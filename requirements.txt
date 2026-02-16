@@ -1,0 +1,13 @@
+django
+djangorestframework
+celery
+redis
+pydantic
+psycopg2-binary
+requests
+pytest
+coverage
+django-environ
+djangorestframework-simplejwt
+gunicorn
+drf-spectacular

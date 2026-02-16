@@ -1,0 +1,59 @@
+version: "3.9"
+
+services:
+  db:
+    image: postgres:14-alpine
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    env_file:
+      - ./app.env
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:6-alpine
+
+  web:
+    build: .
+    command: >
+      sh -c "
+        echo 'Waiting for postgres...' &&
+        while ! nc -z db 5432; do sleep 0.1; done;
+        echo 'PostgreSQL started' &&
+        echo 'Applying database migrations...' &&
+        python manage.py migrate &&
+        echo 'Starting Gunicorn...' &&
+        gunicorn tax_service.wsgi:application --bind 0.0.0.0:8000 --workers 4
+      "
+    volumes:
+      - .:/app
+      - ./media:/app/media
+      # «Живая» установка CryptoPro на хосте —
+      # чтобы контейнер видел те же ключи/сертификаты/лицензии:
+      - /var/opt/cprocsp:/var/opt/cprocsp
+      - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
+    ports:
+      - "8000:8000"
+    env_file:
+      - ./app.env
+    depends_on:
+      - db
+      - redis
+    user: root  # CryptoPro требует root-доступ к хранилищу /var/opt/cprocsp
+
+  worker:
+    build: .
+    command: celery -A tax_service worker -l info
+    volumes:
+      - .:/app
+      - /var/opt/cprocsp:/var/opt/cprocsp
+      - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
+    env_file:
+      - ./app.env
+    depends_on:
+      - redis
+      - db
+    user: root
+
+volumes:
+  postgres_data:
