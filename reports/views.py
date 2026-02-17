@@ -25,7 +25,12 @@ from .models import (
     Recipient,
     ReportType,
 )
-from .sbis_service import send_nds_extra, send_nds_extra_1c, fetch_receipt_pdf_b64_from_archive
+from .sbis_service import (
+    send_nds_extra,
+    send_nds_extra_1c,
+    fetch_receipt_pdf_b64_from_archive,
+    fetch_sales_book_extract_by_counterparty,
+)
 from .schemas import MailLookupRequest, MailLookupResponse, SubmitReportSchema
 from .serializers import DocumentCreateSerializer, DocumentStatusSerializer
 from .tasks import schedule_mail_fetch, start_report_processing_chain
@@ -381,6 +386,80 @@ class SendNdsExtra1CView(APIView):
         except Exception as e:
             logger.exception(f"[1C_IN] failed to log payload: {e}")
 
+
+
+
+class GetSalesBookExtractView(APIView):
+    permission_classes = []
+
+    def post(self, request, *args, **kwargs):
+        inn = str(request.data.get("inn", "")).strip()
+        counterparty_id = str(request.data.get("counterparty_id", "")).strip() or None
+        date_from = str(request.data.get("date_from", "")).strip() or None
+        date_to = str(request.data.get("date_to", "")).strip() or None
+        sbis_doc_id = str(request.data.get("sbis_doc_id", "")).strip() or None
+        nds_subtype = str(request.data.get("nds_subtype", "")).strip() or None
+        max_docs_raw = request.data.get("max_docs", 30)
+        rpc_timeout_sec_raw = request.data.get("rpc_timeout_sec", 25)
+        rpc_budget_sec_raw = request.data.get("rpc_budget_sec", 30)
+        archive_timeout_sec_raw = request.data.get("archive_timeout_sec", 20)
+        archive_budget_sec_raw = request.data.get("archive_budget_sec", 25)
+        auth_timeout_sec_raw = request.data.get("auth_timeout_sec", 14)
+        auth_budget_sec_raw = request.data.get("auth_budget_sec", 20)
+        proxy_prewarm_count_raw = request.data.get("proxy_prewarm_count", 6)
+
+        if not inn:
+            return Response(
+                {
+                    "success": False,
+                    "comment": "Ошибка входных данных",
+                    "error": {"message": "Поле inn обязательно"},
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            max_docs = max(1, min(50, int(max_docs_raw)))
+            rpc_timeout_sec = max(8, min(60, int(rpc_timeout_sec_raw)))
+            rpc_budget_sec = max(12, min(90, int(rpc_budget_sec_raw)))
+            archive_timeout_sec = max(8, min(60, int(archive_timeout_sec_raw)))
+            archive_budget_sec = max(12, min(90, int(archive_budget_sec_raw)))
+            auth_timeout_sec = max(8, min(45, int(auth_timeout_sec_raw)))
+            auth_budget_sec = max(12, min(90, int(auth_budget_sec_raw)))
+            proxy_prewarm_count = max(1, min(10, int(proxy_prewarm_count_raw)))
+        except Exception:
+            return Response(
+                {
+                    "success": False,
+                    "comment": "Ошибка входных данных",
+                    "error": {
+                        "message": "Поля max_docs/rpc_timeout_sec/rpc_budget_sec/archive_timeout_sec/archive_budget_sec/auth_timeout_sec/auth_budget_sec/proxy_prewarm_count должны быть числами"
+                    },
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = fetch_sales_book_extract_by_counterparty(
+            inn=inn,
+            counterparty_id=counterparty_id,
+            date_from=date_from,
+            date_to=date_to,
+            sbis_doc_id=sbis_doc_id,
+            nds_subtype=nds_subtype,
+            max_docs=max_docs,
+            rpc_timeout_sec=rpc_timeout_sec,
+            rpc_budget_sec=rpc_budget_sec,
+            archive_timeout_sec=archive_timeout_sec,
+            archive_budget_sec=archive_budget_sec,
+            auth_timeout_sec=auth_timeout_sec,
+            auth_budget_sec=auth_budget_sec,
+            proxy_prewarm_count=proxy_prewarm_count,
+        )
+
+        if result.get("success"):
+            return Response(result, status=status.HTTP_200_OK)
+
+        return Response(result, status=status.HTTP_400_BAD_REQUEST)
 
 class GetReceiptPdfFromArchive1CView(APIView):
     permission_classes = []
