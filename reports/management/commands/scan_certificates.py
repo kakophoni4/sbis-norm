@@ -13,7 +13,8 @@ CERTMGR_BIN = "/opt/cprocsp/bin/amd64/certmgr"
 
 def run_cmd(args: list[str]) -> str:
     """Запуск внешней команды и возврат stdout как строки."""
-    return subprocess.check_output(args, text=True)
+    result = subprocess.run(args, capture_output=True, text=True, check=True)
+    return result.stdout
 
 
 def list_hdimage_containers() -> list[str]:
@@ -27,14 +28,17 @@ def list_hdimage_containers() -> list[str]:
     return containers
 
 
-def export_cert_from_container(container_name: str, dest_path: str) -> None:
-    """Экспортировать сертификат из контейнера в файл DER."""
-    run_cmd([
-        CERTMGR_BIN,
-        "-export",
-        "-cont", container_name,
-        "-dest", dest_path,
-    ])
+def export_cert_from_container(container_name: str, dest_path: str) -> bool:
+    """
+    Экспортировать сертификат из контейнера в файл DER.
+    Возвращает True при успехе, False при ошибке (контейнер недоступен, нет серта и т.д.).
+    """
+    result = subprocess.run(
+        [CERTMGR_BIN, "-export", "-cont", container_name, "-dest", dest_path],
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
 
 
 def parse_cert_date(s: str) -> datetime | None:
@@ -142,8 +146,20 @@ def update_private_key_flags():
 class Command(BaseCommand):
     help = "Сканирует HDIMAGE-контейнеры CryptoPro и актуализирует таблицу Certificate"
 
+    def add_arguments(self, parser):
+        parser.add_argument(
+            "--clear",
+            action="store_true",
+            help="Очистить таблицу Certificate и заново загрузить все из контейнеров",
+        )
+
     def handle(self, *args, **options):
         now = datetime.now(timezone.utc)
+
+        if options["clear"]:
+            n = Certificate.objects.count()
+            Certificate.objects.all().delete()
+            self.stdout.write(self.style.WARNING(f"Удалено записей Certificate: {n}"))
 
         self.stdout.write("Сканирование контейнеров CryptoPro...")
 
@@ -152,6 +168,7 @@ class Command(BaseCommand):
 
         created = 0
         updated = 0
+        skipped = 0
 
         for csptest_name in containers:
             self.stdout.write(f"  контейнер: {csptest_name}")
@@ -164,7 +181,12 @@ class Command(BaseCommand):
                 continue
 
             tmp_cert = f"/tmp/csp_scan_{abs(hash(csptest_name))}.cer"
-            export_cert_from_container(csptest_name, tmp_cert)
+            if not export_cert_from_container(csptest_name, tmp_cert):
+                self.stdout.write(
+                    self.style.WARNING(f"    пропуск: не удалось экспортировать (Keyset/контейнер недоступен)")
+                )
+                skipped += 1
+                continue
             info = parse_cert_info(tmp_cert)
 
             inn = info.get("inn")
@@ -202,3 +224,5 @@ class Command(BaseCommand):
         self.stdout.write("Статистика по таблице Certificate:")
         self.stdout.write(f"  всего записей: {total}")
         self.stdout.write(f"  активных:      {active}")
+        if skipped:
+            self.stdout.write(self.style.WARNING(f"  пропущено (экспорт не удался): {skipped}"))

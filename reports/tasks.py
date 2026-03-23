@@ -60,7 +60,7 @@ def ensure_certificate_task(self, inn: str) -> Optional[int]:
         cert = Certificate.objects.filter(inn=inn, is_active=True).first()
         
         if cert:
-            logger.info(f"[ensure_certificate_task] Сертификат найден: {cert.container_path}")
+            logger.info(f"[ensure_certificate_task] Сертификат найден: {cert.csptest_name}")
             return cert.id
         
         # Сканируем локальные контейнеры
@@ -71,13 +71,13 @@ def ensure_certificate_task(self, inn: str) -> Optional[int]:
         cert = Certificate.objects.filter(inn=inn, is_active=True).first()
         
         if cert:
-            logger.info(f"[ensure_certificate_task] Сертификат найден после сканирования: {cert.container_path}")
+            logger.info(f"[ensure_certificate_task] Сертификат найден после сканирования: {cert.csptest_name}")
             CertificateAuditLog.objects.create(
                 inn=inn,
                 cert=cert,
                 action="ENSURE_CERT",
                 status="SUCCESS",
-                message=f"Сертификат найден: {cert.container_path}"
+                message=f"Сертификат найден: {cert.csptest_name}"
             )
             return cert.id
         

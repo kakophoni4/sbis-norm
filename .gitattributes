@@ -1,0 +1,2 @@
+# Скрипты всегда с LF, иначе на Linux "./script.sh" даёт "command not found"
+*.sh text eol=lf

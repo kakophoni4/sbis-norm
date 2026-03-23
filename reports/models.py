@@ -153,6 +153,15 @@ class Certificate(models.Model):
     is_active = models.BooleanField(default=True)
     meta = models.JSONField(blank=True, null=True)  # Доп. сведения (кто установил, путь до файла)
 
+    # КПП по данным учёта/внешнего справочника (в Subject серта может не быть)
+    kpp = models.CharField(
+        max_length=9,
+        blank=True,
+        null=True,
+        verbose_name="КПП",
+        help_text="Для СБИС и фильтров; можно заполнить sync_org_kpp",
+    )
+
     class Meta:
         unique_together = ('inn', 'csptest_name')
 
@@ -180,3 +189,93 @@ class CertificateAuditLog(models.Model):
     status = models.CharField(max_length=20)   # SUCCESS / ERROR
     message = models.TextField(blank=True, null=True)
     created_at = models.DateTimeField(auto_now_add=True)
+
+
+class RequirementDocument(models.Model):
+    """
+    Хранение требований ФНС (и подобных входящих документов): ИНН, дата, base64 PDF.
+    Дедупликация: по (inn, sbis_doc_id) — один документ не дублируем;
+    при повторном сканировании сверяем по (inn, document_date, content_sha256).
+    """
+    inn = models.CharField(max_length=12, db_index=True, verbose_name="ИНН")
+    document_date = models.DateField(verbose_name="Дата документа")
+    sbis_doc_id = models.CharField(
+        max_length=255,
+        db_index=True,
+        verbose_name="Идентификатор документа в СБИС",
+    )
+    sbis_stage_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name="Идентификатор этапа в СБИС",
+    )
+    doc_title = models.CharField(
+        max_length=512,
+        blank=True,
+        verbose_name="Название документа",
+    )
+    content_sha256 = models.CharField(
+        max_length=64,
+        db_index=True,
+        verbose_name="SHA256 содержимого (для дедупликации)",
+    )
+    file_b64 = models.TextField(verbose_name="Base64 содержимого PDF/XML")
+    storage_file_name = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name="Имя файла для экспорта (Требование ФНС (ИНН) (дата).pdf)",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Требование (документ ФНС)"
+        verbose_name_plural = "Требования (документы ФНС)"
+        unique_together = (("inn", "sbis_doc_id"),)
+        ordering = ["-document_date", "-created_at"]
+        indexes = [
+            models.Index(fields=["inn", "document_date", "content_sha256"]),
+        ]
+
+    def __str__(self):
+        return f"{self.inn} {self.document_date} {self.sbis_doc_id}"
+
+
+class RequirementFetchScanState(models.Model):
+    """
+    Отметка: для ИНН успешно выполнен опрос СписокСлужебныхЭтапов за окно дат
+    в указанный календарный день (локальная дата сервера).
+
+    Нужна, чтобы при повторном запуске той же команды в тот же день не дергать СБИС
+    по организациям, где уже всё обработано (в т.ч. «0 требований» / «всё уже в БД»).
+
+    Не создаётся, если: ошибка списка; ошибка скачивания; исключение в обработчике;
+    есть документ к скачиванию, но нет этапа / нет даты документа в карточке (при фильтре по дате).
+    Тогда ИНН снова участвует в следующем запуске (или в раундах повтора).
+    """
+
+    inn = models.CharField(max_length=12, db_index=True, verbose_name="ИНН")
+    window_key = models.CharField(
+        max_length=64,
+        db_index=True,
+        verbose_name="Ключ окна (date_from|date_to)",
+    )
+    scan_date = models.DateField(
+        db_index=True,
+        verbose_name="Календарный день успешного сканирования",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+
+    class Meta:
+        verbose_name = "Отметка сканирования требований"
+        verbose_name_plural = "Отметки сканирования требований"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["inn", "window_key", "scan_date"],
+                name="uniq_req_fetch_scan_inn_window_day",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.inn} {self.window_key} @ {self.scan_date}"

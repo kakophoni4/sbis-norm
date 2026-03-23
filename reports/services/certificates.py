@@ -53,8 +53,8 @@ class CertmgrTimeoutError(CertificateServiceError):
 
 @dataclass(slots=True)
 class LocalContainerInfo:
-    """Represents a single certificate container discovered locally."""
-    container_path: str
+    """Represents a single certificate container discovered locally (имя как в csptest -enum_cont -fqcn)."""
+    csptest_name: str
     subject: str
     thumbprint: Optional[str] = None
     serial: Optional[str] = None
@@ -141,8 +141,8 @@ def _parse_container_block(block: str) -> Optional[LocalContainerInfo]:
     for raw_line in block.splitlines():
         line = raw_line.strip()
         if line.startswith("Container name:"):
-            data["container_path"] = line.split(":", 1)[1].strip()
-            current_field = "container_path"
+            data["csptest_name"] = line.split(":", 1)[1].strip()
+            current_field = "csptest_name"
         elif line.startswith("Subject:"):
             data["subject"] = line.split(":", 1)[1].strip()
             current_field = "subject"
@@ -157,12 +157,12 @@ def _parse_container_block(block: str) -> Optional[LocalContainerInfo]:
             if current_field == "subject" and line:
                 data["subject"] = f"{data['subject']} {line}".strip()
 
-    if "container_path" not in data or "subject" not in data:
+    if "csptest_name" not in data or "subject" not in data:
         logger.debug("Skipping block due to missing data:\n%s", block)
         return None
 
     return LocalContainerInfo(
-        container_path=data["container_path"],
+        csptest_name=data["csptest_name"],
         subject=data["subject"],
         thumbprint=data.get("thumbprint"),
         serial=data.get("serial"),
@@ -218,13 +218,13 @@ def register_local_certificate(info: LocalContainerInfo) -> Optional[Certificate
 
     with transaction.atomic():
         cert, created = Certificate.objects.get_or_create(
-            container_path=info.container_path,
+            csptest_name=info.csptest_name,
             defaults=defaults,
         )
 
         updates: dict[str, object] = {}
         if created:
-            logger.info("Created certificate record for container %s", info.container_path)
+            logger.info("Created certificate record for container %s", info.csptest_name)
         else:
             if cert.inn != inn:
                 updates["inn"] = inn
@@ -299,7 +299,7 @@ def refresh_local_certificates(
         try:
             register_local_certificate(info)
         except Exception as exc:  # pragma: no cover - defensive logging
-            logger.exception("Failed to register certificate %s", info.container_path)
+            logger.exception("Failed to register certificate %s", info.csptest_name)
             CertificateAuditLog.objects.create(
                 inn=info.inn or "UNKNOWN",
                 cert=None,
@@ -335,7 +335,7 @@ def ensure_certificate_record(inn: str) -> Optional[Certificate]:
             cert=cert,
             action="ENSURE_CERTIFICATE",
             status="SUCCESS",
-            message=f"Найден контейнер {cert.container_path}",
+            message=f"Найден контейнер {cert.csptest_name}",
         )
         return cert
 

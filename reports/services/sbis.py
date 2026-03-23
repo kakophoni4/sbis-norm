@@ -21,12 +21,13 @@ import subprocess
 import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import requests
 from django.conf import settings
 
 from ..models import Certificate, CertificateAuditLog
+from ..sbis_service import auth_sbis_by_cert, export_cert_der, get_thumbprint_from_cert
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,14 @@ DEFAULT_REQUEST_TIMEOUT = 60  # seconds
 SBIS_THUMBPRINT_PATTERN = re.compile(r"SHA1 Thumbprint\s*:\s*([A-Fa-f0-9]+)")
 
 SBIS_AUTH_AUDIT_ACTION = "SBIS_AUTH"
+
+
+def _csp_use_sudo() -> bool:
+    """
+    Если True, certmgr/cryptcp вызываются через sudo (ключи в /var/opt/cprocsp/keys/root).
+    Нужно, когда Django запущен от devuser, а ключи ставились под root.
+    """
+    return getattr(settings, "CSP_USE_SUDO", True)
 SBIS_FETCH_MAIL_AUDIT_ACTION = "SBIS_FETCH_MAIL"
 
 
@@ -99,8 +108,8 @@ def export_certificate_base64(
     """
     Экспортирует сертификат из контейнера и возвращает Base64.
     """
-    if not certificate.container_path:
-        raise SbisCertificateExportError("Не указан путь к контейнеру сертификата")
+    if not certificate.csptest_name:
+        raise SbisCertificateExportError("Не указано имя контейнера сертификата (csptest_name)")
 
     path = certmgr_path or getattr(settings, "CERTMGR_PATH", DEFAULT_CERTMGR_PATH)
     if not path:
@@ -110,14 +119,15 @@ def export_certificate_base64(
     temp_path = temp_file.name
     temp_file.close()
 
-    command = [
+    base_cmd = [
         path,
         "-export",
         "-cont",
-        certificate.container_path,
+        certificate.csptest_name,
         "-dest",
         temp_path,
     ]
+    command = (["sudo"] + base_cmd) if _csp_use_sudo() else base_cmd
 
     logger.debug(
         "Экспорт сертификата через certmgr (certificate_id=%s, command=%s)",
@@ -173,19 +183,20 @@ def ensure_thumbprint(
     if certificate.thumbprint:
         return certificate.thumbprint
 
-    if not certificate.container_path:
-        raise SbisThumbprintError("Не указан путь к контейнеру сертификата")
+    if not certificate.csptest_name:
+        raise SbisThumbprintError("Не указано имя контейнера сертификата (csptest_name)")
 
     path = certmgr_path or getattr(settings, "CERTMGR_PATH", DEFAULT_CERTMGR_PATH)
     if not path:
         raise SbisThumbprintError("Путь к утилите certmgr не настроен")
 
-    command = [
+    base_cmd = [
         path,
         "-list",
         "-cont",
-        certificate.container_path,
+        certificate.csptest_name,
     ]
+    command = (["sudo"] + base_cmd) if _csp_use_sudo() else base_cmd
 
     logger.debug(
         "Получение отпечатка сертификата (certificate_id=%s, command=%s)",
@@ -328,17 +339,17 @@ def decrypt_session_key(
     *,
     thumbprint: str,
     cryptcp_path: Optional[str] = None,
-    container_path: Optional[str] = None,
+    csptest_name: Optional[str] = None,
 ) -> str:
     """
     Расшифровывает ключ сессии с помощью cryptcp и возвращает session_id.
 
-    Если передан container_path, используется конкретный контейнер (-cont),
+    Если передан csptest_name (имя контейнера как в csptest), используется -cont,
     иначе поиск по отпечатку сертификата (-thumbprint).
     """
-    if not thumbprint and not container_path:
+    if not thumbprint and not csptest_name:
         raise SbisDecryptError(
-            "Не указан ни отпечаток сертификата, ни путь к контейнеру"
+            "Не указан ни отпечаток сертификата, ни имя контейнера (csptest_name)"
         )
 
     path = cryptcp_path or getattr(settings, "CRYPTCP_PATH", DEFAULT_CRYPTCP_PATH)
@@ -359,17 +370,18 @@ def decrypt_session_key(
     dec_fd, dec_path = tempfile.mkstemp()
     os.close(dec_fd)
 
-    command = [path, "-decr"]
-    if container_path:
-        command += ["-cont", container_path]
+    base_cmd = [path, "-decr"]
+    if csptest_name:
+        base_cmd += ["-cont", csptest_name]
     else:
-        command += ["-thumbprint", thumbprint]
-    command += [enc_path, dec_path]
+        base_cmd += ["-thumbprint", thumbprint]
+    base_cmd += [enc_path, dec_path]
+    command = (["sudo"] + base_cmd) if _csp_use_sudo() else base_cmd
 
     logger.debug(
-        "Расшифровка ключа сессии через cryptcp (thumbprint=%s, container=%s, command=%s)",
+        "Расшифровка ключа сессии через cryptcp (thumbprint=%s, csptest_name=%s, command=%s)",
         thumbprint,
-        container_path,
+        csptest_name,
         command,
     )
 
@@ -692,45 +704,38 @@ class SbisSessionService:
     http_session: Optional[requests.Session] = field(
         default=None, repr=False, compare=False
     )
+    progress_callback: Optional[Callable[[str], None]] = field(
+        default=None, repr=False, compare=False
+    )
 
     def authenticate(self) -> str:
         """
-        Возвращает session_id, полученный через авторизацию в СБИС.
+        Возвращает session_id через тот же путь, что и send_nds_extra:
+        экспорт серта в файл → thumbprint из файла → auth_sbis_by_cert.
         """
         logger.debug(
             "Начало авторизации в СБИС (certificate_id=%s)",
             self.certificate.pk,
         )
+        inn_value = _sanitize_inn(getattr(self.certificate, "inn", None)) or "unknown"
+        if not self.certificate.csptest_name:
+            self._write_audit("ERROR", "Не указано имя контейнера (csptest_name)")
+            raise SbisAuthError("Не указано имя контейнера сертификата (csptest_name)")
 
-        certmgr_path = self._get_certmgr_path()
-        cryptcp_path = self._get_cryptcp_path()
-        auth_url = self._get_auth_url()
-        timeout = self._get_request_timeout()
-        verify_ssl = self._get_verify_ssl()
+        def _progress(msg: str) -> None:
+            if self.progress_callback:
+                self.progress_callback(msg)
 
+        fd, cert_path = tempfile.mkstemp(prefix=f"sbis_auth_{inn_value}_", suffix=".cer")
+        os.close(fd)
         try:
-            cert_b64 = export_certificate_base64(
-                self.certificate,
-                certmgr_path=certmgr_path,
-            )
-            thumbprint = ensure_thumbprint(
-                self.certificate,
-                certmgr_path=certmgr_path,
-            )
-            encrypted_key = fetch_encrypted_session_key(
-                cert_b64,
-                auth_url=auth_url,
-                timeout=timeout,
-                verify=verify_ssl,
-                http_session=self.http_session,
-            )
-            session_id = decrypt_session_key(
-                encrypted_key,
-                thumbprint=thumbprint,
-                cryptcp_path=cryptcp_path,
-		container_path=self.certificate.container_path,
-            )
-        except SbisAuthError as exc:
+            _progress("Экспорт сертификата в файл (certmgr -export)...")
+            export_cert_der(self.certificate.csptest_name, cert_path)
+            _progress("Отпечаток из файла (certmgr -list -file)...")
+            thumbprint = get_thumbprint_from_cert(cert_path)
+            _progress("Авторизация в СБИС (HTTP + cryptcp -decr)...")
+            session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn_value)
+        except (SbisAuthError, RuntimeError) as exc:
             self._write_audit("ERROR", str(exc))
             logger.error(
                 "Авторизация в СБИС завершилась ошибкой (certificate_id=%s): %s",
@@ -738,8 +743,8 @@ class SbisSessionService:
                 exc,
                 exc_info=True,
             )
-            raise
-        except Exception as exc:  # непредвиденные ошибки
+            raise SbisAuthError(str(exc)) from exc
+        except Exception as exc:
             message = f"Неизвестная ошибка авторизации: {exc}"
             self._write_audit("ERROR", message)
             logger.exception(
@@ -747,6 +752,12 @@ class SbisSessionService:
                 self.certificate.pk,
             )
             raise SbisAuthError(message) from exc
+        finally:
+            if os.path.exists(cert_path):
+                try:
+                    os.remove(cert_path)
+                except OSError:
+                    logger.warning("Не удалось удалить временный файл %s", cert_path)
 
         self._write_audit("SUCCESS", "Получен session_id")
         logger.info(

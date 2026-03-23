@@ -4,9 +4,11 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import random
+import threading
 import uuid
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta
@@ -15,9 +17,9 @@ import io
 import zipfile
 import requests
 import time
-from functools import lru_cache
 from requests.exceptions import ProxyError, SSLError, ConnectionError, Timeout
 from urllib.parse import urlparse, urlunparse
+from django.conf import settings
 from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 from reports.models import Certificate
 from requests.adapters import HTTPAdapter
@@ -25,6 +27,14 @@ from requests.adapters import HTTPAdapter
 
 CERTMGR_BIN = "/opt/cprocsp/bin/amd64/certmgr"
 CRYPTCP_BIN = "/opt/cprocsp/bin/amd64/cryptcp"
+# Без этих флагов cryptcp спрашивает "Do you want to use this certificate?" при непроверенной цепочке/отзыве
+CRYPTCP_DECR_FLAGS = ["-silent", "-nochain", "-norev"]
+CRYPTCP_SIGN_FLAGS = ["-silent", "-nochain", "-norev"]
+
+
+def _csp_use_sudo() -> bool:
+    """Если True, certmgr/cryptcp запускаются через sudo (ключи в /var/opt/cprocsp/keys/root)."""
+    return getattr(settings, "CSP_USE_SUDO", True)
 
 AUTH_URL = "https://online.sbis.ru/auth/service/"
 REPORTING_URL = "https://online.sbis.ru/service/?srv=1"
@@ -51,9 +61,15 @@ _GOOD_PROXY_POOL: dict[str, tuple[float, list[str]]] = {}  # inn -> (ts, [proxy_
 _GOOD_PROXY_TTL_SECONDS = 300  # 5 минут
 
 _PROXY_LAST_CALL_TS: dict[str, float] = {}  # inn -> timestamp
+
 _PROXY_MIN_INTERVAL_SEC = 1.2  # минимум между запросами через прокси на один ИНН
 
-_RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+_RETRYABLE_HTTP_STATUSES = {403, 404, 429, 500, 502, 503, 504}  # 403 — лимит/доступ, пробуем другой прокси; 404 — сбой туннеля
+
+
+class CertInvalidNoRetryError(RuntimeError):
+    """Сертификат отозван/просрочен/не доверенный — не перебирать прокси, сразу выйти."""
+    pass
 
 
 def _is_retryable_http_status(code: int) -> bool:
@@ -70,6 +86,64 @@ def _short_body(resp: requests.Response, limit: int = 200) -> str:
         return t[:limit]
     except Exception:
         return ""
+
+
+def _request_body_preview_for_log(data, max_len: int = 1200) -> str:
+    """Тело запроса для лога: без длинного base64, чтобы видеть ИНН/ФИО."""
+    if data is None:
+        return "(no body)"
+    try:
+        raw = data.decode("utf-8") if isinstance(data, bytes) else data
+    except Exception:
+        return "(body decode error)"
+    if not raw or not raw.strip():
+        return "(empty)"
+    try:
+        obj = json.loads(raw)
+        # Подменить ДвоичныеДанные в params.Сертификат
+        params = obj.get("params") if isinstance(obj, dict) else None
+        if isinstance(params, dict) and "Сертификат" in params:
+            cert = params["Сертификат"]
+            if isinstance(cert, dict) and "ДвоичныеДанные" in cert:
+                b64 = cert["ДвоичныеДанные"]
+                n = len(b64) if isinstance(b64, str) else 0
+                cert = {**cert, "ДвоичныеДанные": f"<base64 {n} chars>"}
+                params = {**params, "Сертификат": cert}
+                obj = {**obj, "params": params}
+        out = json.dumps(obj, ensure_ascii=False)
+        return out[:max_len] + ("..." if len(out) > max_len else "")
+    except Exception:
+        return (raw[:max_len] + ("..." if len(raw) > max_len else "")) + " (raw)"
+
+
+def _close_http_response(resp: requests.Response | None) -> None:
+    """Освободить сокет/соединение urllib3 (важно при ретраях и stream=True)."""
+    if resp is None:
+        return
+    try:
+        resp.close()
+    except Exception:
+        pass
+
+
+def _is_revoked_or_untrusted_cert_response(body_text: str) -> bool:
+    """
+    Тело ответа СБИС: сертификат отозван / не доверенный / просрочен — не ретраим.
+    Также: регистрация клиента не завершилась — не ретраим (не проблема прокси).
+    """
+    if not body_text:
+        return False
+    t = body_text.lower()
+    return (
+        "отозван" in t
+        or "не является доверенным" in t
+        or "выберите другой сертификат" in t
+        or "просроченному сертификату" in t
+        or "аутентификация по просроченному" in t
+        or "регистрация клиента еще не завершилась" in t
+        or "регистрация клиента ещё не завершилась" in t
+        or "схема для клиента в процессе разворачи" in t
+    )
 
 
 def _nodemaven_client() -> NodeMavenClient:
@@ -100,17 +174,25 @@ def _replace_port_in_proxy_url(proxy_url: str, new_port: int) -> str:
     new_netloc = f"{userinfo+'@' if userinfo else ''}{host}:{int(new_port)}"
     return urlunparse((u.scheme, new_netloc, u.path, u.params, u.query, u.fragment))
 
-@lru_cache(maxsize=1)
-def _requests_session_no_retries() -> requests.Session:
+_thread_http = threading.local()
+
+
+def _thread_local_sbis_session() -> requests.Session:
     """
-    Session без внутренних ретраев urllib3.
-    Иначе requests может сам делать повторные коннекты, мы теряем контроль и время.
+    Отдельный requests.Session на поток (ThreadPoolExecutor), без общего кэша:
+    один глобальный Session + много потоков → гонки и рост открытых сокетов (EMFILE).
+
+    Маленький пул соединений: при N воркерах не раздуваем FD как pool×N×хостов.
     """
-    s = requests.Session()
-    adapter = HTTPAdapter(max_retries=0, pool_connections=20, pool_maxsize=20)
-    s.mount("http://", adapter)
-    s.mount("https://", adapter)
-    return s
+    s = getattr(_thread_http, "sess", None)
+    if s is not None:
+        return s
+    sess = requests.Session()
+    adapter = HTTPAdapter(max_retries=0, pool_connections=2, pool_maxsize=4)
+    sess.mount("http://", adapter)
+    sess.mount("https://", adapter)
+    _thread_http.sess = sess
+    return sess
 
 
 def _nodemaven_proxies(inn: str, sticky_key: str, *, city: str | None = NODEMAVEN_CITY) -> dict:
@@ -178,20 +260,21 @@ def _probe_proxy_connectivity(
     """
     proxies = {"http": proxy_url, "https": proxy_url}
     try:
-        r = requests.get(
+        # stream=True: без close/with соединения копятся → Too many open files
+        with requests.get(
             test_url,
             timeout=timeout,
             proxies=proxies,
             allow_redirects=False,
             stream=True,
             headers={"User-Agent": "sbis-proxy-probe/1.0"},
-        )
-        code = int(r.status_code)
+        ) as r:
+            code = int(r.status_code)
 
-        if code in (429, 500, 502, 503, 504):
-            return False, f"bad_status={code}"
+            if code in (429, 500, 502, 503, 504):
+                return False, f"bad_status={code}"
 
-        return True, f"ok_status={code}"
+            return True, f"ok_status={code}"
 
     except requests.exceptions.ProxyError as e:
         return False, f"proxy_error={e}"
@@ -213,6 +296,10 @@ def warmup_good_proxies_for_inn(
     - ищем 1–2 рабочих прокси
     - не делаем много проб подряд, иначе сами ловим 429
     """
+    logger.info(
+        "[SBIS_PROXY_POOL] warmup start inn=%s want=%s budget_sec=%s",
+        inn, want, total_budget_sec,
+    )
     deadline = time.time() + max(8, int(total_budget_sec))
     good: list[str] = []
 
@@ -302,7 +389,7 @@ def _sbis_request(
     """
 
     started = time.time()
-    sess = _requests_session_no_retries()
+    sess = _thread_local_sbis_session()
 
     def _do(proxy_url: str | None):
         proxies = None
@@ -355,7 +442,10 @@ def _sbis_request(
     last_bad_resp: requests.Response | None = None
 
     attempt = 0
-    for proxy_url in candidates:
+    idx = 0
+    while idx < len(candidates):
+        proxy_url = candidates[idx]
+        idx += 1
         attempt += 1
 
         # budget check
@@ -367,15 +457,40 @@ def _sbis_request(
 
             # если статус "плохой" — пробуем следующий прокси/порт
             if _is_retryable_http_status(resp.status_code) and (inn or proxy_url_override):
+                body_snip = resp.text or ""
+                if _is_revoked_or_untrusted_cert_response(body_snip):
+                    # Может быть сертификат или регистрация клиента — в любом случае не ретраим
+                    logger.warning(
+                        "[SBIS_PROXY] no-retry error (cert/registration) — fail fast"
+                    )
+                    head = _short_body(resp)
+                    code = resp.status_code
+                    _close_http_response(last_bad_resp)
+                    _close_http_response(resp)
+                    raise CertInvalidNoRetryError(
+                        f"Certificate invalid (no retry): status={code} "
+                        f"body_head={head}"
+                    )
+                _close_http_response(last_bad_resp)
                 last_bad_resp = resp
                 logger.warning(
                     f"[SBIS_PROXY] retryable HTTP {resp.status_code} attempt={attempt} "
                     f"proxy={_mask_proxy_url(proxy_url) if proxy_url else None} "
                     f"body_head={_short_body(resp)}"
                 )
+                # при ошибке «Сертификат.ФИО/ИНН» — вывести в консоль тело ОТПРАВЛЕННОГО запроса
+                if resp.status_code == 500 and "Сертификат.ФИО" in body_snip and "Сертификат.ИНН" in body_snip:
+                    req_preview = _request_body_preview_for_log(data)
+                    print("[SBIS_PROXY] >>> ТЕЛО ОТПРАВЛЕННОГО ЗАПРОСА (при ошибке ФИО/ИНН):", req_preview, flush=True)
+                    logger.warning("[SBIS_PROXY] request body preview (ФИО/ИНН error): %s", req_preview[:500])
                 continue
 
+            _close_http_response(last_bad_resp)
+            last_bad_resp = None
             return resp
+
+        except CertInvalidNoRetryError:
+            raise
 
         except (ProxyError, Timeout, ConnectionError, SSLError) as e:
             last_err = e
@@ -386,16 +501,21 @@ def _sbis_request(
 
         except Exception as e:
             last_err = e
-            logger.exception(f"[SBIS_PROXY] unexpected error attempt={attempt}: {e}")
+            logger.warning(
+                f"[SBIS_PROXY] unexpected error attempt={attempt} proxy={_mask_proxy_url(proxy_url) if proxy_url else None}: {e}"
+            )
             continue
 
     # если дошли сюда — не вышло
     if last_bad_resp is not None:
-        raise RuntimeError(
-            f"Proxy/HTTP failed (budget={total_budget_sec}s): "
-            f"last_status={last_bad_resp.status_code} "
-            f"last_body_head={_short_body(last_bad_resp)}"
-        )
+        try:
+            raise RuntimeError(
+                f"Proxy/HTTP failed (budget={total_budget_sec}s): "
+                f"last_status={last_bad_resp.status_code} "
+                f"last_body_head={_short_body(last_bad_resp)}"
+            )
+        finally:
+            _close_http_response(last_bad_resp)
 
     if last_err is not None:
         raise RuntimeError(f"Proxy/HTTP failed (budget={total_budget_sec}s): {last_err}")
@@ -403,22 +523,6 @@ def _sbis_request(
     raise RuntimeError(
         f"Proxy/HTTP failed (budget={total_budget_sec}s): no response, attempts={attempt}, candidates={len(candidates)}"
     )
-
-
-def get_operation_proxy_for_inn(inn: str) -> str:
-    """
-    Берём один proxy_url и используем его во всех SBIS вызовах одной операции.
-    Это резко снижает шанс 429.
-    """
-    cached = get_good_proxy_for_inn(inn)
-    if cached:
-        return cached
-
-    good = warmup_good_proxies_for_inn(inn, want=1, total_budget_sec=10, per_probe_timeout=6.0)
-    if not good:
-        raise RuntimeError("No working proxy found for operation")
-    return good[0]
-
 
 
 def _sbis_post(
@@ -450,7 +554,7 @@ def _sbis_get(
     timeout: int = 60,
     inn: str | None = None,
     proxy_url_override: str | None = None,
-    total_budget_sec: int = 45,
+    total_budget_sec: int = 120,
 ):
     return _sbis_request(
         "GET",
@@ -464,16 +568,42 @@ def _sbis_get(
     )
 
 
-def run_cmd(args: list[str]) -> str:
-    return subprocess.check_output(args, text=True)
+def run_cmd(args: list[str], timeout_sec: int = 90) -> str:
+    """Запуск команды без доступа к stdin. certmgr/cryptcp при CSP_USE_SUDO вызываются через sudo."""
+    if args and args[0] in (CERTMGR_BIN, CRYPTCP_BIN) and _csp_use_sudo():
+        args = ["sudo", *args]
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            err = (result.stderr or result.stdout or "").strip() or f"exit code {result.returncode}"
+            raise RuntimeError(f"{args[0] if args else '?'}: {err}")
+        return result.stdout or ""
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"Команда {args[0] if args else '?'} не завершилась за {timeout_sec} с (возможен запрос пароля или недоступный контейнер)"
+        ) from e
 
 
 def export_cert_der(csptest_name: str, dest_path: str) -> None:
     run_cmd([CERTMGR_BIN, "-export", "-cont", csptest_name, "-dest", dest_path])
 
 
+def get_certmgr_list_file_output(cert_path: str) -> str:
+    """Полный текст `certmgr -list -file` (SHA1, Subject и т.д.)."""
+    return run_cmd([CERTMGR_BIN, "-list", "-file", cert_path])
+
+
 def get_thumbprint_from_cert(cert_path: str) -> str:
-    out = run_cmd([CERTMGR_BIN, "-list", "-file", cert_path])
+    return get_thumbprint_from_certmgr_listing(get_certmgr_list_file_output(cert_path))
+
+
+def get_thumbprint_from_certmgr_listing(out: str) -> str:
     for line in out.splitlines():
         line = line.strip()
         if line.startswith("SHA1 Thumbprint"):
@@ -481,6 +611,92 @@ def get_thumbprint_from_cert(cert_path: str) -> str:
             if len(parts) == 2:
                 return parts[1].strip().lower()
     raise RuntimeError("Не удалось вытащить SHA1 Thumbprint из файла сертификата")
+
+
+def get_fio_from_cert_file(cert_path: str) -> str:
+    """
+    Из вывода certmgr -list -file извлечь ФИО (значение CN из Subject/Субъект).
+    Нужно для СБИС.АутентифицироватьПоСертификату при запросе через прокси (обязательные поля Сертификат.ФИО, Сертификат.ИНН).
+    """
+    try:
+        out = get_certmgr_list_file_output(cert_path)
+    except Exception:
+        return ""
+    subject = ""
+    for line in out.splitlines():
+        line_stripped = line.strip()
+        if line_stripped.startswith("Subject:") or line_stripped.startswith("Субъект:"):
+            subject = line_stripped.split(":", 1)[1].strip()
+            break
+    if not subject:
+        return ""
+    m = re.search(r"CN=([^,]+)", subject, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    m = re.search(r"CN\s*=\s*([^,]+)", subject, re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return subject[:200].strip()
+
+
+# Порядок важен: явные KPP/КПП в Subject, затем OID КПП (ФНС) в квалифицированных сертах РФ.
+_KPP_SUBJECT_RES = (
+    re.compile(r"(?i)\bKPP=([0-9]{9})\b"),
+    re.compile(r"КПП=([0-9]{9})"),
+    re.compile(r"1\.2\.643\.100\.5=([0-9]{9})\b"),
+)
+
+
+def parse_kpp_from_subject_text(text: str) -> str | None:
+    """Ищет КПП в строке Subject / выводе certmgr."""
+    if not (text or "").strip():
+        return None
+    for rx in _KPP_SUBJECT_RES:
+        m = rx.search(text)
+        if m:
+            return m.group(1)
+    return None
+
+
+def parse_kpp_from_cert_file(
+    cert_path: str,
+    *,
+    certmgr_listing: str | None = None,
+) -> str | None:
+    """
+    Пытается извлечь 9-значный КПП из экспортированного .cer:
+    openssl x509 -subject (DER/PEM), затем certmgr -list -file (или готовый текст в certmgr_listing).
+    """
+    blobs: list[str] = []
+
+    openssl_bin = shutil.which("openssl")
+    if openssl_bin and os.path.isfile(cert_path):
+        for inform in ("DER", "PEM"):
+            try:
+                r = subprocess.run(
+                    [openssl_bin, "x509", "-inform", inform, "-in", cert_path, "-noout", "-subject"],
+                    capture_output=True,
+                    text=True,
+                    timeout=20,
+                    stdin=subprocess.DEVNULL,
+                )
+                if r.returncode == 0 and (r.stdout or "").strip():
+                    blobs.append(r.stdout.strip())
+                    break
+            except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+                break
+
+    if certmgr_listing is not None:
+        blobs.append(certmgr_listing)
+    else:
+        try:
+            blobs.append(
+                run_cmd([CERTMGR_BIN, "-list", "-file", cert_path], timeout_sec=60)
+            )
+        except Exception:
+            pass
+
+    return parse_kpp_from_subject_text("\n".join(blobs))
 
 
 def log_http_exchange(prefix: str, url: str, req_headers: dict, req_body: str, resp: requests.Response) -> None:
@@ -519,20 +735,34 @@ def auth_sbis_by_cert(
     timeout_sec: int = 30,
     total_budget_sec: int = 45,
 ) -> str:
+    logger.info("[SBIS auth] 1/4 Чтение серта и подготовка запроса")
     with open(cert_path, "rb") as f:
         cert_der = f.read()
     cert_b64 = base64.b64encode(cert_der).decode("ascii")
 
+    inn_val = (inn or "").strip() if inn else ""
+    if not inn_val or inn_val == "no_inn":
+        inn_val = ""
+    fio = get_fio_from_cert_file(cert_path)
+    fio_val = (fio or "—").strip() or "—"
+    cert_params: dict = {
+        "ДвоичныеДанные": cert_b64,
+        "ИНН": inn_val,
+        "ФИО": fio_val,
+    }
+    logger.info("[SBIS auth] Сертификат.ИНН=%r Сертификат.ФИО=%r", cert_params["ИНН"], (cert_params["ФИО"])[:60])
+
     req = {
         "jsonrpc": "2.0",
         "method": "СБИС.АутентифицироватьПоСертификату",
-        "params": {"Сертификат": {"ДвоичныеДанные": cert_b64}},
+        "params": {"Сертификат": cert_params},
         "id": 1,
     }
 
     headers = {"Content-Type": "application/json-rpc;charset=utf-8"}
     req_json = json.dumps(req, ensure_ascii=False)
 
+    logger.info("[SBIS auth] 2/4 Отправка HTTP POST в СБИС %s", AUTH_URL)
     resp = _sbis_request(
         "POST",
         AUTH_URL,
@@ -545,10 +775,31 @@ def auth_sbis_by_cert(
     )
     log_http_exchange("AUTH", AUTH_URL, headers, req_json, resp)
 
+    logger.info("[SBIS auth] СБИС ответил: %s", resp.status_code)
     resp.raise_for_status()
     data = resp.json()
 
     if data.get("error"):
+        err = data["error"]
+        err_msg = (err.get("message") or err.get("details") or str(err)).lower()
+        if (
+            "отозван" in err_msg
+            or "не является доверенным" in err_msg
+            or "выберите другой сертификат" in err_msg
+            or "просроченному сертификату" in err_msg
+            or "аутентификация по просроченному" in err_msg
+        ):
+            try:
+                tp = (thumbprint or "").strip().lower()
+                if inn and inn != "no_inn" and tp:
+                    deleted = Certificate.objects.filter(inn=inn, thumbprint=tp).delete()
+                    if deleted[0]:
+                        logger.warning(
+                            "[SBIS auth] Сертификат отозван/просрочен/не доверенный — удалён из БД (inn=%s)",
+                            inn,
+                        )
+            except Exception as e:
+                logger.warning("[SBIS auth] Не удалось удалить сертификат из БД: %s", e)
         raise RuntimeError(f"JSON-RPC error при аутентификации: {data['error']}")
 
     enc_b64 = data.get("result")
@@ -559,17 +810,45 @@ def auth_sbis_by_cert(
     enc_path = "/tmp/sbis_report_auth.enc"
     dec_path = "/tmp/sbis_report_auth.dec"
 
+    logger.info("[SBIS auth] 3/4 Запись .enc, запуск cryptcp -decr (расшифровка)")
     with open(enc_path, "wb") as f:
         f.write(enc_bin)
 
-    run_cmd([CRYPTCP_BIN, "-decr", "-thumbprint", thumbprint, enc_path, dec_path])
+    run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, enc_path, dec_path])
 
+    logger.info("[SBIS auth] 4/4 Чтение session_id из .dec")
     with open(dec_path, "rb") as f:
         session_id = f.read().decode("utf-8").strip()
     return session_id
 
 
-def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str]:
+def extract_our_org_from_nds_xml(xml_path: str) -> dict | None:
+    """
+    Из отчёта НДС (XML) достать нашу организацию: СвНП/НПЮЛ → ИНН, КПП, название.
+    Возвращает {"inn": str, "kpp": str, "name": str} или None при ошибке/отсутствии блока.
+    """
+    if not xml_path or not os.path.isfile(xml_path):
+        return None
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+        doc = root.find("Документ")
+        if doc is None:
+            return None
+        np = doc.find("СвНП/НПЮЛ")
+        if np is None:
+            return None
+        inn = (np.attrib.get("ИННЮЛ") or "").strip()
+        kpp = (np.attrib.get("КПП") or "").strip()
+        name = (np.attrib.get("НаимОрг") or "").strip()
+        if not inn or not kpp or len(kpp) != 9 or not kpp.isdigit():
+            return None
+        return {"inn": inn, "kpp": kpp, "name": name or f"ИНН {inn}"}
+    except Exception:
+        return None
+
+
+def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str, str]:
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -578,6 +857,7 @@ def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str]:
         raise RuntimeError("В XML не найден тег <Документ>")
 
     id_file = root.attrib.get("ИдФайл", "")
+    format_version = root.attrib.get("ВерсФорм", "")
     guid = ""
     if "_" in id_file:
         parts = id_file.rsplit("_", 1)
@@ -615,15 +895,17 @@ def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str]:
         "Описание": {
             "ИмяФормы": "Декларация по налогу на добавленную стоимость",
             "КНДФормы": knd,
-            "ВидДокумента": "Приложение",
+            "ВидДокумента": "Первичный",
             "НомерКорректировки": nom_korr,
             "НОПоМестуУчета": kod_no,
             "НОПоМестуНахождения": kod_no,
-        },
-        "Отчетный период": {
-            "Год": year,
-            "Код": period_code,
-            "ИдентификаторВложения": "",
+            "Период": [
+                {
+                    "Год": year,
+                    "Код": period_code,
+                    "ИдентификаторВложения": "",
+                }
+            ],
         },
         "Пакет": {
             "ВерсПрог": "1С:БУХГАЛТЕРИЯ 3.0.156.17",
@@ -633,7 +915,7 @@ def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str]:
         "ПрограммаФормированияОтчета": "1С:БУХГАЛТЕРИЯ",
     }
 
-    return sved, our_org, kod_no, po_mestu, guid
+    return sved, our_org, kod_no, po_mestu, guid, format_version
 
 
 def extract_guid_from_xml_idfile(xml_path: str) -> str:
@@ -659,7 +941,7 @@ def sign_xml_if_needed(xml_path: str, sign_path: str | None, thumbprint: str) ->
         return sign_path
 
     out_sign = f"{xml_path}.sgn"
-    run_cmd([CRYPTCP_BIN, "-sign", "-detached", "-der", "-thumbprint", thumbprint, xml_path])
+    run_cmd([CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-thumbprint", thumbprint, xml_path])
 
     if not os.path.exists(out_sign):
         raise RuntimeError(f"Не удалось создать подпись {out_sign}")
@@ -670,6 +952,8 @@ def _build_enclosure(
     file_path: str,
     sign_path: str,
     subtype: str,
+    format_version: str,
+    title: str,
     category: str = "Основное",
     ident: str | None = None,
 ) -> dict:
@@ -686,9 +970,9 @@ def _build_enclosure(
         "Подтип": subtype,
         "Направление": "Исходящий",
         "Идентификатор": ident or "00000000-0000-0000-0000-000000000000",
-        "ВерсияФормата": "",
+        "ВерсияФормата": format_version,
         "ПодВерсияФормата": "",
-        "Название": file_name,
+        "Название": title,
         "Категория": category,
         "Файл": {
             "Имя": file_name,
@@ -726,7 +1010,7 @@ def send_nds_extra(
         return {"success": False, "error": {"message": f"Ошибка аутентификации в СБИС: {e}"}}
 
     try:
-        sved, our_org, kod_no, po_mestu, guid = build_svedenia_from_xml(xml_path)
+        sved, our_org, kod_no, po_mestu, guid, format_version = build_svedenia_from_xml(xml_path)
     except Exception as e:
         return {"success": False, "error": {"message": f"Ошибка разбора XML: {e}"}}
 
@@ -746,20 +1030,28 @@ def send_nds_extra(
         file_id_map[file_path] = ident
 
     enclosures: list[dict] = []
+    main_file_ident = file_id_map.get(xml_path, "")
+    if sved.get("Описание", {}).get("Период"):
+        sved["Описание"]["Период"][0]["ИдентификаторВложения"] = main_file_ident
+
     for file_path in all_files:
         ident = file_id_map[file_path]
         if file_path == xml_path:
             sp = sign_path_final
             category = "Основное"
+            title = sved.get("Описание", {}).get("ИмяФормы") or "Отчет"
         else:
             sp = sign_xml_if_needed(file_path, None, thumbprint)
             category = "Приложение"
+            title = f"Приложение {os.path.basename(file_path)}"
 
         enclosures.append(
             _build_enclosure(
                 file_path=file_path,
                 sign_path=sp,
                 subtype=subtype_nds,
+                format_version=format_version,
+                title=title,
                 category=category,
                 ident=ident,
             )
@@ -768,9 +1060,11 @@ def send_nds_extra(
     file_name = os.path.basename(xml_path)
     doc = {
         "Название": f"Доп.листы книги продаж ({file_name})",
+        "Идентификатор": guid.lower() or uuid.uuid4().hex,
         "Тип": "ОтчетФНС",
         "ПодТип": subtype_nds,
         "ДатаВремяСоздания": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Расширение": {"ИдентификаторКомплекта": guid or str(uuid.uuid4())},
         "НашаОрганизация": our_org,
         "Участники": {
             "Отправитель": our_org,
@@ -779,6 +1073,7 @@ def send_nds_extra(
         },
         "Сведения": sved,
         "Вложение": enclosures,
+        "Сертификат": {"Отпечаток": thumbprint, "Ключ": {"Тип": "Клиентский"}},
     }
 
     body = {"jsonrpc": "2.0", "method": "СБИС.ЗаписатьКомплект", "params": {"Документ": [doc]}, "id": 1}
@@ -873,7 +1168,7 @@ def send_nds_extra(
         file_ident = file_id_map[file_path]
         sig_path = f"{file_path}.sgn"
         try:
-            run_cmd([CRYPTCP_BIN, "-sign", "-detached", "-der", "-thumbprint", thumbprint, file_path, sig_path])
+            run_cmd([CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-thumbprint", thumbprint, file_path, sig_path])
             with open(sig_path, "rb") as f:
                 sig_b64 = base64.b64encode(f.read()).decode("ascii")
             attachments.append({"Идентификатор": file_ident, "Подпись": [{"Файл": {"ДвоичныеДанные": sig_b64}}]})
@@ -1628,6 +1923,275 @@ def sbis_get_our_org_from_service_info(inn: str, session_id: str, target_inn: st
     return None
 
 
+def sbis_list_organizations_from_service_info(
+    inn: str,
+    session_id: str,
+    *,
+    timeout: int = 45,
+) -> dict:
+    """
+    СБИС.ИнформацияОСлужебныхЭтапах — разбор всех «наших организаций» из ответа.
+
+    Возвращает dict:
+      success: bool
+      organizations: [{"inn", "kpp", "name", "raw": dict}, ...]  — по возможности
+      error: {...} при ошибке RPC или неожиданной структуре
+      raw_result_type: str — для отладки
+    """
+    data = sbis_rpc(
+        inn=inn,
+        session_id=session_id,
+        method="СБИС.ИнформацияОСлужебныхЭтапах",
+        params={},
+        timeout=timeout,
+    )
+
+    if data.get("error"):
+        return {
+            "success": False,
+            "organizations": [],
+            "error": data["error"],
+            "raw_result_type": None,
+        }
+
+    result = data.get("result")
+    raw_type = type(result).__name__
+
+    def _extract_svul_pairs(candidate: dict) -> list[tuple[dict, dict]]:
+        """Вернуть пары (родительский объект, СвЮЛ) если есть."""
+        out: list[tuple[dict, dict]] = []
+        if not isinstance(candidate, dict):
+            return out
+        svul = candidate.get("СвЮЛ")
+        if isinstance(svul, dict):
+            out.append((candidate, svul))
+        # иногда вложенность иная
+        for key in ("НашаОрганизация", "Организация", "ЮЛ"):
+            sub = candidate.get(key)
+            if isinstance(sub, dict):
+                s2 = sub.get("СвЮЛ")
+                if isinstance(s2, dict):
+                    out.append((sub, s2))
+        return out
+
+    organizations: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add_from_svul(parent: dict, svul: dict) -> None:
+        i = (str(svul.get("ИНН") or "").strip(), str(svul.get("КПП") or "").strip())
+        if not i[0] and not i[1]:
+            return
+        key = (i[0], i[1])
+        if key in seen:
+            return
+        seen.add(key)
+        organizations.append(
+            {
+                "inn": i[0],
+                "kpp": i[1],
+                "name": (
+                    str(svul.get("Название") or svul.get("Наименование") or "").strip()
+                ),
+                "raw": parent,
+            }
+        )
+
+    if isinstance(result, list):
+        for item in result:
+            if not isinstance(item, dict):
+                continue
+            org = item.get("НашаОрганизация")
+            candidates: list[dict] = []
+            if isinstance(org, dict):
+                candidates.append(org)
+            candidates.append(item)
+            for cand in candidates:
+                for parent, svul in _extract_svul_pairs(cand):
+                    _add_from_svul(parent, svul)
+    elif isinstance(result, dict):
+        # единичный объект или обёртка
+        for parent, svul in _extract_svul_pairs(result):
+            _add_from_svul(parent, svul)
+        for key in ("НашаОрганизация", "Документ", "Организации"):
+            sub = result.get(key)
+            if isinstance(sub, list):
+                for el in sub:
+                    if isinstance(el, dict):
+                        for parent, svul in _extract_svul_pairs(el):
+                            _add_from_svul(parent, svul)
+            elif isinstance(sub, dict):
+                for parent, svul in _extract_svul_pairs(sub):
+                    _add_from_svul(parent, svul)
+    else:
+        return {
+            "success": False,
+            "organizations": [],
+            "error": {
+                "message": f"Неожиданный тип result: {raw_type}",
+                "sample": str(result)[:500] if result is not None else "",
+            },
+            "raw_result_type": raw_type,
+        }
+
+    return {
+        "success": True,
+        "organizations": organizations,
+        "error": None,
+        "raw_result_type": raw_type,
+    }
+
+
+def _deep_walk_collect_svul(
+    obj: object,
+    organizations: list[dict],
+    seen: set[tuple[str, str]],
+) -> None:
+    """Рекурсивно собрать СвЮЛ с ИНН/КПП из произвольного JSON (ответ СБИС)."""
+    if isinstance(obj, dict):
+        svul = obj.get("СвЮЛ")
+        if isinstance(svul, dict):
+            inn_v = str(svul.get("ИНН") or "").strip()
+            kpp_v = str(svul.get("КПП") or "").strip()
+            if inn_v or kpp_v:
+                key = (inn_v, kpp_v)
+                if key not in seen:
+                    seen.add(key)
+                    organizations.append(
+                        {
+                            "inn": inn_v,
+                            "kpp": kpp_v,
+                            "name": str(
+                                svul.get("Название") or svul.get("Наименование") or ""
+                            ).strip(),
+                            "raw": svul,
+                        }
+                    )
+        for v in obj.values():
+            _deep_walk_collect_svul(v, organizations, seen)
+    elif isinstance(obj, list):
+        for x in obj:
+            _deep_walk_collect_svul(x, organizations, seen)
+
+
+def _filter_service_stages_our_org(
+    inn: str,
+    kpp: str,
+    *,
+    org_name: str = "",
+    date_from: str,
+    date_to: str,
+    page_size: int = 50,
+) -> dict:
+    """Фильтр СБИС.СписокСлужебныхЭтапов (на многих контурах КПП в СвЮЛ обязателен)."""
+    kpp = (kpp or "").strip()
+    return {
+        "Блокировать": "Да",
+        "НашаОрганизация": {
+            "СвЮЛ": {
+                "ИНН": inn,
+                "КПП": kpp,
+                "Название": (org_name or "").strip(),
+                "КодФилиала": "",
+            }
+        },
+        "ТолькоОтчетность": "Да",
+        "ТолькоЭДО": "Нет",
+        "ДатаС": date_from,
+        "ДатаПо": date_to,
+        "Навигация": {"РазмерСтраницы": str(int(page_size))},
+    }
+
+
+def sbis_list_organizations_from_service_stages(
+    inn: str,
+    session_id: str,
+    *,
+    kpp: str | None = None,
+    org_name: str = "",
+    date_from: str | None = None,
+    date_to: str | None = None,
+    page_size: int = 50,
+    timeout: int = 45,
+) -> dict:
+    """
+    СБИС.СписокСлужебныхЭтапов + рекурсивный разбор СвЮЛ в ответе.
+
+    На контурах СБИС КПП в фильтре часто обязателен («КПП должен быть заполнен»).
+    Без kpp HTTP-запрос не выполняется — передайте КПП, возьмите из БД/серта/XML.
+    """
+    kpp = (kpp or "").strip()
+    if not kpp:
+        return {
+            "success": False,
+            "organizations": [],
+            "error": {
+                "message": "КПП обязателен для СписокСлужебныхЭтапов на этом контуре СБИС",
+                "code": "KPP_REQUIRED",
+                "hint": "Передайте kpp=, заполните Organization.kpp, или parse_kpp_from_cert_file()",
+            },
+            "raw_result_type": None,
+            "source_method": "СписокСлужебныхЭтапов",
+            "docs_count": None,
+        }
+
+    today = datetime.now()
+    if not date_to:
+        date_to = today.strftime("%d.%m.%Y")
+    if not date_from:
+        date_from = (today - timedelta(days=90)).strftime("%d.%m.%Y")
+
+    filt = _filter_service_stages_our_org(
+        inn,
+        kpp,
+        org_name=org_name,
+        date_from=date_from,
+        date_to=date_to,
+        page_size=page_size,
+    )
+    data = sbis_rpc(
+        inn=inn,
+        session_id=session_id,
+        method="СБИС.СписокСлужебныхЭтапов",
+        params={"Фильтр": filt},
+        timeout=timeout,
+    )
+
+    if data.get("error"):
+        return {
+            "success": False,
+            "organizations": [],
+            "error": data["error"],
+            "raw_result_type": None,
+            "source_method": "СписокСлужебныхЭтапов",
+        }
+
+    result = data.get("result")
+    organizations: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    _deep_walk_collect_svul(result, organizations, seen)
+
+    # как в sbis_list_organizations_from_service_info — без лишнего raw в slim
+    slim = []
+    for o in organizations:
+        slim.append(
+            {
+                "inn": o["inn"],
+                "kpp": o["kpp"],
+                "name": o["name"],
+            }
+        )
+
+    return {
+        "success": True,
+        "organizations": slim,
+        "error": None,
+        "raw_result_type": type(result).__name__,
+        "source_method": "СписокСлужебныхЭтапов",
+        "docs_count": len((result or {}).get("Документ") or [])
+        if isinstance(result, dict)
+        else None,
+    }
+
 
 def _build_service_stages_filter_minimal(
     inn: str,
@@ -1667,12 +2231,14 @@ def sbis_list_service_stages(
     date_from: str | None = None,   # "dd.mm.yyyy"
     date_to: str | None = None,     # "dd.mm.yyyy"
     page_size: int = 20,
+    only_reporting: bool = True,
 ) -> dict:
     """
     1) Аутентификация по сертификату (СБИС.АутентифицироватьПоСертификату)
     2) СБИС.СписокСлужебныхЭтапов с фильтром по нашей организации
 
     КПП — передаём ВРУЧНУЮ.
+    only_reporting: True — только отчётность; False — в т.ч. требования ФНС и др. служебные.
     """
 
     if not inn:
@@ -1727,7 +2293,7 @@ def sbis_list_service_stages(
             "Фильтр": {
                 "Блокировать": "Да",
                 "НашаОрганизация": our_org,
-                "ТолькоОтчетность": "Да",
+                "ТолькоОтчетность": "Да" if only_reporting else "Нет",
                 "ТолькоЭДО": "Нет",
                 "ДатаС": date_from,
                 "ДатаПо": date_to,
@@ -1803,6 +2369,7 @@ def sbis_list_service_stages(
                 "period": {"from": date_from, "to": date_to},
                 "session_id_head": (session_id or "")[:8],
                 "total_docs": len(docs),
+                "docs": docs,
                 "preview": preview,
                 "raw_result_keys": list(result.keys()),
             },
@@ -1852,6 +2419,8 @@ def sbis_prepare_action(
 
     headers = {"Content-Type": "application/json-rpc;charset=utf-8", "X-SBISSessionID": session_id}
 
+    fio = (get_fio_from_cert_file(cert_path) or "—").strip() or "—"
+
     our_org = {
         "СвЮЛ": {
             "ИНН": inn,
@@ -1874,7 +2443,10 @@ def sbis_prepare_action(
                 "НашаОрганизация": our_org,
                 "Этап": {
                     "Идентификатор": stage_id,
-                    "Действие": {"Название": action_name},
+                    "Действие": {
+                        "Название": action_name,
+                        "Сертификат": {"Отпечаток": thumb, "ИНН": inn, "ФИО": fio},
+                    },
                 },
             }
         },
@@ -1886,9 +2458,10 @@ def sbis_prepare_action(
     try:
         resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=req_json, timeout=45)
         if resp.status_code != 200:
+            body_head = (resp.text or "").strip()[:400]
             return {
                 "success": False,
-                "error": {"message": f"HTTP {resp.status_code}", "inn": inn, "raw_head": (resp.text or "")[:500]},
+                "error": {"message": f"HTTP {resp.status_code} при ПодготовитьДействие. Ответ: {body_head or '(пусто)'}", "inn": inn, "raw_head": body_head},
             }
 
         data = resp.json()
@@ -2027,7 +2600,7 @@ def sbis_decrypt_bytes_with_cert_thumbprint(
         with open(enc_path, "wb") as f:
             f.write(enc_bytes)
 
-        run_cmd([CRYPTCP_BIN, "-decr", "-thumbprint", thumbprint, enc_path, dec_path])
+        run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, enc_path, dec_path])
 
         out = Path(dec_path).read_bytes()
         return out
@@ -2282,7 +2855,7 @@ def _try_decrypt_bytes_with_cert(
             f.write(content)
 
         try:
-            run_cmd([CRYPTCP_BIN, "-decr", "-thumbprint", thumbprint, in_path, out_path])
+            run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, in_path, out_path])
             dec = Path(out_path).read_bytes()
             meta["decrypt_ok"] = True
             return dec, meta
@@ -2404,6 +2977,10 @@ def fetch_requirement_file_b64(
 
     Важно: для СБИС.ПодготовитьДействие нужно указать Этап.Действие.Название,
     иначе будет "Не указано название действия".
+
+    Скачивание по «Ссылка» должно идти с тем же X-SBISSessionID, что и после auth;
+    ответ 403 (в т.ч. с текстом про HMAC/доступ) часто даёт СБИС при другом exit-IP
+    или без сессии — ретраи HTTP перебирают прокси из пула (_sbis_request).
     """
     if not inn:
         return {"success": False, "error": {"message": "inn обязателен"}}
@@ -2429,7 +3006,9 @@ def fetch_requirement_file_b64(
     except Exception as e:
         return {"success": False, "error": {"message": f"Ошибка аутентификации в СБИС: {e}", "inn": inn}}
 
-    # 1) ПодготовитьДействие — чтобы получить вложение и ссылку
+    fio = (get_fio_from_cert_file(cert_path) or "—").strip() or "—"
+
+    # 1) ПодготовитьДействие — чтобы получить вложение и ссылку (Сертификат внутри Действие, как в Отправить)
     body = {
         "jsonrpc": "2.0",
         "method": "СБИС.ПодготовитьДействие",
@@ -2440,6 +3019,7 @@ def fetch_requirement_file_b64(
                     "Идентификатор": requirement_stage_id,
                     "Действие": {
                         "Название": action_name,
+                        "Сертификат": {"Отпечаток": thumbprint, "ИНН": inn, "ФИО": fio},
                     },
                 },
             }
@@ -2461,9 +3041,13 @@ def fetch_requirement_file_b64(
         return {"success": False, "error": {"message": f"Ошибка СБИС.ПодготовитьДействие: {e}", "inn": inn}}
 
     if resp.status_code != 200:
+        body_head = (resp.text or "").strip()[:400]
         return {
             "success": False,
-            "error": {"message": f"HTTP {resp.status_code} при ПодготовитьДействие", "body_head": (resp.text or "")[:300]},
+            "error": {
+                "message": f"HTTP {resp.status_code} при ПодготовитьДействие. Ответ: {body_head or '(пусто)'}",
+                "body_head": body_head,
+            },
         }
 
     try:
@@ -2484,68 +3068,89 @@ def fetch_requirement_file_b64(
     if not isinstance(atts, list) or not atts:
         return {"success": False, "error": {"message": "В ответе нет Этап[0].Вложение[]", "inn": inn}}
 
-    # Берем первое вложение (у тебя это PDF)
-    att0 = atts[0] or {}
-    file_obj = att0.get("Файл") or {}
-    if not isinstance(file_obj, dict):
-        return {"success": False, "error": {"message": "Вложение.Файл не dict", "inn": inn}}
-
-    file_url = (file_obj.get("Ссылка") or "").strip()
-    filename = (file_obj.get("Имя") or file_obj.get("Название") or "requirement.bin").strip()
-
-    if not file_url:
-        return {"success": False, "error": {"message": "Вложение.Файл.Ссылка пустая", "inn": inn, "filename": filename}}
-
-    encrypted_flag = (att0.get("Зашифрован") or "").strip()  # "Да"/"Нет"
-
-    # 2) скачать файл по ссылке
-    try:
-        r = _sbis_get(file_url, headers={"X-SBISSessionID": session_id}, timeout=60, inn=inn)
-    except Exception as e:
-        return {"success": False, "error": {"message": f"Ошибка скачивания файла: {e}", "url": file_url}}
-
-    if r.status_code != 200:
-        return {
-            "success": False,
-            "error": {
-                "message": f"Не удалось скачать файл: HTTP {r.status_code}",
-                "url": file_url,
-                "body_head": (r.text or "")[:300],
-            },
-        }
-
-    content = r.content or b""
-    decrypted = content
-    decrypt_ok = False
-    decrypt_error = None
-
-    # 3) если зашифрован — расшифровать
-    if encrypted_flag == "Да":
+    # По доке СБИС: два вложения — XML обмена и требование в формате PDF или DOC. Скачиваем все и отдаём первое (для обратной совместимости).
+    attachments_out: list[dict] = []
+    for i, att in enumerate(atts):
+        att = att or {}
+        file_obj = att.get("Файл") or {}
+        if not isinstance(file_obj, dict):
+            continue
+        file_url = (file_obj.get("Ссылка") or "").strip()
+        filename = (file_obj.get("Имя") or file_obj.get("Название") or "requirement.bin").strip()
+        if not file_url:
+            continue
+        if i > 0:
+            time.sleep(1.0)  # пауза между вложениями
+        encrypted_flag = (att.get("Зашифрован") or "").strip()
         try:
-            with tempfile.TemporaryDirectory(prefix=f"sbis_req_dec_{inn}_") as td:
-                enc_path = os.path.join(td, "req.enc")
-                dec_path = os.path.join(td, "req.dec")
-                Path(enc_path).write_bytes(content)
-
-                run_cmd([CRYPTCP_BIN, "-decr", "-thumbprint", thumbprint, enc_path, dec_path])
-
-                decrypted = Path(dec_path).read_bytes()
-                decrypt_ok = True
+            r = _sbis_get(
+                file_url,
+                headers={"X-SBISSessionID": session_id},
+                timeout=120,
+                inn=inn,
+                total_budget_sec=180,
+            )
         except Exception as e:
-            decrypt_error = str(e)
-            decrypted = content  # вернем хотя бы то, что скачали
+            return {"success": False, "error": {"message": f"Ошибка скачивания вложения {i + 1}: {e}", "url": file_url}}
+        if r.status_code == 403:
+            time.sleep(2.0)
+            try:
+                r = _sbis_get(
+                    file_url,
+                    headers={"X-SBISSessionID": session_id},
+                    timeout=120,
+                    inn=inn,
+                    total_budget_sec=180,
+                )
+            except Exception as e:
+                return {"success": False, "error": {"message": f"Ошибка повтора скачивания вложения {i + 1}: {e}", "url": file_url}}
+        if r.status_code != 200:
+            return {
+                "success": False,
+                "error": {"message": f"HTTP {r.status_code} при скачивании вложения {i + 1}", "url": file_url},
+            }
+        content = r.content or b""
+        decrypted = content
+        if encrypted_flag == "Да":
+            try:
+                with tempfile.TemporaryDirectory(prefix=f"sbis_req_dec_{inn}_") as td:
+                    enc_path = os.path.join(td, f"req_{i}.enc")
+                    dec_path = os.path.join(td, f"req_{i}.dec")
+                    Path(enc_path).write_bytes(content)
+                    run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, enc_path, dec_path])
+                    decrypted = Path(dec_path).read_bytes()
+            except Exception:
+                decrypted = content
+        is_pdf = decrypted.startswith(b"%PDF") or (filename or "").lower().endswith(".pdf")
+        is_doc = (filename or "").lower().endswith((".doc", ".docx"))
+        attachments_out.append({
+            "filename": filename,
+            "b64": base64.b64encode(decrypted).decode("ascii"),
+            "size": len(decrypted),
+            "is_pdf": is_pdf,
+            "is_doc": is_doc,
+        })
 
-    # 4) сохранить на сервере (опционально)
+    if not attachments_out:
+        return {"success": False, "error": {"message": "Не удалось скачать ни одного вложения", "inn": inn}}
+
+    # Выбираем вложение: предпочитаем PDF, затем DOC, иначе первое
+    chosen = None
+    for a in attachments_out:
+        if a["is_pdf"] or a["is_doc"]:
+            chosen = a
+            break
+    if not chosen:
+        chosen = attachments_out[0]
+
     saved_to = None
     if save_to:
         try:
             Path(save_to).parent.mkdir(parents=True, exist_ok=True)
-            Path(save_to).write_bytes(decrypted)
+            Path(save_to).write_bytes(base64.b64decode(chosen["b64"]))
             saved_to = save_to
-        except Exception as e:
-            decrypt_error = (decrypt_error + f" | save_to failed: {e}") if decrypt_error else f"save_to failed: {e}"
-
-    b64 = base64.b64encode(decrypted).decode("ascii")
+        except Exception:
+            pass
 
     return {
         "success": True,
@@ -2555,13 +3160,12 @@ def fetch_requirement_file_b64(
             "requirement_doc_id": requirement_doc_id,
             "requirement_stage_id": requirement_stage_id,
             "action_name": action_name,
-            "filename": filename,
-            "encrypted_flag": encrypted_flag,
-            "decrypt_ok": decrypt_ok if encrypted_flag == "Да" else True,
-            "decrypt_error": decrypt_error,
-            "size": len(decrypted),
+            "filename": chosen["filename"],
+            "size": chosen["size"],
             "saved_to": saved_to,
-            "b64": b64,
+            "b64": chosen["b64"],
+            "attachments_count": len(attachments_out),
+            "attachments_all": attachments_out,
         },
     }
 
