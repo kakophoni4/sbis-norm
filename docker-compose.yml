@@ -1,5 +1,3 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:14-alpine
@@ -15,21 +13,16 @@ services:
 
   web:
     build: .
+    entrypoint: ["/app/docker-entrypoint.sh"]
     command: >
       sh -c "
-        echo 'Waiting for postgres...' &&
-        while ! nc -z db 5432; do sleep 0.1; done;
-        echo 'PostgreSQL started' &&
-        echo 'Applying database migrations...' &&
+        while ! nc -z db 5432; do sleep 0.1; done &&
         python manage.py migrate &&
-        echo 'Starting Gunicorn...' &&
         gunicorn tax_service.wsgi:application --bind 0.0.0.0:8000 --workers 4
       "
     volumes:
       - .:/app
       - ./media:/app/media
-      # «Живая» установка CryptoPro на хосте —
-      # чтобы контейнер видел те же ключи/сертификаты/лицензии:
       - /var/opt/cprocsp:/var/opt/cprocsp
       - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
     ports:
@@ -39,11 +32,27 @@ services:
     depends_on:
       - db
       - redis
-    user: root  # CryptoPro требует root-доступ к хранилищу /var/opt/cprocsp
+    user: root
 
   worker:
     build: .
+    entrypoint: ["/app/docker-entrypoint.sh"]
     command: celery -A tax_service worker -l info
+    volumes:
+      - .:/app
+      - /var/opt/cprocsp:/var/opt/cprocsp
+      - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
+    env_file:
+      - ./app.env
+    depends_on:
+      - redis
+      - db
+    user: root
+
+  beat:
+    build: .
+    entrypoint: ["/app/docker-entrypoint.sh"]
+    command: celery -A tax_service beat -l info
     volumes:
       - .:/app
       - /var/opt/cprocsp:/var/opt/cprocsp

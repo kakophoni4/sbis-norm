@@ -1,24 +1,16 @@
-# reports/services/__init__.py
-
 from .certificates import (
-    LocalContainerInfo,
     CertificateServiceError,
-    CertmgrNotFoundError,
     CertmgrExecutionError,
+    CertmgrNotFoundError,
     CertmgrTimeoutError,
-    run_certmgr_list,
-    parse_certmgr_output,
-    register_local_certificate,
-    refresh_local_certificates,
+    LocalContainerInfo,
     ensure_certificate_record,
+    parse_certmgr_output,
+    refresh_local_certificates,
+    register_local_certificate,
+    run_certmgr_list,
 )
-
-from .sbis import (
-    SbisSessionService,
-    SbisMailService,
-    MailRecord,
-    AttachmentMeta,
-)
+from .sbis_mail import AttachmentMeta, MailRecord, SbisMailService, SbisSessionService
 
 __all__ = [
     "LocalContainerInfo",

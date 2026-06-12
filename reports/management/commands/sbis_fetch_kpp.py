@@ -24,7 +24,7 @@ import sys
 from django.core.management.base import BaseCommand
 
 from reports.models import Certificate, Organization
-from reports.sbis_service import (
+from reports.services.sbis import (
     auth_sbis_by_cert,
     export_cert_der,
     get_certmgr_list_file_output,

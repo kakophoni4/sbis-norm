@@ -1,3 +1,0 @@
-rm rm /home/devuser/mega_signatures/???? 9703112963 28-12-22.rar
-rm rm /home/devuser/mega_signatures/??????? 9704085430 27-01-23.rar
-rm rm /home/devuser/mega_signatures/????????? 7714494453 28-12-22.rar

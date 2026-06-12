@@ -156,4 +156,7 @@ SBIS_AUTH_URL = env('SBIS_AUTH_URL', default='https://online.sbis.ru/auth/servic
 SBIS_SERVICE_URL = env('SBIS_SERVICE_URL', default='https://online.sbis.ru/service/')
 CERT_AUTH_PATH = env('CERT_AUTH_PATH', default=None)
 SIGNER_FIO_FOR_SEARCH = env('SIGNER_FIO_FOR_SEARCH', default=None)
+NODEMAVEN_API_KEY = env('NODEMAVEN_API_KEY', default='')
+SBIS_DEFAULT_INN = env('SBIS_DEFAULT_INN', default='')
+CSP_USE_SUDO = env.bool('CSP_USE_SUDO', default=True)
 

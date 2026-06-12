@@ -3,8 +3,7 @@
 Запуск: sudo .venv/bin/python manage.py test_sbis_auth_one 9722082369
 
 Если команда зависает после "Контейнер: ...":
-  - На сервере должны быть обновлены reports/sbis_service.py (таймаут в run_cmd)
-    и reports/services/sbis.py (progress_callback), иначе certmgr ждёт бесконечно.
+  - Убедитесь, что reports/services/sbis/crypto.py содержит таймаут в run_cmd.
   - Проверьте вручную (подставьте свой контейнер):
     sudo certmgr -export -cont '\\\\.\\HDIMAGE\\286918236-b48c-96eb-238d-fb295c9c483' -dest /tmp/test.cer
     Если запрашивает пароль/PIN — ключ защищён; без таймаута скрипт будет висеть.
@@ -15,7 +14,7 @@ import traceback
 
 from django.core.management.base import BaseCommand
 from reports.models import Certificate
-from reports.services.sbis import SbisSessionService, SbisAuthError
+from reports.services.sbis_mail import SbisAuthError, SbisSessionService
 
 
 class Command(BaseCommand):
@@ -30,7 +29,7 @@ class Command(BaseCommand):
         inn = options["inn"]
         show_traceback = options.get("full_traceback", False)
         # Всегда показывать пошаговые логи auth (где зависло: HTTP или cryptcp)
-        sbis_log = logging.getLogger("reports.sbis_service")
+        sbis_log = logging.getLogger("reports.services.sbis")
         sbis_log.setLevel(logging.INFO)
         if not sbis_log.handlers:
             h = logging.StreamHandler(sys.stdout)
@@ -45,7 +44,7 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR("Сертификат не найден"))
             sys.exit(1)
         self.stdout.write(f"  Контейнер: {cert.csptest_name[:60]}...")
-        self.stdout.write("  (если зависло — обновите sbis_service.py и reports/services/sbis.py на сервере)")
+        self.stdout.write("  (если зависло — проверьте certmgr и reports/services/sbis/)")
         sys.stdout.flush()
 
         def progress(msg: str) -> None:

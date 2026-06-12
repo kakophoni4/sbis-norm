@@ -42,7 +42,7 @@ from django.utils import timezone
 
 from reports.models import Certificate, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
-from reports.sbis_service import sbis_list_service_stages, fetch_requirement_file_b64
+from reports.services.sbis import sbis_list_service_stages, fetch_requirement_file_b64
 
 
 logger = logging.getLogger(__name__)
