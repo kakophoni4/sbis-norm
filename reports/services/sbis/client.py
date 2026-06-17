@@ -28,6 +28,8 @@ from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 
 from .constants import *
 
+_thread_http = threading.local()
+
 def _is_retryable_http_status(code: int) -> bool:
     try:
         return int(code) in _RETRYABLE_HTTP_STATUSES
