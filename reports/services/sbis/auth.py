@@ -27,7 +27,13 @@ from reports.models import Certificate
 from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 
 from .constants import *
-from .client import _sbis_request
+from .client import (
+    _mask_proxy_url,
+    _sbis_request,
+    get_good_proxy_for_inn,
+    log_http_exchange,
+    warmup_good_proxies_for_inn,
+)
 from .crypto import (
     CERTMGR_BIN,
     CRYPTCP_BIN,

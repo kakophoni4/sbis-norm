@@ -28,7 +28,7 @@ from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 
 from .constants import *
 from .auth import auth_sbis_by_cert
-from .client import _sbis_request, _sbis_post
+from .client import _sbis_post, _sbis_request, log_http_exchange
 from .crypto import (
     CRYPTCP_BIN,
     CRYPTCP_SIGN_FLAGS,
