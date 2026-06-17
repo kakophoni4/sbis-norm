@@ -253,9 +253,11 @@ def warmup_good_proxies_for_inn(
     city_modes = [None, NODEMAVEN_CITY]  # чаще без city стабильнее
 
     tries = 0
-    while time.time() < deadline and len(good) < want:
+    max_tries = 80
+    while time.time() < deadline and len(good) < want and tries < max_tries:
         tries += 1
         sticky = uuid.uuid4().hex[:8]
+        got_proxy_this_round = False
 
         for city in city_modes:
             if time.time() >= deadline or len(good) >= want:
@@ -266,6 +268,7 @@ def warmup_good_proxies_for_inn(
                 base = (p.get("http") or "").strip()
                 if not base:
                     continue
+                got_proxy_this_round = True
             except Exception:
                 continue
 
@@ -287,6 +290,9 @@ def warmup_good_proxies_for_inn(
 
                 # лёгкая пауза между пробами
                 time.sleep(0.7)
+
+        if not got_proxy_this_round:
+            time.sleep(0.3)
 
     if good:
         _GOOD_PROXY_POOL[inn] = (time.time(), good)

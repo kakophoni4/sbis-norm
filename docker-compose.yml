@@ -1,3 +1,9 @@
+x-app-dns: &app-dns
+  dns:
+    - 8.8.8.8
+    - 8.8.4.4
+    - 1.1.1.1
+
 services:
   db:
     image: postgres:14-alpine
@@ -33,6 +39,7 @@ services:
       - db
       - redis
     user: root
+    dns: *app-dns
 
   worker:
     build: .
@@ -47,6 +54,7 @@ services:
       - redis
       - db
     user: root
+    dns: *app-dns
 
   beat:
     build: .
@@ -61,6 +69,7 @@ services:
       - redis
       - db
     user: root
+    dns: *app-dns
 
 volumes:
   postgres_data:
