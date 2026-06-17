@@ -23,8 +23,8 @@ services:
     volumes:
       - .:/app
       - ./media:/app/media
-      - /var/opt/cprocsp:/var/opt/cprocsp
-      - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
+      # Только ключи с хоста; /etc/opt/cprocsp и остальной /var/opt/cprocsp — из образа
+      - /var/opt/cprocsp/keys:/var/opt/cprocsp/keys
     ports:
       - "8000:8000"
     env_file:
@@ -40,8 +40,7 @@ services:
     command: celery -A tax_service worker -l info
     volumes:
       - .:/app
-      - /var/opt/cprocsp:/var/opt/cprocsp
-      - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
+      - /var/opt/cprocsp/keys:/var/opt/cprocsp/keys
     env_file:
       - ./app.env
     depends_on:
@@ -55,8 +54,7 @@ services:
     command: celery -A tax_service beat -l info
     volumes:
       - .:/app
-      - /var/opt/cprocsp:/var/opt/cprocsp
-      - /etc/opt/cprocsp:/etc/opt/cprocsp:ro
+      - /var/opt/cprocsp/keys:/var/opt/cprocsp/keys
     env_file:
       - ./app.env
     depends_on:
