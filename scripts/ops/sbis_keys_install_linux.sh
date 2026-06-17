@@ -7,9 +7,12 @@
 #
 # Использование:
 #   sudo ./sbis_keys_install_linux.sh [--source DIR] [--csp-root DIR] [--dry-run]
-#   --source   папка с архивами .zip/.rar (по умолчанию: текущая или ~/mega_signatures)
-#   --csp-root каталог ключей CSP (по умолчанию: /var/opt/cprocsp/keys/root)
-#   --dry-run  только распаковать и вывести список контейнеров, не ставить в uMy
+#   --source       папка с архивами .zip/.rar (по умолчанию: текущая или ~/mega_signatures)
+#   --csp-root     каталог ключей CSP (по умолчанию: /var/opt/cprocsp/keys/root)
+#   --dry-run      только распаковать и вывести список контейнеров, не ставить в uMy
+#   --recursive    искать архивы во вложенных папках (ИНН = имя родительской папки)
+#   --unpack-only  только распаковка ключей в CSP, без certmgr/uMy
+#   --install-only только certmgr/uMy (ключи уже лежат в CSP_ROOT)
 #
 set -euo pipefail
 
@@ -18,33 +21,59 @@ CERTMGR="${CERTMGR:-/opt/cprocsp/bin/amd64/certmgr}"
 SOURCE_DIR=""
 CSP_ROOT="/var/opt/cprocsp/keys/root"
 DRY_RUN=false
+RECURSIVE=false
+UNPACK_ONLY=false
+INSTALL_ONLY=false
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --source)   SOURCE_DIR="$2"; shift 2 ;;
-    --csp-root) CSP_ROOT="$2";   shift 2 ;;
-    --dry-run)  DRY_RUN=true;   shift 1 ;;
+    --source)       SOURCE_DIR="$2"; shift 2 ;;
+    --csp-root)     CSP_ROOT="$2";   shift 2 ;;
+    --dry-run)      DRY_RUN=true;   shift 1 ;;
+    --recursive)    RECURSIVE=true; shift 1 ;;
+    --unpack-only)  UNPACK_ONLY=true; shift 1 ;;
+    --install-only) INSTALL_ONLY=true; shift 1 ;;
     *) echo "Неизвестный аргумент: $1"; exit 1 ;;
   esac
 done
 
-if [[ -z "$SOURCE_DIR" ]]; then
-  if [[ -d "$HOME/mega_signatures" ]]; then
-    SOURCE_DIR="$HOME/mega_signatures"
-  else
-    SOURCE_DIR="."
-  fi
+if [[ "$UNPACK_ONLY" == true && "$INSTALL_ONLY" == true ]]; then
+  echo "Нельзя одновременно --unpack-only и --install-only" >&2
+  exit 1
 fi
-SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
 
-echo "Источник архивов: $SOURCE_DIR"
+if [[ "$INSTALL_ONLY" != true ]]; then
+  if [[ -z "$SOURCE_DIR" ]]; then
+    if [[ -d "$HOME/mega_signatures" ]]; then
+      SOURCE_DIR="$HOME/mega_signatures"
+    else
+      SOURCE_DIR="."
+    fi
+  fi
+  SOURCE_DIR="$(cd "$SOURCE_DIR" && pwd)"
+  echo "Источник архивов: $SOURCE_DIR"
+fi
 echo "Каталог CSP:      $CSP_ROOT"
 echo ""
 
 # Из имени файла достаём ИНН (10 цифр подряд). Без совпадения — пустая строка, без выхода по set -e.
 get_inn_from_filename() {
   local name="$1"
-  echo "$name" | grep -oE '[0-9]{10}' | head -1 || true
+  echo "$name" | grep -oE '[0-9]{12}' | head -1 || echo "$name" | grep -oE '[0-9]{10}' | head -1 || true
+}
+
+# ИНН для архива: при --recursive берём имя родительской папки (10–12 цифр), иначе из имени файла.
+get_inn_for_archive() {
+  local archive="$1"
+  local parent_name
+  if [[ "$RECURSIVE" == true ]]; then
+    parent_name="$(basename "$(dirname "$archive")")"
+    if [[ "$parent_name" =~ ^[0-9]{10,12}$ ]]; then
+      echo "$parent_name"
+      return
+    fi
+  fi
+  get_inn_from_filename "$(basename "$archive")"
 }
 
 # Распаковка одного архива в каталог по ИНН
@@ -121,7 +150,11 @@ list_containers() {
 # ИНН из сертификата (certmgr -list -file)
 get_inn_from_cert() {
   local cert_path="$1"
-  "$CERTMGR" -list -file "$cert_path" 2>/dev/null | grep -oE 'ИНН ЮЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || echo ""
+  local out
+  out="$("$CERTMGR" -list -file "$cert_path" 2>/dev/null || true)"
+  echo "$out" | grep -oE 'ИНН ЮЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || \
+  echo "$out" | grep -oE 'ИНН ФЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || \
+  echo "$out" | grep -oE 'ИНН=[0-9]+' | head -1 | grep -oE '[0-9]+' || echo ""
 }
 
 # SHA1 Thumbprint из сертификата
@@ -134,7 +167,11 @@ get_thumbprint_from_cert() {
 get_inn_from_cont_name() {
   local cont="$1"
   local name="${cont##*\\}"
-  echo "$name" | grep -oE '[0-9]{10}' | head -1 || true
+  local s
+  for s in "${seen_inns[@]}"; do
+    [[ "$name" == *"$s"* ]] && { echo "$s"; return; }
+  done
+  echo "$name" | grep -oE '[0-9]{12}' | head -1 || echo "$name" | grep -oE '[0-9]{10}' | head -1 || true
 }
 
 # Есть ли ИНН в списке распакованных
@@ -176,26 +213,54 @@ find_best_cer_for_inn() {
   echo "$best"
 }
 
-echo "=== 1. Поиск архивов и распаковка по ИНН ==="
 seen_inns=()
-# find избегает «argument list too long» при тысячах файлов
-while IFS= read -r -d '' archive; do
-  archive="${archive#* }"
-  inn=$(get_inn_from_filename "$(basename "$archive")")
-  if [[ -z "$inn" ]]; then
-    echo "  Пропуск (ИНН не найден в имени): $(basename "$archive")"
-    continue
-  fi
-  if unpack_archive "$archive" "$inn"; then
-    seen_inns+=("$inn")
-  else
-    echo "  Пропуск из-за ошибки: $(basename "$archive")" >&2
-  fi
-done < <(
-  find "$SOURCE_DIR" -maxdepth 1 -type f \( -iname '*.zip' -o -iname '*.rar' \) -printf '%T@ %p\0' 2>/dev/null | sort -zr
-)
 
-echo ""
+collect_seen_inns_from_csp_root() {
+  local d inn
+  for d in "$CSP_ROOT"/*/; do
+    [[ -d "$d" ]] || continue
+    inn="$(basename "$d")"
+    [[ "$inn" =~ ^[0-9]{10,12}$ ]] || continue
+    seen_inns+=("$inn")
+  done
+}
+
+if [[ "$INSTALL_ONLY" != true ]]; then
+  echo "=== 1. Поиск архивов и распаковка по ИНН ==="
+  # find избегает «argument list too long» при тысячах файлов
+  find_depth=(-maxdepth 1)
+  if [[ "$RECURSIVE" == true ]]; then
+    find_depth=(-mindepth 2)
+  fi
+  while IFS= read -r -d '' archive; do
+    archive="${archive#* }"
+    inn=$(get_inn_for_archive "$archive")
+    if [[ -z "$inn" ]]; then
+      echo "  Пропуск (ИНН не найден): $(basename "$archive")"
+      continue
+    fi
+    if unpack_archive "$archive" "$inn"; then
+      seen_inns+=("$inn")
+    else
+      echo "  Пропуск из-за ошибки: $(basename "$archive")" >&2
+    fi
+  done < <(
+    find "$SOURCE_DIR" "${find_depth[@]}" -type f \( -iname '*.zip' -o -iname '*.rar' \) -printf '%T@ %p\0' 2>/dev/null | sort -zr
+  )
+  echo ""
+else
+  echo "=== 1. Распаковка пропущена (--install-only) ==="
+  collect_seen_inns_from_csp_root
+  echo "  Каталогов по ИНН в CSP: ${#seen_inns[@]}"
+  echo ""
+fi
+
+if [[ "$UNPACK_ONLY" == true ]]; then
+  echo "Распаковано каталогов ИНН: ${#seen_inns[@]}"
+  echo "Режим --unpack-only: csptest/certmgr пропущены."
+  exit 0
+fi
+
 echo "=== 2. Список контейнеров (csptest) ==="
 mapfile -t containers < <(list_containers)
 for c in "${containers[@]}"; do

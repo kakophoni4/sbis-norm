@@ -68,8 +68,8 @@ def parse_cert_info(cert_path: str) -> dict:
     for line in out.splitlines():
         line = line.strip()
 
-        if "ИНН ЮЛ=" in line:
-            m = re.search(r"ИНН ЮЛ=([0-9]+)", line)
+        if inn is None and ("ИНН ЮЛ=" in line or "ИНН ФЛ=" in line or "ИНН=" in line):
+            m = re.search(r"ИНН(?: ЮЛ| ФЛ)?=([0-9]+)", line)
             if m:
                 inn = m.group(1)
 
