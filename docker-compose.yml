@@ -13,7 +13,7 @@ services:
 
   web:
     build: .
-    entrypoint: ["/app/docker-entrypoint.sh"]
+    entrypoint: ["bash", "/app/docker-entrypoint.sh"]
     command: >
       sh -c "
         while ! nc -z db 5432; do sleep 0.1; done &&
@@ -36,7 +36,7 @@ services:
 
   worker:
     build: .
-    entrypoint: ["/app/docker-entrypoint.sh"]
+    entrypoint: ["bash", "/app/docker-entrypoint.sh"]
     command: celery -A tax_service worker -l info
     volumes:
       - .:/app
@@ -51,7 +51,7 @@ services:
 
   beat:
     build: .
-    entrypoint: ["/app/docker-entrypoint.sh"]
+    entrypoint: ["bash", "/app/docker-entrypoint.sh"]
     command: celery -A tax_service beat -l info
     volumes:
       - .:/app

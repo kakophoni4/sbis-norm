@@ -44,6 +44,7 @@ fi
 
 echo ""
 echo "=== Docker build + up ==="
+chmod +x "$PROJECT_DIR/docker-entrypoint.sh" 2>/dev/null || true
 docker compose up --build -d
 
 echo ""

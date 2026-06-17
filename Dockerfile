@@ -26,6 +26,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . /app/
 
+RUN chmod +x /app/docker-entrypoint.sh
+
 # Чтобы утилиты CryptoPro были в PATH (по желанию, но удобно)
 ENV PATH="/opt/cprocsp/bin/amd64:${PATH}"
 ENV LD_LIBRARY_PATH="/opt/cprocsp/lib/linux-amd64:${LD_LIBRARY_PATH}"
