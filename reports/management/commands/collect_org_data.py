@@ -19,6 +19,7 @@ import csv
 import json
 import logging
 import os
+import sys
 import tempfile
 import threading
 import time
@@ -295,6 +296,11 @@ class Command(BaseCommand):
             help="Не запрашивать star-pro.ru (КПП/ОГРН/имя). По умолчанию egrul включён",
         )
         parser.add_argument(
+            "--egrul",
+            action="store_true",
+            help="(устар.) то же что по умолчанию; оставлено для совместимости",
+        )
+        parser.add_argument(
             "--parse-cert",
             action="store_true",
             help="Экспорт .cer через certmgr на каждый ИНН (медленно, для ФИО/КПП из Subject)",
@@ -309,6 +315,18 @@ class Command(BaseCommand):
             help="Положить отдельный {ИНН}.json в подкаталог companies/",
         )
         parser.add_argument("--quiet", action="store_true")
+        parser.add_argument(
+            "--progress-every",
+            type=int,
+            default=25,
+            help="Каждые N ИНН писать строку в лог и обновлять *_progress.csv (даже с --quiet)",
+        )
+
+    def _write_csv(self, path: Path, rows: list[dict]) -> None:
+        with path.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(rows)
 
     def handle(self, *args, **options):
         if options["quiet"]:
@@ -346,6 +364,7 @@ class Command(BaseCommand):
         ts = dj_timezone.now().strftime("%Y%m%d_%H%M%S")
         json_path = out_dir / f"organizations_{ts}.json"
         csv_path = out_dir / f"organizations_{ts}.csv"
+        progress_csv_path = out_dir / f"organizations_{ts}_progress.csv"
         xlsx_path = out_dir / f"organizations_{ts}.xlsx"
         companies_dir = out_dir / f"companies_{ts}"
 
@@ -354,12 +373,14 @@ class Command(BaseCommand):
         call_egrul = not bool(options["no_egrul"])
         parse_cert = bool(options["parse_cert"])
         egrul_delay = max(0.0, float(options["egrul_delay"]))
+        progress_every = max(1, int(options.get("progress_every") or 25))
 
         self.stdout.write(f"ИНН к сбору: {len(inns)}")
         self.stdout.write(f"СБИС СписокНашихОрганизаций: {'да' if call_sbis else 'нет'}")
         self.stdout.write(f"star-pro (КПП/ОГРН/имя): {'да' if call_egrul else 'нет'}")
         self.stdout.write(f"Парсинг сертификата (certmgr): {'да' if parse_cert else 'нет'}")
         self.stdout.write(f"Потоков: {workers}")
+        self.stdout.write(f"Промежуточный CSV: {progress_csv_path} (каждые {progress_every} ИНН)")
         if auth_csv:
             self.stdout.write(f"Auth CSV: {auth_csv}")
         if not call_sbis and not call_egrul:
@@ -391,14 +412,21 @@ class Command(BaseCommand):
             with lock:
                 rows.append(r)
                 done[0] += 1
-                if not options["quiet"]:
-                    self.stdout.write(
-                        f"[{done[0]}/{total}] {r['ИНН']} — "
-                        f"auth={r['СтатусСБИС_auth']}, "
-                        f"ЭЦП до {r['ЭЦП_действует_по'] or '—'}, "
-                        f"КПП={r['КПП'] or '—'}, "
-                        f"имя={(r['Наименование'] or '—')[:35]}"
-                    )
+                n = done[0]
+                line = (
+                    f"[{n}/{total}] {r['ИНН']} — "
+                    f"auth={r['СтатусСБИС_auth']}, "
+                    f"ЭЦП до {r['ЭЦП_действует_по'] or '—'}, "
+                    f"КПП={r['КПП'] or '—'}, "
+                    f"имя={(r['Наименование'] or '—')[:35]}"
+                )
+                show = (not options["quiet"]) or (n % progress_every == 0) or (n == total)
+                if show:
+                    self.stdout.write(line)
+                    sys.stdout.flush()
+                if n % progress_every == 0 or n == total:
+                    snapshot = sorted(rows, key=lambda x: x.get("ИНН", ""))
+                    self._write_csv(progress_csv_path, snapshot)
 
         if workers <= 1:
             for inn in inns:
@@ -424,6 +452,11 @@ class Command(BaseCommand):
             w = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
+
+        try:
+            progress_csv_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
         if options["per_inn_json"]:
             companies_dir.mkdir(parents=True, exist_ok=True)
