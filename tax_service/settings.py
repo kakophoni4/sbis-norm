@@ -162,6 +162,12 @@ NODEMAVEN_API_KEY = env('NODEMAVEN_API_KEY', default='')
 SBIS_DEFAULT_INN = env('SBIS_DEFAULT_INN', default='')
 CSP_USE_SUDO = env.bool('CSP_USE_SUDO', default=True)
 
+# 1С HTTP-сервис mole (загрузка организаций /units)
+ONE_C_MOLE_BASE_URL = env('ONE_C_MOLE_BASE_URL', default='')
+ONE_C_MOLE_USER = env('ONE_C_MOLE_USER', default='')
+ONE_C_MOLE_PASSWORD = env('ONE_C_MOLE_PASSWORD', default='')
+ONE_C_MOLE_TIMEOUT_SEC = env.int('ONE_C_MOLE_TIMEOUT_SEC', default=300)
+
 # nodemaven SDK utils читают NODEMAVEN_APIKEY
 if NODEMAVEN_API_KEY and not os.environ.get('NODEMAVEN_APIKEY'):
     os.environ['NODEMAVEN_APIKEY'] = NODEMAVEN_API_KEY

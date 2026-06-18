@@ -110,6 +110,33 @@ docker cp $(docker-compose ps -q web):/app/media/org_export/organizations_YYYYMM
 
 Колонки в файле (только для 1С): ИНН, КПП, ОГРН, наименования, код налогового органа, ЮЛ/ИП, ФИО ИП, сроки ЭЦП, ЭЦПОтозвана.
 
+### Загрузка организаций в 1С (mole /units)
+
+В `app.env`:
+
+```env
+ONE_C_MOLE_BASE_URL=http://45.142.193.159/demo/hs/mole
+ONE_C_MOLE_USER=mole
+ONE_C_MOLE_PASSWORD=...
+ONE_C_MOLE_TIMEOUT_SEC=300
+```
+
+Проверка Basic auth:
+
+```bash
+docker-compose exec web python manage.py upload_org_units_1c --health-only
+```
+
+Загрузка пакетами (1С медленная — по 20–30 шт.):
+
+```bash
+docker-compose exec web python manage.py upload_org_units_1c \
+  --from-csv /app/media/org_export/organizations_FINAL_670_v2.csv \
+  --batch-size 25 --delay 2
+```
+
+Тест без отправки: `--dry-run`. Только первые N: `--limit 10`.
+
 **Не запускайте** `sbis_keys_install_linux.sh` на хосте — CryptoPro там не видит контейнеры. Только внутри Docker:
 
 ```bash
