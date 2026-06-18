@@ -104,11 +104,12 @@ def get_inn_from_container_name(csptest_name: str) -> str | None:
 
 
 def get_inn_from_cont_name(csptest_name: str, known_inns: set[str]) -> str | None:
-    """ИНН из имени контейнера: подстрока известного ИНН или 10/12 цифр (как в sbis_keys_install_linux.sh)."""
+    """ИНН из имени контейнера (7730322740atrium), без ложных совпадений внутри UUID."""
     name = normalize_container_id(csptest_name)
-    for inn in sorted(known_inns, key=len, reverse=True):
-        if inn in name:
-            return inn
+    m = re.match(r"^(\d{12}|\d{10})", name)
+    if m:
+        return m.group(1)[:10] if len(m.group(1)) >= 10 else m.group(1)
+    # UUID/текстовые имена — не ищем подстроку ИНН в known_inns (даёт ложные совпадения)
     return get_inn_from_container_name(csptest_name)
 
 
@@ -211,15 +212,15 @@ class CspIndex:
         subject_line: str | None = None,
         certmgr_out: str | None = None,
     ) -> str | None:
-        if certmgr_out:
-            inn = _inn_from_certmgr_output(certmgr_out)
-            if inn:
-                return inn
         subject_full = subject_line or ""
         if certmgr_out and not subject_full:
             subject_full = _subject_text_from_listing(certmgr_out)
         if subject_full:
             inn = _inn_from_text(subject_full)
+            if inn:
+                return inn
+        if certmgr_out:
+            inn = _inn_from_certmgr_output(certmgr_out)
             if inn:
                 return inn
         for resolver in (
@@ -228,7 +229,7 @@ class CspIndex:
             lambda: get_inn_from_cont_name(csptest_name, self.known_inns),
         ):
             inn = resolver()
-            if inn:
+            if inn and inn != FNS_ISSUER_INN:
                 return inn
         return None
 
@@ -270,6 +271,10 @@ class CspIndex:
         return None, None
 
 
+# ИНН ФНС в Issuer — никогда не использовать как ИНН организации
+FNS_ISSUER_INN = "7707329152"
+
+
 def _inn_from_text(text: str) -> str | None:
     """ИНН из Subject (предпочтительно ИНН ЮЛ, не Issuer ФНС)."""
     if not text:
@@ -277,13 +282,17 @@ def _inn_from_text(text: str) -> str | None:
     for pattern in (r"ИНН ЮЛ=([0-9]+)", r"ИНН ФЛ=([0-9]+)", r"ИНН=([0-9]+)"):
         m = re.search(pattern, text)
         if m:
-            return m.group(1)
+            inn = m.group(1)
+            if inn == FNS_ISSUER_INN:
+                continue
+            return inn
     return None
 
 
 def _inn_from_certmgr_output(out: str) -> str | None:
-    """ИНН из полного вывода certmgr -list -file (Subject может быть на нескольких строках)."""
-    return _inn_from_text(out)
+    """ИНН ЮЛ только из блока Subject (Issuer ФНС содержит ИНН ЮЛ=7707329152)."""
+    subject = _subject_text_from_listing(out)
+    return _inn_from_text(subject) if subject else None
 
 
 def _subject_text_from_listing(out: str) -> str:
