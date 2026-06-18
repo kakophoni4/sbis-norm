@@ -52,6 +52,8 @@ def auth_sbis_by_cert(
     proxy_url: str | None = None,
     timeout_sec: int = 30,
     total_budget_sec: int = 45,
+    proxy_want: int = 5,
+    proxy_warmup_budget_sec: int = 12,
 ) -> str:
     logger.info("[SBIS auth] 1/4 Чтение серта и подготовка запроса")
     with open(cert_path, "rb") as f:
@@ -90,6 +92,8 @@ def auth_sbis_by_cert(
         timeout=max(8, int(timeout_sec)),
         proxy_url_override=proxy_url,   # pinned proxy if provided
         total_budget_sec=max(12, int(total_budget_sec)),
+        proxy_want=proxy_want,
+        proxy_warmup_budget_sec=proxy_warmup_budget_sec,
     )
     log_http_exchange("AUTH", AUTH_URL, headers, req_json, resp)
 

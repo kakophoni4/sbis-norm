@@ -345,6 +345,8 @@ def _sbis_request(
     allow_redirects: bool = True,
     proxy_url_override: str | None = None,
     total_budget_sec: int = 45,
+    proxy_want: int = 5,
+    proxy_warmup_budget_sec: int = 12,
 ):
     """
     Главная точка HTTP.
@@ -393,7 +395,11 @@ def _sbis_request(
     if inn:
         try:
             # хотим несколько штук, но быстро
-            extra = warmup_good_proxies_for_inn(inn, want=5, total_budget_sec=12)
+            extra = warmup_good_proxies_for_inn(
+                inn,
+                want=max(1, int(proxy_want)),
+                total_budget_sec=max(6, int(proxy_warmup_budget_sec)),
+            )
             for u in extra:
                 if u and u not in candidates:
                     candidates.append(u)

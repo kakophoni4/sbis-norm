@@ -708,6 +708,8 @@ class SbisSessionService:
     progress_callback: Optional[Callable[[str], None]] = field(
         default=None, repr=False, compare=False
     )
+    proxy_want: Optional[int] = field(default=None, repr=False, compare=False)
+    proxy_warmup_budget_sec: Optional[int] = field(default=None, repr=False, compare=False)
 
     def authenticate(self) -> str:
         """
@@ -735,7 +737,12 @@ class SbisSessionService:
             _progress("Отпечаток из файла (certmgr -list -file)...")
             thumbprint = get_thumbprint_from_cert(cert_path)
             _progress("Авторизация в СБИС (HTTP + cryptcp -decr)...")
-            session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn_value)
+            auth_kw: dict = {}
+            if self.proxy_want is not None:
+                auth_kw["proxy_want"] = self.proxy_want
+            if self.proxy_warmup_budget_sec is not None:
+                auth_kw["proxy_warmup_budget_sec"] = self.proxy_warmup_budget_sec
+            session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn_value, **auth_kw)
         except CertInvalidNoRetryError as exc:
             self._write_audit("ERROR", str(exc))
             logger.error(

@@ -4,11 +4,11 @@
 Пример:
   docker compose exec web python manage.py test_sbis_auth_all --quiet
   docker compose exec web python manage.py test_sbis_auth_all --limit 20
-  docker compose exec web python manage.py test_sbis_auth_all --workers 4 --delay 0.2 --quiet
+  docker compose exec web python manage.py test_sbis_auth_all --workers 12 --delay 0 --quiet
 
 Полный прогон ~1004 ИНН (в screen/nohup):
   nohup docker compose exec -T web python manage.py test_sbis_auth_all \\
-    --quiet --workers 4 --delay 0.2 > /tmp/sbis_auth_all.log 2>&1 &
+    --quiet --workers 12 --delay 0 > /tmp/sbis_auth_all.log 2>&1 &
   tail -f /tmp/sbis_auth_all.log
 """
 import csv
@@ -118,6 +118,8 @@ def _check_inn(
     certs: list[Certificate],
     *,
     skip_expired: bool,
+    proxy_want: int,
+    proxy_warmup_budget_sec: int,
 ) -> InnCheckResult:
     close_old_connections()
     if not certs:
@@ -136,7 +138,11 @@ def _check_inn(
             continue
 
         try:
-            session_id = SbisSessionService(certificate=cert).authenticate()
+            session_id = SbisSessionService(
+                certificate=cert,
+                proxy_want=proxy_want,
+                proxy_warmup_budget_sec=proxy_warmup_budget_sec,
+            ).authenticate()
             return InnCheckResult(inn, True, "ok", cert, session_id)
         except SbisAuthError as e:
             last_msg = str(e)
@@ -172,7 +178,19 @@ class Command(BaseCommand):
             type=int,
             default=1,
             metavar="N",
-            help="Потоков параллельно (1–6, по умолчанию 1). Рекомендуется 3–4.",
+            help="Потоков параллельно (1–12). При ≥8 автоматически короткий прогрев прокси.",
+        )
+        parser.add_argument(
+            "--proxy-want",
+            type=int,
+            default=0,
+            help="Сколько прокси прогревать на ИНН (0 = авто: 2 при workers≥8, иначе 3)",
+        )
+        parser.add_argument(
+            "--proxy-budget",
+            type=int,
+            default=0,
+            help="Бюджет прогрева прокси, сек (0 = авто: 6 при workers≥8, иначе 10)",
         )
         parser.add_argument(
             "--inn",
@@ -198,7 +216,19 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         skip_expired = not options["call_sbis_for_expired"]
-        workers = max(1, min(6, int(options.get("workers") or 1)))
+        workers = max(1, min(12, int(options.get("workers") or 1)))
+        if options.get("proxy_want"):
+            proxy_want = max(1, min(10, int(options["proxy_want"])))
+        elif workers >= 8:
+            proxy_want = 2
+        else:
+            proxy_want = 3
+        if options.get("proxy_budget"):
+            proxy_budget = max(4, min(30, int(options["proxy_budget"])))
+        elif workers >= 8:
+            proxy_budget = 6
+        else:
+            proxy_budget = 10
         if options["quiet"]:
             for name in ("reports.services.sbis", "reports.services.sbis_mail"):
                 logging.getLogger(name).setLevel(logging.WARNING)
@@ -242,8 +272,15 @@ class Command(BaseCommand):
         )
         self.stdout.write(f"ИНН к проверке: {total}")
         self.stdout.write(f"Потоков: {workers}")
+        self.stdout.write(f"Прогрев прокси: want={proxy_want}, budget={proxy_budget}s")
         self.stdout.write(f"БД: записей={db_total}, уникальных ИНН={db_unique}, ИНН с uMy={db_auth}")
-        if workers > 4:
+        if workers >= 8:
+            self.stdout.write(
+                self.style.WARNING(
+                    "12 потоков — следите за proxy_error и 429; при сбоях: --workers 6 --proxy-want 3"
+                )
+            )
+        elif workers > 4:
             self.stdout.write(
                 self.style.WARNING(
                     "При >4 потоках возможны proxy_error / EMFILE — начните с --workers 3"
@@ -337,7 +374,13 @@ class Command(BaseCommand):
             if workers <= 1:
                 for inn in inns:
                     apply_result(
-                        _check_inn(inn, inn_certs[inn], skip_expired=skip_expired)
+                        _check_inn(
+                            inn,
+                            inn_certs[inn],
+                            skip_expired=skip_expired,
+                            proxy_want=proxy_want,
+                            proxy_warmup_budget_sec=proxy_budget,
+                        )
                     )
             else:
                 with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -347,6 +390,8 @@ class Command(BaseCommand):
                             inn,
                             inn_certs[inn],
                             skip_expired=skip_expired,
+                            proxy_want=proxy_want,
+                            proxy_warmup_budget_sec=proxy_budget,
                         ): inn
                         for inn in inns
                     }
@@ -366,6 +411,8 @@ class Command(BaseCommand):
             "valid_count": len(valid_inns),
             "failed_count": len(failed_inns),
             "workers": workers,
+            "proxy_want": proxy_want,
+            "proxy_warmup_budget_sec": proxy_budget,
             "stats": stats,
             "error_categories_ru": ERROR_CATEGORY_RU,
             "csv": str(csv_path),
