@@ -9,9 +9,14 @@
   - star-pro.ru по ИНН (КПП, ОГРН, краткое имя) — опционально
 
 Пример:
-  python manage.py collect_org_data --from-file valid_inns_final.txt --limit 5
-  python manage.py collect_org_data --from-file valid_inns_final.txt --workers 4 --quiet
-  python manage.py collect_org_data --from-file valid_inns_final.txt --sbis --workers 4 --quiet
+  docker compose exec web python manage.py collect_org_data --from-file valid_inns_final.txt --limit 5
+  docker compose exec web python manage.py collect_org_data --from-file valid_inns_final.txt --sbis --workers 4 --quiet
+  docker compose exec web python manage.py collect_org_data \\
+    --from-file valid_inns_final.txt \\
+    --auth-csv /app/media/sbis_auth_scan/sbis_auth_report_YYYYMMDD_HHMMSS.csv \\
+    --sbis --workers 4 --quiet
+
+Мониторинг: /app/media/org_export/collect_org_LIVE.log и collect_org_LIVE.status.json
 """
 from __future__ import annotations
 
@@ -38,7 +43,6 @@ from reports.management.commands.test_sbis_auth_all import (
 from reports.models import Certificate, Organization
 from reports.services.kpp_external import fetch_kpp_star_pro
 from reports.services.sbis import export_cert_der, parse_kpp_from_cert_file
-from reports.services.sbis.crypto import get_fio_from_cert_file
 from reports.services.sbis.organizations import (
     kpp_to_tax_office_code,
     pick_best_sbis_org,
@@ -46,6 +50,7 @@ from reports.services.sbis.organizations import (
 )
 from reports.services.sbis_mail import SbisAuthError, SbisSessionService
 
+# Колонки для передачи в 1С / внешние файлы
 EXPORT_COLUMNS = [
     "ИНН",
     "КПП",
@@ -58,20 +63,18 @@ EXPORT_COLUMNS = [
     "ФамилияИП",
     "ИмяИП",
     "ОтчествоИП",
-    "ФИО_ВладелецСерта",
     "ЭЦП_действует_с",
     "ЭЦП_действует_по",
     "ЭЦПОтозвана",
-    "СтатусСБИС_auth",
-    "КатегорияОшибки",
-    "Отпечаток",
-    "КодФилиала",
-    "КодСтраны",
-    "ИсточникКПП",
-    "ИсточникНаименования",
-    "sbis_error",
-    "egrul_error",
 ]
+
+
+def _empty_export_row(inn: str = "") -> dict:
+    row = {col: "" for col in EXPORT_COLUMNS}
+    if inn:
+        row["ИНН"] = inn
+    row["ЭЦПОтозвана"] = "нет"
+    return row
 
 
 def _fmt_dt(dt) -> str:
@@ -118,24 +121,27 @@ def _collect_one(
     parse_cert: bool,
     proxy_want: int,
     proxy_budget: int,
-) -> dict:
+) -> tuple[dict, dict]:
+    """Возвращает (строка для экспорта, служебная meta для логов)."""
     close_old_connections()
-    row = {col: "" for col in EXPORT_COLUMNS}
-    row["ИНН"] = inn
-    row["ЭЦПОтозвана"] = "нет"
-    row["СтатусСБИС_auth"] = "неизвестно"
+    row = _empty_export_row(inn)
+    meta = {
+        "auth_status": "неизвестно",
+        "error_category": "",
+        "sbis_error": "",
+        "egrul_error": "",
+    }
 
     auth_row = auth_by_inn.get(inn) or {}
     if auth_row:
         status = (auth_row.get("status") or "").strip()
         cat = (auth_row.get("error_category") or "").strip()
-        row["СтатусСБИС_auth"] = "ok" if status == "ok" else "fail"
-        row["КатегорияОшибки"] = cat
+        meta["auth_status"] = "ok" if status == "ok" else "fail"
+        meta["error_category"] = cat
         if cat == "revoked_or_untrusted":
             row["ЭЦПОтозвана"] = "да"
         row["ЭЦП_действует_с"] = _parse_csv_date(auth_row.get("not_before") or "")
         row["ЭЦП_действует_по"] = _parse_csv_date(auth_row.get("not_after") or "")
-        row["Отпечаток"] = (auth_row.get("thumbprint") or "").strip()
 
     cert = (
         Certificate.objects.filter(inn=inn, has_private_key=True, is_active=True)
@@ -149,24 +155,17 @@ def _collect_one(
             row["ЭЦП_действует_с"] = _fmt_dt(cert.not_before)
         if not row["ЭЦП_действует_по"] and cert.not_after:
             row["ЭЦП_действует_по"] = _fmt_dt(cert.not_after)
-        if not row["Отпечаток"] and cert.thumbprint:
-            row["Отпечаток"] = cert.thumbprint.strip()
         if cert.kpp and not row["КПП"]:
             row["КПП"] = str(cert.kpp).strip()
-            row["ИсточникКПП"] = "БД Certificate"
 
         if parse_cert and cert.csptest_name:
             fd, cert_path = tempfile.mkstemp(prefix=f"org_col_{inn}_", suffix=".cer")
             os.close(fd)
             try:
                 export_cert_der(cert.csptest_name, cert_path)
-                fio = (get_fio_from_cert_file(cert_path) or "").strip()
-                if fio and fio != "—":
-                    row["ФИО_ВладелецСерта"] = fio
                 cert_kpp = parse_kpp_from_cert_file(cert_path) or ""
                 if cert_kpp and not row["КПП"]:
                     row["КПП"] = cert_kpp
-                    row["ИсточникКПП"] = "сертификат"
             except Exception:
                 pass
             finally:
@@ -178,10 +177,8 @@ def _collect_one(
     if org:
         if org.kpp and not row["КПП"]:
             row["КПП"] = org.kpp.strip()
-            row["ИсточникКПП"] = "БД Organization"
         if org.name and not row["Наименование"]:
             row["Наименование"] = org.name.strip()
-            row["ИсточникНаименования"] = "БД Organization"
 
     if call_egrul:
         try:
@@ -189,23 +186,21 @@ def _collect_one(
             if egr.get("ok"):
                 if egr.get("kpp") and not row["КПП"]:
                     row["КПП"] = egr["kpp"]
-                    row["ИсточникКПП"] = "star-pro"
                 if egr.get("ogrn"):
                     row["ОГРН"] = egr["ogrn"]
                 if egr.get("name_short"):
                     row["НаименованиеСокращенное"] = egr["name_short"]
                     if not row["Наименование"]:
                         row["Наименование"] = egr["name_short"]
-                        row["ИсточникНаименования"] = "star-pro"
             else:
-                row["egrul_error"] = (egr.get("error") or "unknown")[:200]
+                meta["egrul_error"] = (egr.get("error") or "unknown")[:200]
         except Exception as e:
-            row["egrul_error"] = str(e)[:200]
+            meta["egrul_error"] = str(e)[:200]
 
     pack: dict = {"success": False, "organizations": []}
     if call_sbis:
         if not cert:
-            row["sbis_error"] = "нет активного сертификата в БД"
+            meta["sbis_error"] = "нет активного сертификата в БД"
         else:
             try:
                 session_id = SbisSessionService(
@@ -213,6 +208,7 @@ def _collect_one(
                     proxy_want=proxy_want,
                     proxy_warmup_budget_sec=proxy_budget,
                 ).authenticate()
+                meta["auth_status"] = "ok"
                 pack = sbis_list_our_organizations(
                     inn,
                     session_id,
@@ -220,33 +216,29 @@ def _collect_one(
                     filter_kpp=row["КПП"] or "",
                 )
             except SbisAuthError as e:
-                row["sbis_error"] = str(e)[:300]
-                row["СтатусСБИС_auth"] = "fail"
-                row["КатегорияОшибки"] = classify_sbis_error(str(e))
+                meta["sbis_error"] = str(e)[:300]
+                meta["auth_status"] = "fail"
+                meta["error_category"] = classify_sbis_error(str(e))
             except Exception as e:
-                row["sbis_error"] = str(e)[:300]
+                meta["sbis_error"] = str(e)[:300]
 
     if pack.get("success"):
         best = pick_best_sbis_org(pack.get("organizations") or [], inn)
         if best:
             if best.get("kpp"):
                 row["КПП"] = _first_non_empty(best["kpp"], row["КПП"])
-                row["ИсточникКПП"] = _first_non_empty(row["ИсточникКПП"], "СБИС")
             if best.get("name"):
                 row["Наименование"] = _first_non_empty(best["name"], row["Наименование"])
                 row["НаименованиеПолное"] = best["name"]
-                row["ИсточникНаименования"] = _first_non_empty(row["ИсточникНаименования"], "СБИС")
-            row["КодФилиала"] = best.get("branch_code") or ""
-            row["КодСтраны"] = best.get("country_code") or ""
             et = best.get("entity_type") or ""
             row["ЮрлицоИлиИП"] = "ИП" if et == "IP" else ("ЮЛ" if et == "UL" else "")
             if et == "IP":
                 row["ФамилияИП"] = best.get("surname") or ""
                 row["ИмяИП"] = best.get("firstname") or ""
                 row["ОтчествоИП"] = best.get("patronymic") or ""
-    elif pack.get("error") and not row["sbis_error"]:
+    elif pack.get("error") and not meta["sbis_error"]:
         err = pack["error"]
-        row["sbis_error"] = str(err.get("message") if isinstance(err, dict) else err)[:300]
+        meta["sbis_error"] = str(err.get("message") if isinstance(err, dict) else err)[:300]
 
     if not row["НаименованиеПолное"] and row["Наименование"]:
         row["НаименованиеПолное"] = row["Наименование"]
@@ -261,7 +253,7 @@ def _collect_one(
     elif len(inn) == 10:
         row["ЮрлицоИлиИП"] = row["ЮрлицоИлиИП"] or "ЮЛ"
 
-    return row
+    return row, meta
 
 
 class Command(BaseCommand):
@@ -303,7 +295,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--parse-cert",
             action="store_true",
-            help="Экспорт .cer через certmgr на каждый ИНН (медленно, для ФИО/КПП из Subject)",
+            help="Экспорт .cer через certmgr на каждый ИНН (медленно, для КПП из Subject)",
         )
         parser.add_argument("--egrul-delay", type=float, default=0.35)
         parser.add_argument("--workers", type=int, default=1)
@@ -335,6 +327,7 @@ class Command(BaseCommand):
         state: str,
         total: int,
         rows: list[dict],
+        meta_rows: list[dict],
         started_at: str,
         last_inn: str = "",
         last_row: dict | None = None,
@@ -343,8 +336,8 @@ class Command(BaseCommand):
         done = len(rows)
         with_kpp = sum(1 for r in rows if r.get("КПП"))
         with_name = sum(1 for r in rows if r.get("Наименование"))
-        sbis_err = sum(1 for r in rows if r.get("sbis_error"))
-        egrul_err = sum(1 for r in rows if r.get("egrul_error"))
+        sbis_err = sum(1 for m in meta_rows if m.get("sbis_error"))
+        egrul_err = sum(1 for m in meta_rows if m.get("egrul_error"))
         payload = {
             "state": state,
             "done": done,
@@ -435,6 +428,7 @@ class Command(BaseCommand):
             )
 
         rows: list[dict] = []
+        meta_rows: list[dict] = []
         lock = threading.Lock()
         done = [0]
         total = len(inns)
@@ -444,6 +438,7 @@ class Command(BaseCommand):
             state="running",
             total=total,
             rows=rows,
+            meta_rows=meta_rows,
             started_at=started_at,
             extra={
                 "sbis": call_sbis,
@@ -457,7 +452,7 @@ class Command(BaseCommand):
             encoding="utf-8",
         )
 
-        def _run(inn: str) -> dict:
+        def _run(inn: str) -> tuple[dict, dict]:
             if call_egrul and egrul_delay > 0:
                 time.sleep(egrul_delay)
             return _collect_one(
@@ -470,22 +465,23 @@ class Command(BaseCommand):
                 proxy_budget=max(4, int(options["proxy_budget"])),
             )
 
-        def _store(r: dict) -> None:
+        def _store(r: dict, meta: dict) -> None:
             with lock:
                 rows.append(r)
+                meta_rows.append(meta)
                 done[0] += 1
                 n = done[0]
                 line = (
                     f"[{n}/{total}] {r['ИНН']} — "
-                    f"auth={r['СтатусСБИС_auth']}, "
+                    f"auth={meta['auth_status']}, "
                     f"ЭЦП до {r['ЭЦП_действует_по'] or '—'}, "
                     f"КПП={r['КПП'] or '—'}, "
                     f"имя={(r['Наименование'] or '—')[:35]}"
                 )
-                if r.get("sbis_error"):
-                    line += f" | sbis_err={(r['sbis_error'] or '')[:60]}"
-                if r.get("egrul_error"):
-                    line += f" | egrul_err={(r['egrul_error'] or '')[:40]}"
+                if meta.get("sbis_error"):
+                    line += f" | sbis_err={(meta['sbis_error'] or '')[:60]}"
+                if meta.get("egrul_error"):
+                    line += f" | egrul_err={(meta['egrul_error'] or '')[:40]}"
 
                 with live_log_path.open("a", encoding="utf-8") as lf:
                     lf.write(line + "\n")
@@ -505,6 +501,7 @@ class Command(BaseCommand):
                     state="running",
                     total=total,
                     rows=rows,
+                    meta_rows=meta_rows,
                     started_at=started_at,
                     last_inn=r["ИНН"],
                     last_row=r,
@@ -519,16 +516,21 @@ class Command(BaseCommand):
 
         if workers <= 1:
             for inn in inns:
-                _store(_run(inn))
+                row, meta = _run(inn)
+                _store(row, meta)
         else:
             with ThreadPoolExecutor(max_workers=workers) as pool:
                 futs = {pool.submit(_run, inn): inn for inn in inns}
                 for fut in as_completed(futs):
                     try:
-                        _store(fut.result())
+                        row, meta = fut.result()
+                        _store(row, meta)
                     except Exception as e:
                         inn = futs[fut]
-                        _store({col: "" for col in EXPORT_COLUMNS} | {"ИНН": inn, "sbis_error": str(e)})
+                        _store(
+                            _empty_export_row(inn),
+                            {"auth_status": "fail", "error_category": "", "sbis_error": str(e), "egrul_error": ""},
+                        )
 
         rows.sort(key=lambda r: r.get("ИНН", ""))
 
@@ -584,6 +586,7 @@ class Command(BaseCommand):
             state="done",
             total=total,
             rows=rows,
+            meta_rows=meta_rows,
             started_at=started_at,
             extra={"json": str(json_path), "csv": str(csv_path)},
         )
