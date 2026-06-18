@@ -2,21 +2,41 @@
 Массовая проверка авторизации СБИС по всем ИНН в БД.
 
 Пример:
-  docker compose exec web python manage.py test_sbis_auth_all
+  docker compose exec web python manage.py test_sbis_auth_all --quiet
   docker compose exec web python manage.py test_sbis_auth_all --limit 20
   docker compose exec web python manage.py test_sbis_auth_all --output-dir /app/media/sbis_auth_scan
+
+Полный прогон ~1004 ИНН (в screen/nohup):
+  nohup docker compose exec -T web python manage.py test_sbis_auth_all --quiet --delay 0.5 \\
+    > /tmp/sbis_auth_all.log 2>&1 &
+  tail -f /tmp/sbis_auth_all.log
 """
 import csv
 import json
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
-from django.utils import timezone
+from django.utils import timezone as dj_timezone
 
 from reports.models import Certificate
 from reports.services.sbis_mail import SbisAuthError, SbisSessionService
+
+
+ERROR_CATEGORY_RU = {
+    "ok": "OK — session получен",
+    "expired": "Сертификат просрочен",
+    "expired_local": "Просрочен (not_after в БД, SBIS не вызывали)",
+    "revoked_or_untrusted": "Отозван / не доверенный",
+    "not_registered_in_sbis": "Не зарегистрирован в СБИС",
+    "registration_pending": "Ожидает регистрации в СБИС",
+    "umy_not_linked": "Нет PrivateKey Link в uMy",
+    "proxy_error": "Ошибка прокси NodeMaven / сети",
+    "no_cert": "Нет сертификата в БД",
+    "other_error": "Прочая ошибка",
+}
 
 
 def classify_sbis_error(message: str) -> str:
@@ -43,6 +63,7 @@ FAIL_FAST_CATEGORIES = frozenset(
         "revoked_or_untrusted",
         "not_registered_in_sbis",
         "expired",
+        "expired_local",
         "registration_pending",
         "umy_not_linked",
     }
@@ -60,6 +81,23 @@ def pick_certs_for_inn(inn: str, try_all: bool):
         best = qs.order_by("-not_after", "-id").first()
         return [best] if best else []
     return list(qs.order_by("-not_after", "-id"))
+
+
+def _fmt_dt(dt) -> str:
+    if not dt:
+        return ""
+    if dj_timezone.is_naive(dt):
+        dt = dj_timezone.make_aware(dt, timezone.utc)
+    return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _cert_expired(cert: Certificate, now) -> bool:
+    na = cert.not_after
+    if not na:
+        return False
+    if dj_timezone.is_naive(na):
+        na = dj_timezone.make_aware(na, timezone.utc)
+    return na <= now
 
 
 class Command(BaseCommand):
@@ -95,17 +133,25 @@ class Command(BaseCommand):
             action="store_true",
             help="Перебирать все сертификаты ИНН (по умолчанию — один лучший из uMy)",
         )
+        parser.add_argument(
+            "--call-sbis-for-expired",
+            action="store_true",
+            help="Вызывать СБИС даже для просроченных по not_after (по умолчанию просроченные только в CSV)",
+        )
 
     def handle(self, *args, **options):
+        skip_expired = not options["call_sbis_for_expired"]
         if options["quiet"]:
             for name in ("reports.services.sbis", "reports.services.sbis_mail"):
                 logging.getLogger(name).setLevel(logging.WARNING)
 
         out_dir = Path(options["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
-        ts = timezone.now().strftime("%Y%m%d_%H%M%S")
+        now = dj_timezone.now()
+        ts = now.strftime("%Y%m%d_%H%M%S")
         csv_path = out_dir / f"sbis_auth_report_{ts}.csv"
         valid_path = out_dir / f"valid_inns_{ts}.txt"
+        failed_path = out_dir / f"failed_inns_{ts}.txt"
         summary_path = out_dir / f"summary_{ts}.json"
 
         only_inns = [x.strip() for x in options["inn"] if x and x.strip()]
@@ -148,20 +194,58 @@ class Command(BaseCommand):
         self.stdout.write(f"Отчёт: {csv_path}")
 
         valid_inns: list[str] = []
+        failed_inns: list[str] = []
         stats: dict[str, int] = {}
 
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(
-                ["inn", "status", "error_category", "certificate_id", "csptest_name", "message"]
+                [
+                    "inn",
+                    "status",
+                    "error_category",
+                    "error_category_ru",
+                    "certificate_id",
+                    "csptest_name",
+                    "thumbprint",
+                    "not_before",
+                    "not_after",
+                    "expired_in_db",
+                    "has_private_key",
+                    "message",
+                ]
             )
+
+            def write_row(
+                inn,
+                status,
+                cat,
+                cert_obj,
+                msg="",
+            ):
+                writer.writerow(
+                    [
+                        inn,
+                        status,
+                        cat,
+                        ERROR_CATEGORY_RU.get(cat, cat),
+                        cert_obj.id if cert_obj else "",
+                        (cert_obj.csptest_name or "") if cert_obj else "",
+                        (cert_obj.thumbprint or "") if cert_obj else "",
+                        _fmt_dt(cert_obj.not_before) if cert_obj else "",
+                        _fmt_dt(cert_obj.not_after) if cert_obj else "",
+                        "yes" if cert_obj and _cert_expired(cert_obj, now) else "no",
+                        "yes" if cert_obj and cert_obj.has_private_key else "no",
+                        (msg or "")[:500],
+                    ]
+                )
 
             for idx, inn in enumerate(inns, start=1):
                 certs = pick_certs_for_inn(inn, options["try_all_certs"])
                 if not certs:
-                    row = [inn, "fail", "no_cert", "", "", "нет контейнера в БД"]
-                    writer.writerow(row)
+                    write_row(inn, "fail", "no_cert", None, "нет контейнера в БД")
                     stats["no_cert"] = stats.get("no_cert", 0) + 1
+                    failed_inns.append(inn)
                     f.flush()
                     self.stdout.write(f"[{idx}/{total}] {inn} — no_cert")
                     continue
@@ -169,18 +253,19 @@ class Command(BaseCommand):
                 ok = False
                 last_cat = "other_error"
                 last_msg = ""
-                last_cert_id = ""
-                last_name = ""
+                last_cert: Certificate | None = None
 
                 for cert in certs:
-                    last_cert_id = str(cert.id)
-                    last_name = cert.csptest_name or ""
+                    last_cert = cert
+                    if skip_expired and _cert_expired(cert, now):
+                        last_cat = "expired_local"
+                        last_msg = f"not_after={_fmt_dt(cert.not_after)}"
+                        continue
+
                     try:
                         service = SbisSessionService(certificate=cert)
                         session_id = service.authenticate()
-                        writer.writerow(
-                            [inn, "ok", "ok", cert.id, last_name, session_id[:40] + "..."]
-                        )
+                        write_row(inn, "ok", "ok", cert, session_id)
                         valid_inns.append(inn)
                         stats["ok"] = stats.get("ok", 0) + 1
                         ok = True
@@ -196,10 +281,13 @@ class Command(BaseCommand):
                         last_cat = classify_sbis_error(last_msg)
 
                 if not ok:
-                    writer.writerow([inn, "fail", last_cat, last_cert_id, last_name, last_msg[:500]])
+                    write_row(inn, "fail", last_cat, last_cert, last_msg)
                     stats[last_cat] = stats.get(last_cat, 0) + 1
+                    failed_inns.append(inn)
                     self.stdout.write(
-                        self.style.WARNING(f"[{idx}/{total}] {inn} — {last_cat}")
+                        self.style.WARNING(
+                            f"[{idx}/{total}] {inn} — {last_cat}: {ERROR_CATEGORY_RU.get(last_cat, last_cat)}"
+                        )
                     )
 
                 f.flush()
@@ -207,19 +295,26 @@ class Command(BaseCommand):
                     time.sleep(options["delay"])
 
         valid_path.write_text("\n".join(valid_inns) + ("\n" if valid_inns else ""), encoding="utf-8")
+        failed_path.write_text("\n".join(failed_inns) + ("\n" if failed_inns else ""), encoding="utf-8")
         summary = {
             "checked_inns": total,
             "valid_count": len(valid_inns),
+            "failed_count": len(failed_inns),
             "stats": stats,
+            "error_categories_ru": ERROR_CATEGORY_RU,
             "csv": str(csv_path),
             "valid_inns_file": str(valid_path),
+            "failed_inns_file": str(failed_path),
         }
         summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
         self.stdout.write("")
         self.stdout.write(self.style.SUCCESS(f"Валидных ИНН: {len(valid_inns)} / {total}"))
-        self.stdout.write(f"Список: {valid_path}")
-        self.stdout.write(f"CSV:    {csv_path}")
-        self.stdout.write(f"Сводка: {summary_path}")
+        self.stdout.write(f"С ошибкой:     {len(failed_inns)}")
+        self.stdout.write(f"Валидные:      {valid_path}")
+        self.stdout.write(f"С ошибками:    {failed_path}")
+        self.stdout.write(f"CSV:           {csv_path}")
+        self.stdout.write(f"Сводка JSON:   {summary_path}")
         for cat, n in sorted(stats.items(), key=lambda x: (-x[1], x[0])):
-            self.stdout.write(f"  {cat}: {n}")
+            ru = ERROR_CATEGORY_RU.get(cat, cat)
+            self.stdout.write(f"  {cat} ({ru}): {n}")
