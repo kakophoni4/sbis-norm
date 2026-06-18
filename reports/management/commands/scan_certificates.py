@@ -1,6 +1,7 @@
 import hashlib
 import re
 import subprocess
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -79,6 +80,11 @@ def normalize_container_id(csptest_name: str) -> str:
     return name
 
 
+def is_copy_container(csptest_name: str) -> bool:
+    """Дубликаты «… копия» — мусорные контейнеры без ключей."""
+    return csptest_name.rsplit("\\", 1)[-1].strip().endswith(" копия")
+
+
 def get_inn_from_container_name(csptest_name: str) -> str | None:
     name = normalize_container_id(csptest_name)
     m = re.search(r"\d{10}", name)
@@ -86,6 +92,15 @@ def get_inn_from_container_name(csptest_name: str) -> str | None:
         return m.group(0)
     m = re.search(r"\d{12}", name)
     return m.group(0) if m else None
+
+
+def get_inn_from_cont_name(csptest_name: str, known_inns: set[str]) -> str | None:
+    """ИНН из имени контейнера: подстрока известного ИНН или 10/12 цифр (как в sbis_keys_install_linux.sh)."""
+    name = normalize_container_id(csptest_name)
+    for inn in sorted(known_inns, key=len, reverse=True):
+        if inn in name:
+            return inn
+    return get_inn_from_container_name(csptest_name)
 
 
 class CspIndex:
@@ -97,6 +112,7 @@ class CspIndex:
         self.best_cer_by_inn: dict[str, Path] = {}
         self.inn_count = 0
         self.cer_count = 0
+        self.known_inns: set[str] = set()
         self._build()
 
     def _register_container_dir(self, inn: str, path: Path, depth: int) -> None:
@@ -124,6 +140,7 @@ class CspIndex:
                 continue
             inn = inn_dir.name
             self.inn_count += 1
+            self.known_inns.add(inn)
             cers = self._collect_cers(inn_dir)
             if cers:
                 self.cers_by_inn[inn] = cers
@@ -151,6 +168,49 @@ class CspIndex:
         inn, _ = self.find_container_dir(csptest_name)
         return inn
 
+    def get_inn_from_csp_folder_for_cont(self, csptest_name: str) -> str | None:
+        """ИНН каталога CSP_ROOT/{inn}/, где лежит подпапка контейнера (UUID и т.п.)."""
+        inn, _ = self.find_container_dir(csptest_name)
+        if inn:
+            return inn
+        cid = normalize_container_id(csptest_name)
+        if not cid:
+            return None
+        tokens = [cid]
+        if " " in cid:
+            tokens.insert(0, cid.split()[0])
+        if not CSP_ROOT.is_dir():
+            return None
+        for inn_dir in CSP_ROOT.iterdir():
+            if not inn_dir.is_dir() or not INN_DIR_RE.match(inn_dir.name):
+                continue
+            inn = inn_dir.name
+            for token in tokens:
+                if (inn_dir / token).is_dir():
+                    return inn
+                try:
+                    for sub in inn_dir.iterdir():
+                        if sub.is_dir() and sub.name in (token, cid):
+                            return inn
+                except OSError:
+                    pass
+        return None
+
+    def resolve_inn_for_container(self, csptest_name: str, subject_line: str | None = None) -> str | None:
+        if subject_line:
+            inn = _inn_from_subject_line(subject_line)
+            if inn:
+                return inn
+        for resolver in (
+            lambda: self.get_inn(csptest_name),
+            lambda: self.get_inn_from_csp_folder_for_cont(csptest_name),
+            lambda: get_inn_from_cont_name(csptest_name, self.known_inns),
+        ):
+            inn = resolver()
+            if inn:
+                return inn
+        return None
+
     def get_best_cer_for_inn(self, inn: str) -> Path | None:
         if inn in self.best_cer_by_inn:
             return self.best_cer_by_inn[inn]
@@ -172,11 +232,20 @@ class CspIndex:
             best = _pick_best_cer(self.cers_in_dir(cont_dir), require_valid=True)
             if best:
                 return inn, best
+        folder_inn = self.get_inn_from_csp_folder_for_cont(csptest_name)
+        if folder_inn:
+            best = self.get_best_cer_for_inn(folder_inn)
+            if best:
+                return folder_inn, best
         if inn:
-            return inn, self.get_best_cer_for_inn(inn)
-        name_inn = get_inn_from_container_name(csptest_name)
+            best = self.get_best_cer_for_inn(inn)
+            if best:
+                return inn, best
+        name_inn = get_inn_from_cont_name(csptest_name, self.known_inns)
         if name_inn:
-            return name_inn, self.get_best_cer_for_inn(name_inn)
+            best = self.get_best_cer_for_inn(name_inn)
+            if best:
+                return name_inn, best
         return None, None
 
 
@@ -191,22 +260,13 @@ def _inn_from_subject_line(subject_line: str) -> str | None:
 def resolve_certificate_inn(
     subject_line: str | None, csptest_name: str, csp_index: CspIndex | None = None
 ) -> str | None:
-    if subject_line:
-        m = re.search(r"ИНН ЮЛ=([0-9]+)", subject_line)
-        if m:
-            return m.group(1)
     if csp_index:
-        folder_inn = csp_index.get_inn(csptest_name)
-    else:
-        folder_inn = None
-    if folder_inn:
-        return folder_inn
-    name_inn = get_inn_from_container_name(csptest_name)
-    if name_inn and len(name_inn) == 10:
-        return name_inn
+        return csp_index.resolve_inn_for_container(csptest_name, subject_line)
     if subject_line:
-        return _inn_from_subject_line(subject_line)
-    return name_inn
+        inn = _inn_from_subject_line(subject_line)
+        if inn:
+            return inn
+    return get_inn_from_container_name(csptest_name)
 
 
 def parse_certmgr_listing(
@@ -275,17 +335,50 @@ def obtain_cert_path(csptest_name: str, csp_index: CspIndex) -> tuple[str | None
         out = certmgr_list_file(dest)
         if out and "thumbprint" in out.lower():
             info = parse_certmgr_listing(out, csptest_name, csp_index)
-            if info.get("thumbprint"):
-                if info.get("inn"):
-                    return dest, "export"
-                inn = csp_index.get_inn(csptest_name) or get_inn_from_container_name(csptest_name)
-                if inn:
-                    return dest, "export"
+            if info.get("thumbprint") and csp_index.resolve_inn_for_container(
+                csptest_name, _subject_from_listing(out)
+            ):
+                return dest, "export"
 
     _, folder_cer = csp_index.find_best_cer_near_container(csptest_name)
     if folder_cer:
         return str(folder_cer), "folder"
     return None, ""
+
+
+def _subject_from_listing(out: str) -> str | None:
+    for line in out.splitlines():
+        line = line.strip()
+        if line.startswith("Subject") or line.startswith("Субъект"):
+            return line
+    return None
+
+
+def install_cert_to_umy(cert_path: str, container_name: str) -> tuple[bool, str]:
+    """certmgr -inst -store uMy — PrivateKey Link для cryptcp -decr / SBIS auth."""
+    result = subprocess.run(
+        _csp_cmd(
+            CERTMGR_BIN,
+            ["-inst", "-store", "uMy", "-file", cert_path, "-cont", container_name],
+        ),
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0:
+        return True, ""
+    err = (result.stderr or result.stdout or "").strip()
+    return False, err
+
+
+@dataclass
+class ScanCandidate:
+    csptest_name: str
+    inn: str
+    thumbprint: str
+    not_before: datetime | None
+    not_after: datetime | None
+    cert_path: str
+    source: str
 
 
 def parse_cert_info(cert_path: str, csptest_name: str = "", csp_index: CspIndex | None = None) -> dict:
@@ -341,7 +434,10 @@ def update_private_key_flags():
 
 
 class Command(BaseCommand):
-    help = "Сканирует HDIMAGE-контейнеры CryptoPro и актуализирует таблицу Certificate"
+    help = (
+        "Сканирует HDIMAGE-контейнеры CryptoPro, актуализирует Certificate. "
+        "С --install-uMy ставит серт в uMy (PrivateKey Link) как sbis_keys_install_linux.sh."
+    )
 
     def add_arguments(self, parser):
         parser.add_argument(
@@ -354,10 +450,28 @@ class Command(BaseCommand):
             action="store_true",
             help="Только сводка (без строк по каждому контейнеру)",
         )
+        parser.add_argument(
+            "--install-uMy",
+            action="store_true",
+            help="Установить лучший сертификат на ИНН в uMy (certmgr -inst -store uMy -cont ...)",
+        )
+        parser.add_argument(
+            "--include-copies",
+            action="store_true",
+            help="Не пропускать контейнеры «… копия» (по умолчанию пропускаются)",
+        )
+        parser.add_argument(
+            "--all-containers",
+            action="store_true",
+            help="Запись в БД для каждого контейнера (по умолчанию — один лучший на ИНН)",
+        )
 
     def handle(self, *args, **options):
         now = datetime.now(timezone.utc)
         quiet = options["quiet"]
+        skip_copies = not options["include_copies"]
+        best_per_inn = not options["all_containers"]
+        install_umy = options["install_uMy"]
 
         if options["clear"]:
             n = Certificate.objects.count()
@@ -376,13 +490,26 @@ class Command(BaseCommand):
 
         containers = list_hdimage_containers()
         self.stdout.write(f"Найдено контейнеров: {len(containers)}")
+        if skip_copies:
+            self.stdout.write("  (контейнеры «копия» пропускаются; --include-copies чтобы включить)")
+        if best_per_inn:
+            self.stdout.write("  (в БД — один лучший контейнер на ИНН; --all-containers для всех)")
 
         created = 0
         updated = 0
         skipped_export = 0
         skipped_parse = 0
+        skipped_copies = 0
+        skipped_expired = 0
+        installed_umy = 0
+        install_umy_failed = 0
+        candidates: list[ScanCandidate] = []
 
         for csptest_name in containers:
+            if skip_copies and is_copy_container(csptest_name):
+                skipped_copies += 1
+                continue
+
             if not quiet:
                 self.stdout.write(f"  контейнер: {csptest_name}")
 
@@ -398,11 +525,9 @@ class Command(BaseCommand):
                 continue
 
             info = parse_cert_info(cert_path, csptest_name, csp_index)
-            inn = info.get("inn")
+            inn = info.get("inn") or csp_index.resolve_inn_for_container(csptest_name)
             thumb = info.get("thumbprint")
-
-            if not inn:
-                inn = csp_index.get_inn(csptest_name) or get_inn_from_container_name(csptest_name)
+            not_after = info.get("not_after")
 
             if not inn or not thumb:
                 skipped_parse += 1
@@ -414,36 +539,115 @@ class Command(BaseCommand):
                     )
                 continue
 
-            cert = Certificate.objects.filter(csptest_name=csptest_name).first()
+            if not_after and not_after <= now:
+                skipped_expired += 1
+                if not quiet:
+                    self.stdout.write(self.style.WARNING(f"    пропуск: сертификат просрочен ({inn})"))
+                continue
+
+            candidates.append(
+                ScanCandidate(
+                    csptest_name=csptest_name,
+                    inn=inn,
+                    thumbprint=thumb,
+                    not_before=info.get("not_before"),
+                    not_after=not_after,
+                    cert_path=cert_path,
+                    source=source,
+                )
+            )
+            if not quiet:
+                self.stdout.write(f"    кандидат ИНН {inn} ({source})")
+
+        if best_per_inn:
+            best_by_inn: dict[str, ScanCandidate] = {}
+            for cand in candidates:
+                prev = best_by_inn.get(cand.inn)
+                if not prev:
+                    best_by_inn[cand.inn] = cand
+                    continue
+                prev_na = prev.not_after or datetime.min.replace(tzinfo=timezone.utc)
+                cand_na = cand.not_after or datetime.min.replace(tzinfo=timezone.utc)
+                if cand_na > prev_na:
+                    best_by_inn[cand.inn] = cand
+            to_persist = list(best_by_inn.values())
+            self.stdout.write(
+                f"Кандидатов: {len(candidates)}, уникальных ИНН (лучший): {len(to_persist)}"
+            )
+        else:
+            to_persist = candidates
+
+        for cand in to_persist:
+            if install_umy:
+                ok, err = install_cert_to_umy(cand.cert_path, cand.csptest_name)
+                if ok:
+                    installed_umy += 1
+                    if not quiet:
+                        self.stdout.write(f"  uMy: {cand.inn} ← {cand.csptest_name}")
+                else:
+                    install_umy_failed += 1
+                    if not quiet:
+                        self.stdout.write(
+                            self.style.WARNING(f"  uMy FAIL {cand.inn}: {(err or '')[:100]}")
+                        )
+
+            cert = Certificate.objects.filter(csptest_name=cand.csptest_name).first()
+            if not cert and best_per_inn:
+                cert = (
+                    Certificate.objects.filter(inn=cand.inn, is_active=True)
+                    .order_by("-not_after", "-last_seen_at")
+                    .first()
+                )
+
             if cert:
-                cert.inn = inn
-                cert.thumbprint = thumb
-                cert.not_before = info.get("not_before")
-                cert.not_after = info.get("not_after")
+                cert.inn = cand.inn
+                cert.csptest_name = cand.csptest_name
+                cert.thumbprint = cand.thumbprint
+                cert.not_before = cand.not_before
+                cert.not_after = cand.not_after
                 cert.last_seen_at = now
+                cert.is_active = True
                 cert.save(
-                    update_fields=["inn", "thumbprint", "not_before", "not_after", "last_seen_at"]
+                    update_fields=[
+                        "inn",
+                        "csptest_name",
+                        "thumbprint",
+                        "not_before",
+                        "not_after",
+                        "last_seen_at",
+                        "is_active",
+                    ]
                 )
                 updated += 1
                 if not quiet:
-                    self.stdout.write(f"    обновлён ИНН {inn} ({source})")
+                    self.stdout.write(f"  обновлён ИНН {cand.inn} ({cand.source})")
                 continue
 
-            cert = Certificate.objects.create(
-                inn=inn,
-                csptest_name=csptest_name,
+            Certificate.objects.create(
+                inn=cand.inn,
+                csptest_name=cand.csptest_name,
                 hdimage_path="",
-                thumbprint=thumb,
+                thumbprint=cand.thumbprint,
                 source="LOCAL",
-                not_before=info.get("not_before"),
-                not_after=info.get("not_after"),
+                not_before=cand.not_before,
+                not_after=cand.not_after,
                 has_private_key=False,
                 last_seen_at=now,
-                meta={},
+                meta={"scan_source": cand.source},
             )
             created += 1
             if not quiet:
-                self.stdout.write(f"    создан Certificate id={cert.id} для ИНН {inn} ({source})")
+                self.stdout.write(f"  создан Certificate для ИНН {cand.inn} ({cand.source})")
+
+        if best_per_inn:
+            for cand in to_persist:
+                n = (
+                    Certificate.objects.filter(inn=cand.inn)
+                    .exclude(csptest_name=cand.csptest_name)
+                    .update(is_active=False)
+                )
+                if n and not quiet:
+                    self.stdout.write(f"  деактивировано дублей ИНН {cand.inn}: {n}")
 
         update_private_key_flags()
 
@@ -451,7 +655,11 @@ class Command(BaseCommand):
         active = Certificate.objects.filter(is_active=True).count()
         with_pk = Certificate.objects.filter(has_private_key=True).count()
         unique_inns = (
-            Certificate.objects.exclude(inn="").values_list("inn", flat=True).distinct().count()
+            Certificate.objects.filter(is_active=True)
+            .exclude(inn="")
+            .values_list("inn", flat=True)
+            .distinct()
+            .count()
         )
         auth_inns = (
             Certificate.objects.filter(has_private_key=True, is_active=True)
@@ -469,7 +677,22 @@ class Command(BaseCommand):
         self.stdout.write(f"  has_private_key (uMy PrivateKey Link): {with_pk}")
         self.stdout.write(f"  ИНН готовых к auth (has_private_key): {auth_inns}")
         self.stdout.write(f"  создано: {created}, обновлено: {updated}")
+        if skipped_copies:
+            self.stdout.write(f"  пропущено «копия»: {skipped_copies}")
         if skipped_export:
-            self.stdout.write(self.style.WARNING(f"  пропущено (нет .cer): {skipped_export}"))
+            self.stdout.write(self.style.WARNING(f"  пропущено (нет серта): {skipped_export}"))
         if skipped_parse:
             self.stdout.write(self.style.WARNING(f"  пропущено (парсинг): {skipped_parse}"))
+        if skipped_expired:
+            self.stdout.write(self.style.WARNING(f"  пропущено (просрочен): {skipped_expired}"))
+        if install_umy:
+            self.stdout.write(
+                self.style.SUCCESS(f"  установлено в uMy: {installed_umy}, ошибок: {install_umy_failed}")
+            )
+        elif auth_inns == 0 and with_pk == 0:
+            self.stdout.write(
+                self.style.WARNING(
+                    "  Подсказка: для SBIS auth нужен uMy — запустите с --install-uMy "
+                    "или scripts/ops/sbis_keys_install_linux.sh --install-only"
+                )
+            )
