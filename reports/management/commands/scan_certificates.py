@@ -406,6 +406,59 @@ def _subject_from_listing(out: str) -> str | None:
     return text or None
 
 
+@dataclass
+class ScanCandidate:
+    csptest_name: str
+    inn: str
+    thumbprint: str
+    not_before: datetime | None
+    not_after: datetime | None
+    cert_path: str
+    source: str
+    has_container_key: bool = False
+
+
+def verify_container_has_private_key(csptest_name: str) -> bool:
+    """csptest -verifycontext: в контейнере реально есть приватный ключ."""
+    try:
+        result = subprocess.run(
+            _csp_cmd(CSPTEST_BIN, ["-keyset", "-container", csptest_name, "-verifycontext"]),
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    combined = f"{result.stdout}\n{result.stderr}".lower()
+    return result.returncode == 0 or "success" in combined
+
+
+def parse_umy_thumbprint_link(thumbprint: str) -> tuple[bool, str | None]:
+    """PrivateKey Link : Yes для thumbprint в хранилище uMy."""
+    out = run_cmd(_csp_cmd(CERTMGR_BIN, ["-list", "-store", "uMy"]), check=False)
+    thumb = thumbprint.lower().strip()
+    block_thumb: str | None = None
+    has_pk = False
+    container: str | None = None
+    for line in out.splitlines():
+        line = line.rstrip()
+        if line.startswith("SHA1 Thumbprint"):
+            if block_thumb == thumb and has_pk:
+                return True, container
+            parts = line.split(":", 1)
+            block_thumb = parts[1].strip().lower() if len(parts) == 2 else None
+            has_pk = False
+            container = None
+        elif block_thumb == thumb:
+            if "PrivateKey Link" in line:
+                has_pk = "Yes" in line
+            if line.startswith("Container"):
+                container = line.split(":", 1)[1].strip() if ":" in line else None
+    if block_thumb == thumb and has_pk:
+        return True, container
+    return False, container
+
+
 def install_cert_to_umy(cert_path: str, container_name: str) -> tuple[bool, str]:
     """certmgr -inst -store uMy — PrivateKey Link для cryptcp -decr / SBIS auth."""
     result = subprocess.run(
@@ -422,15 +475,31 @@ def install_cert_to_umy(cert_path: str, container_name: str) -> tuple[bool, str]
     return False, err
 
 
-@dataclass
-class ScanCandidate:
-    csptest_name: str
-    inn: str
-    thumbprint: str
-    not_before: datetime | None
-    not_after: datetime | None
-    cert_path: str
-    source: str
+def install_cert_to_umy_verified(
+    cert_path: str, container_name: str, thumbprint: str
+) -> tuple[bool, str]:
+    ok, err = install_cert_to_umy(cert_path, container_name)
+    if not ok:
+        return False, err or "certmgr -inst failed"
+    has_link, _ = parse_umy_thumbprint_link(thumbprint)
+    if has_link:
+        return True, ""
+    return False, "PrivateKey Link: No (ключ не в этом контейнере — нужен другой -cont)"
+
+
+def _candidate_rank(cand: ScanCandidate) -> tuple:
+    na = cand.not_after or datetime.min.replace(tzinfo=timezone.utc)
+    copy_penalty = 0 if is_copy_container(cand.csptest_name) else 1
+    return (cand.has_container_key, na, copy_penalty)
+
+
+def group_candidates_by_inn(candidates: list[ScanCandidate]) -> dict[str, list[ScanCandidate]]:
+    grouped: dict[str, list[ScanCandidate]] = {}
+    for cand in candidates:
+        grouped.setdefault(cand.inn, []).append(cand)
+    for inn in grouped:
+        grouped[inn].sort(key=_candidate_rank, reverse=True)
+    return grouped
 
 
 def parse_cert_info(cert_path: str, csptest_name: str = "", csp_index: CspIndex | None = None) -> dict:
@@ -606,57 +675,71 @@ class Command(BaseCommand):
                     not_after=not_after,
                     cert_path=cert_path,
                     source=source,
+                    has_container_key=verify_container_has_private_key(csptest_name),
                 )
             )
             if not quiet:
                 self.stdout.write(f"    кандидат ИНН {inn} ({source})")
 
+        by_inn = group_candidates_by_inn(candidates)
         if best_per_inn:
-            best_by_inn: dict[str, ScanCandidate] = {}
-            for cand in candidates:
-                prev = best_by_inn.get(cand.inn)
-                if not prev:
-                    best_by_inn[cand.inn] = cand
-                    continue
-                prev_na = prev.not_after or datetime.min.replace(tzinfo=timezone.utc)
-                cand_na = cand.not_after or datetime.min.replace(tzinfo=timezone.utc)
-                if cand_na > prev_na:
-                    best_by_inn[cand.inn] = cand
-            to_persist = list(best_by_inn.values())
+            to_persist = [group[0] for group in by_inn.values() if group]
+            with_key = sum(1 for c in to_persist if c.has_container_key)
             self.stdout.write(
-                f"Кандидатов: {len(candidates)}, уникальных ИНН (лучший): {len(to_persist)}"
+                f"Кандидатов: {len(candidates)}, ИНН: {len(to_persist)}, "
+                f"с ключом в контейнере: {with_key}"
             )
         else:
             to_persist = candidates
+            by_inn = group_candidates_by_inn(candidates)
 
+        install_pk_ok = 0
+        winners_by_inn: dict[str, ScanCandidate] = {}
         for cand in to_persist:
+            winner = cand
             if install_umy:
-                ok, err = install_cert_to_umy(cand.cert_path, cand.csptest_name)
-                if ok:
-                    installed_umy += 1
-                    if not quiet:
-                        self.stdout.write(f"  uMy: {cand.inn} ← {cand.csptest_name}")
-                else:
+                tried = by_inn.get(cand.inn, [cand])
+                last_err = ""
+                installed = False
+                for try_cand in tried:
+                    ok, err = install_cert_to_umy_verified(
+                        try_cand.cert_path, try_cand.csptest_name, try_cand.thumbprint
+                    )
+                    if ok:
+                        winner = try_cand
+                        installed_umy += 1
+                        install_pk_ok += 1
+                        installed = True
+                        if not quiet:
+                            self.stdout.write(
+                                f"  uMy OK {winner.inn} ← {winner.csptest_name}"
+                                + (" (ключ в контейнере)" if winner.has_container_key else "")
+                            )
+                        break
+                    last_err = err or last_err
+                if not installed:
                     install_umy_failed += 1
                     if not quiet:
                         self.stdout.write(
-                            self.style.WARNING(f"  uMy FAIL {cand.inn}: {(err or '')[:100]}")
+                            self.style.WARNING(
+                                f"  uMy FAIL {cand.inn} ({len(tried)} конт.): {(last_err or '')[:120]}"
+                            )
                         )
 
-            cert = Certificate.objects.filter(csptest_name=cand.csptest_name).first()
+            winners_by_inn[winner.inn] = winner
             if not cert and best_per_inn:
                 cert = (
-                    Certificate.objects.filter(inn=cand.inn, is_active=True)
+                    Certificate.objects.filter(inn=winner.inn, is_active=True)
                     .order_by("-not_after", "-last_seen_at")
                     .first()
                 )
 
             if cert:
-                cert.inn = cand.inn
-                cert.csptest_name = cand.csptest_name
-                cert.thumbprint = cand.thumbprint
-                cert.not_before = cand.not_before
-                cert.not_after = cand.not_after
+                cert.inn = winner.inn
+                cert.csptest_name = winner.csptest_name
+                cert.thumbprint = winner.thumbprint
+                cert.not_before = winner.not_before
+                cert.not_after = winner.not_after
                 cert.last_seen_at = now
                 cert.is_active = True
                 cert.save(
@@ -672,34 +755,34 @@ class Command(BaseCommand):
                 )
                 updated += 1
                 if not quiet:
-                    self.stdout.write(f"  обновлён ИНН {cand.inn} ({cand.source})")
+                    self.stdout.write(f"  обновлён ИНН {winner.inn} ({winner.source})")
                 continue
 
             Certificate.objects.create(
-                inn=cand.inn,
-                csptest_name=cand.csptest_name,
+                inn=winner.inn,
+                csptest_name=winner.csptest_name,
                 hdimage_path="",
-                thumbprint=cand.thumbprint,
+                thumbprint=winner.thumbprint,
                 source="LOCAL",
-                not_before=cand.not_before,
-                not_after=cand.not_after,
+                not_before=winner.not_before,
+                not_after=winner.not_after,
                 has_private_key=False,
                 last_seen_at=now,
-                meta={"scan_source": cand.source},
+                meta={"scan_source": winner.source},
             )
             created += 1
             if not quiet:
-                self.stdout.write(f"  создан Certificate для ИНН {cand.inn} ({cand.source})")
+                self.stdout.write(f"  создан Certificate для ИНН {winner.inn} ({winner.source})")
 
         if best_per_inn:
-            for cand in to_persist:
+            for inn, winner in winners_by_inn.items():
                 n = (
-                    Certificate.objects.filter(inn=cand.inn)
-                    .exclude(csptest_name=cand.csptest_name)
+                    Certificate.objects.filter(inn=inn)
+                    .exclude(csptest_name=winner.csptest_name)
                     .update(is_active=False)
                 )
                 if n and not quiet:
-                    self.stdout.write(f"  деактивировано дублей ИНН {cand.inn}: {n}")
+                    self.stdout.write(f"  деактивировано дублей ИНН {inn}: {n}")
 
         update_private_key_flags()
 
@@ -739,7 +822,10 @@ class Command(BaseCommand):
             self.stdout.write(self.style.WARNING(f"  пропущено (просрочен): {skipped_expired}"))
         if install_umy:
             self.stdout.write(
-                self.style.SUCCESS(f"  установлено в uMy: {installed_umy}, ошибок: {install_umy_failed}")
+                self.style.SUCCESS(
+                    f"  установлено в uMy: {installed_umy} "
+                    f"(PrivateKey Link: {install_pk_ok}), ошибок: {install_umy_failed}"
+                )
             )
         elif auth_inns == 0 and with_pk == 0:
             self.stdout.write(

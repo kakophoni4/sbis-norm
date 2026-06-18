@@ -147,6 +147,43 @@ list_containers() {
 # Имя контейнера в certmgr передаём как из csptest (один \ перед каждой частью).
 # Удваивать слэши не нужно — иначе PrivateKey Link не создаётся.
 
+container_has_private_key() {
+  local cont="$1"
+  "$CSPTEST" -keyset -container "$cont" -verifycontext &>/dev/null
+}
+
+umy_thumbprint_has_private_key() {
+  local thumb="$1"
+  local thumb_lc
+  thumb_lc="$(echo "$thumb" | tr '[:upper:]' '[:lower:]' | tr -d '\r\n')"
+  "$CERTMGR" -list -store uMy 2>/dev/null | awk -v t="$thumb_lc" '
+    BEGIN { block=0; haspk=0 }
+    /^SHA1 Thumbprint/ {
+      if (block && haspk) { found=1; exit }
+      block=0; haspk=0
+      sub(/^[^:]*:[[:space:]]*/, "")
+      gsub(/[[:space:]]/, "", $0)
+      if (tolower($0) == t) block=1
+      next
+    }
+    block && /PrivateKey Link/ && /Yes/ { haspk=1 }
+    END { exit (block && haspk) ? 0 : 1 }
+  '
+}
+
+should_replace_best_candidate() {
+  local inn="$1" new_idx="$2"
+  local old_idx="${BEST_IDX[$inn]:-}"
+  [[ -z "$old_idx" ]] && return 0
+  local old_key=0 new_key=0
+  container_has_private_key "${CAND_NAME[$old_idx]}" && old_key=1
+  container_has_private_key "${CAND_NAME[$new_idx]}" && new_key=1
+  (( new_key > old_key )) && return 0
+  (( new_key < old_key )) && return 1
+  (( CAND_EPOCH[$new_idx] > CAND_EPOCH[$old_idx] )) && return 0
+  return 1
+}
+
 # ИНН из Subject (не Issuer — у ФНС в Issuer всегда ИНН ЮЛ=7707329152)
 get_inn_ul_from_cert() {
   local cert_path="$1"
@@ -393,7 +430,7 @@ for cont in "${containers[@]}"; do
   CAND_THUMB[$i]="$thumb"
   CAND_CERT[$i]="$cert_file"
   CAND_EPOCH[$i]="$epoch"
-  if [[ -z "${BEST_EPOCH[$inn]:-}" ]] || (( epoch > BEST_EPOCH[$inn] )); then
+  if [[ -z "${BEST_IDX[$inn]:-}" ]] || should_replace_best_candidate "$inn" "$i"; then
     BEST_EPOCH[$inn]="$epoch"
     BEST_IDX[$inn]="$i"
   fi
@@ -401,19 +438,38 @@ for cont in "${containers[@]}"; do
 done
 
 echo ""
-echo "=== 3.1 Выбор лучшего контейнера на ИНН ==="
+echo "=== 3.1 Установка в uMy (перебор контейнеров ИНН до PrivateKey Link : Yes) ==="
 k=0
 for inn in "${!BEST_IDX[@]}"; do
-  idx="${BEST_IDX[$inn]}"
-  CONT_INN[$k]="${CAND_INN[$idx]}"
-  CONT_NAME[$k]="${CAND_NAME[$idx]}"
-  CONT_THUMB[$k]="${CAND_THUMB[$idx]}"
-  cert_path="${CAND_CERT[$idx]}"
-  cont_name="${CAND_NAME[$idx]}"
-  echo "  Выбран: ИНН=$inn контейнер=$cont_name epoch=${CAND_EPOCH[$idx]}"
-  "$CERTMGR" -inst -store uMy -file "$cert_path" -cont "$cont_name" 2>/dev/null || {
-    echo "    Ошибка установки в uMy (возможно уже установлен)."
-  }
+  installed=false
+  win_idx=""
+  for ((j=0; j<i; j++)); do
+    [[ "${CAND_INN[$j]:-}" != "$inn" ]] && continue
+    cert_path="${CAND_CERT[$j]}"
+    cont_name="${CAND_NAME[$j]}"
+    thumb="${CAND_THUMB[$j]}"
+    [[ -z "$cert_path" || -z "$cont_name" ]] && continue
+    echo "  Пробуем ИНН=$inn контейнер=$cont_name (ключ в контейнере: $(container_has_private_key "$cont_name" && echo yes || echo no))"
+    if ! "$CERTMGR" -inst -store uMy -file "$cert_path" -cont "$cont_name" 2>/dev/null; then
+      echo "    certmgr -inst вернул ошибку"
+      continue
+    fi
+    if umy_thumbprint_has_private_key "$thumb"; then
+      echo "    OK: PrivateKey Link : Yes"
+      win_idx="$j"
+      installed=true
+      break
+    fi
+    echo "    PrivateKey Link : No — следующий контейнер"
+  done
+  if [[ "$installed" != true ]]; then
+    echo "  WARN: ИНН=$inn — не удалось получить PrivateKey Link ни в одном контейнере"
+    idx="${BEST_IDX[$inn]}"
+    win_idx="$idx"
+  fi
+  CONT_INN[$k]="$inn"
+  CONT_NAME[$k]="${CAND_NAME[$win_idx]}"
+  CONT_THUMB[$k]="${CAND_THUMB[$win_idx]}"
   ((k++)) || true
 done
 i="$k"
