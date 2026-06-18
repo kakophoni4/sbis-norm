@@ -10,7 +10,8 @@
 
 Пример:
   python manage.py collect_org_data --from-file valid_inns_final.txt --limit 5
-  python manage.py collect_org_data --from-file valid_inns_final.txt --sbis --egrul --workers 4 --quiet
+  python manage.py collect_org_data --from-file valid_inns_final.txt --workers 4 --quiet
+  python manage.py collect_org_data --from-file valid_inns_final.txt --sbis --workers 4 --quiet
 """
 from __future__ import annotations
 
@@ -100,12 +101,20 @@ def _first_non_empty(*values: str) -> str:
     return ""
 
 
+def _parse_csv_date(val: str) -> str:
+    s = (val or "").strip()
+    if len(s) >= 10 and s[4] == "-" and s[7] == "-":
+        return s[:10]
+    return s[:10] if s else ""
+
+
 def _collect_one(
     inn: str,
     *,
     auth_by_inn: dict[str, dict],
     call_sbis: bool,
     call_egrul: bool,
+    parse_cert: bool,
     proxy_want: int,
     proxy_budget: int,
 ) -> dict:
@@ -123,8 +132,8 @@ def _collect_one(
         row["КатегорияОшибки"] = cat
         if cat == "revoked_or_untrusted":
             row["ЭЦПОтозвана"] = "да"
-        row["ЭЦП_действует_с"] = (auth_row.get("not_before") or "")[:10]
-        row["ЭЦП_действует_по"] = (auth_row.get("not_after") or "")[:10]
+        row["ЭЦП_действует_с"] = _parse_csv_date(auth_row.get("not_before") or "")
+        row["ЭЦП_действует_по"] = _parse_csv_date(auth_row.get("not_after") or "")
         row["Отпечаток"] = (auth_row.get("thumbprint") or "").strip()
 
     cert = (
@@ -141,25 +150,29 @@ def _collect_one(
             row["ЭЦП_действует_по"] = _fmt_dt(cert.not_after)
         if not row["Отпечаток"] and cert.thumbprint:
             row["Отпечаток"] = cert.thumbprint.strip()
+        if cert.kpp and not row["КПП"]:
+            row["КПП"] = str(cert.kpp).strip()
+            row["ИсточникКПП"] = "БД Certificate"
 
-        fd, cert_path = tempfile.mkstemp(prefix=f"org_col_{inn}_", suffix=".cer")
-        os.close(fd)
-        try:
-            export_cert_der(cert.csptest_name, cert_path)
-            fio = (get_fio_from_cert_file(cert_path) or "").strip()
-            if fio and fio != "—":
-                row["ФИО_ВладелецСерта"] = fio
-            cert_kpp = parse_kpp_from_cert_file(cert_path) or ""
-            if cert_kpp and not row["КПП"]:
-                row["КПП"] = cert_kpp
-                row["ИсточникКПП"] = "сертификат"
-        except Exception:
-            pass
-        finally:
+        if parse_cert and cert.csptest_name:
+            fd, cert_path = tempfile.mkstemp(prefix=f"org_col_{inn}_", suffix=".cer")
+            os.close(fd)
             try:
-                os.remove(cert_path)
-            except OSError:
+                export_cert_der(cert.csptest_name, cert_path)
+                fio = (get_fio_from_cert_file(cert_path) or "").strip()
+                if fio and fio != "—":
+                    row["ФИО_ВладелецСерта"] = fio
+                cert_kpp = parse_kpp_from_cert_file(cert_path) or ""
+                if cert_kpp and not row["КПП"]:
+                    row["КПП"] = cert_kpp
+                    row["ИсточникКПП"] = "сертификат"
+            except Exception:
                 pass
+            finally:
+                try:
+                    os.remove(cert_path)
+                except OSError:
+                    pass
 
     if org:
         if org.kpp and not row["КПП"]:
@@ -274,12 +287,17 @@ class Command(BaseCommand):
         parser.add_argument(
             "--sbis",
             action="store_true",
-            help="Запрашивать СБИС.СписокНашихОрганизаций (нужен auth по серту)",
+            help="СБИС.СписокНашихОрганизаций (auth + HTTP на каждый ИНН)",
         )
         parser.add_argument(
-            "--egrul",
+            "--no-egrul",
             action="store_true",
-            help="Дополнить КПП/ОГРН/имя через star-pro.ru (пауза между запросами)",
+            help="Не запрашивать star-pro.ru (КПП/ОГРН/имя). По умолчанию egrul включён",
+        )
+        parser.add_argument(
+            "--parse-cert",
+            action="store_true",
+            help="Экспорт .cer через certmgr на каждый ИНН (медленно, для ФИО/КПП из Subject)",
         )
         parser.add_argument("--egrul-delay", type=float, default=0.35)
         parser.add_argument("--workers", type=int, default=1)
@@ -333,15 +351,23 @@ class Command(BaseCommand):
 
         workers = max(1, min(8, int(options.get("workers") or 1)))
         call_sbis = bool(options["sbis"])
-        call_egrul = bool(options["egrul"])
+        call_egrul = not bool(options["no_egrul"])
+        parse_cert = bool(options["parse_cert"])
         egrul_delay = max(0.0, float(options["egrul_delay"]))
 
         self.stdout.write(f"ИНН к сбору: {len(inns)}")
         self.stdout.write(f"СБИС СписокНашихОрганизаций: {'да' if call_sbis else 'нет'}")
-        self.stdout.write(f"star-pro (КПП/ОГРН): {'да' if call_egrul else 'нет'}")
+        self.stdout.write(f"star-pro (КПП/ОГРН/имя): {'да' if call_egrul else 'нет'}")
+        self.stdout.write(f"Парсинг сертификата (certmgr): {'да' if parse_cert else 'нет'}")
         self.stdout.write(f"Потоков: {workers}")
         if auth_csv:
             self.stdout.write(f"Auth CSV: {auth_csv}")
+        if not call_sbis and not call_egrul:
+            self.stdout.write(
+                self.style.WARNING(
+                    "Без --sbis и --no-egrul в файле будут в основном ИНН и сроки ЭЦП из CSV"
+                )
+            )
 
         rows: list[dict] = []
         lock = threading.Lock()
@@ -356,6 +382,7 @@ class Command(BaseCommand):
                 auth_by_inn=auth_by_inn,
                 call_sbis=call_sbis,
                 call_egrul=call_egrul,
+                parse_cert=parse_cert,
                 proxy_want=max(1, int(options["proxy_want"])),
                 proxy_budget=max(4, int(options["proxy_budget"])),
             )
@@ -367,7 +394,10 @@ class Command(BaseCommand):
                 if not options["quiet"]:
                     self.stdout.write(
                         f"[{done[0]}/{total}] {r['ИНН']} — "
-                        f"КПП={r['КПП'] or '—'}, имя={(r['Наименование'] or '—')[:40]}"
+                        f"auth={r['СтатусСБИС_auth']}, "
+                        f"ЭЦП до {r['ЭЦП_действует_по'] or '—'}, "
+                        f"КПП={r['КПП'] or '—'}, "
+                        f"имя={(r['Наименование'] or '—')[:35]}"
                     )
 
         if workers <= 1:
