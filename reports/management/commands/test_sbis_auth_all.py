@@ -21,9 +21,11 @@ from reports.services.sbis_mail import SbisAuthError, SbisSessionService
 
 def classify_sbis_error(message: str) -> str:
     m = (message or "").lower()
+    if "no certificate found" in m or "0x2000012d" in m:
+        return "umy_not_linked"
     if "отозван" in m or "не является доверенным" in m or "выберите другой сертификат" in m:
         return "revoked_or_untrusted"
-    if "не зарегистрирован" in m:
+    if "не зарегистрирован" in m or "ни в одном кабинете" in m:
         return "not_registered_in_sbis"
     if "просрочен" in m or "аутентификация по просроченному" in m:
         return "expired"
@@ -34,6 +36,30 @@ def classify_sbis_error(message: str) -> str:
     if "не указано имя контейнера" in m or "не найден активный сертификат" in m:
         return "no_cert"
     return "other_error"
+
+
+FAIL_FAST_CATEGORIES = frozenset(
+    {
+        "revoked_or_untrusted",
+        "not_registered_in_sbis",
+        "expired",
+        "registration_pending",
+        "umy_not_linked",
+    }
+)
+
+
+def pick_certs_for_inn(inn: str, try_all: bool):
+    qs = Certificate.objects.filter(inn=inn, has_private_key=True, is_active=True)
+    if not try_all:
+        linked = qs.exclude(hdimage_path="").exclude(hdimage_path__isnull=True).order_by(
+            "-not_after", "-id"
+        )
+        if linked.exists():
+            return [linked.first()]
+        best = qs.order_by("-not_after", "-id").first()
+        return [best] if best else []
+    return list(qs.order_by("-not_after", "-id"))
 
 
 class Command(BaseCommand):
@@ -63,6 +89,11 @@ class Command(BaseCommand):
             "--quiet",
             action="store_true",
             help="Меньше логов SBIS в консоли",
+        )
+        parser.add_argument(
+            "--try-all-certs",
+            action="store_true",
+            help="Перебирать все сертификаты ИНН (по умолчанию — один лучший из uMy)",
         )
 
     def handle(self, *args, **options):
@@ -94,7 +125,26 @@ class Command(BaseCommand):
             inns = inns[: options["limit"]]
 
         total = len(inns)
+        db_total = Certificate.objects.count()
+        db_unique = (
+            Certificate.objects.exclude(inn="").values_list("inn", flat=True).distinct().count()
+        )
+        db_auth = (
+            Certificate.objects.filter(has_private_key=True, is_active=True)
+            .exclude(inn="")
+            .values_list("inn", flat=True)
+            .distinct()
+            .count()
+        )
         self.stdout.write(f"ИНН к проверке: {total}")
+        self.stdout.write(f"БД: записей={db_total}, уникальных ИНН={db_unique}, ИНН с uMy={db_auth}")
+        if db_auth < 10 and db_total > 100:
+            self.stdout.write(
+                self.style.WARNING(
+                    "Мало ИНН с has_private_key — сначала: "
+                    "sbis_keys_install_linux.sh --install-only && sync_has_private_key (без --all)"
+                )
+            )
         self.stdout.write(f"Отчёт: {csv_path}")
 
         valid_inns: list[str] = []
@@ -107,10 +157,7 @@ class Command(BaseCommand):
             )
 
             for idx, inn in enumerate(inns, start=1):
-                certs = list(
-                    Certificate.objects.filter(inn=inn, has_private_key=True, is_active=True)
-                    .order_by("-not_after", "-id")
-                )
+                certs = pick_certs_for_inn(inn, options["try_all_certs"])
                 if not certs:
                     row = [inn, "fail", "no_cert", "", "", "нет контейнера в БД"]
                     writer.writerow(row)
@@ -142,12 +189,7 @@ class Command(BaseCommand):
                     except SbisAuthError as e:
                         last_msg = str(e)
                         last_cat = classify_sbis_error(last_msg)
-                        if last_cat in (
-                            "revoked_or_untrusted",
-                            "not_registered_in_sbis",
-                            "expired",
-                            "registration_pending",
-                        ):
+                        if last_cat in FAIL_FAST_CATEGORIES:
                             break
                     except Exception as e:
                         last_msg = str(e)

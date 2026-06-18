@@ -173,14 +173,6 @@ class Command(BaseCommand):
         for csptest_name in containers:
             self.stdout.write(f"  контейнер: {csptest_name}")
 
-            cert = Certificate.objects.filter(csptest_name=csptest_name).first()
-            if cert:
-                cert.last_seen_at = now
-                cert.has_private_key = True
-                cert.save(update_fields=["last_seen_at", "has_private_key"])
-                updated += 1
-                continue
-
             tmp_cert = f"/tmp/csp_scan_{abs(hash(csptest_name))}.cer"
             if not export_cert_from_container(csptest_name, tmp_cert):
                 self.stdout.write(
@@ -199,6 +191,19 @@ class Command(BaseCommand):
                 )
                 continue
 
+            cert = Certificate.objects.filter(csptest_name=csptest_name).first()
+            if cert:
+                cert.inn = inn
+                cert.thumbprint = thumb
+                cert.not_before = info.get("not_before")
+                cert.not_after = info.get("not_after")
+                cert.last_seen_at = now
+                cert.save(
+                    update_fields=["inn", "thumbprint", "not_before", "not_after", "last_seen_at"]
+                )
+                updated += 1
+                continue
+
             cert = Certificate.objects.create(
                 inn=inn,
                 csptest_name=csptest_name,
@@ -207,7 +212,7 @@ class Command(BaseCommand):
                 source="LOCAL",
                 not_before=info.get("not_before"),
                 not_after=info.get("not_after"),
-                has_private_key=True,
+                has_private_key=False,
                 last_seen_at=now,
                 meta={},
             )
@@ -218,17 +223,26 @@ class Command(BaseCommand):
 
         update_private_key_flags()
 
-        container_set = set(containers)
-        flagged = Certificate.objects.filter(csptest_name__in=container_set).update(has_private_key=True)
-
         total = Certificate.objects.count()
         active = Certificate.objects.filter(is_active=True).count()
         with_pk = Certificate.objects.filter(has_private_key=True).count()
+        unique_inns = (
+            Certificate.objects.exclude(inn="").values_list("inn", flat=True).distinct().count()
+        )
+        auth_inns = (
+            Certificate.objects.filter(has_private_key=True, is_active=True)
+            .exclude(inn="")
+            .values_list("inn", flat=True)
+            .distinct()
+            .count()
+        )
 
         self.stdout.write("")
         self.stdout.write("Статистика по таблице Certificate:")
         self.stdout.write(f"  всего записей: {total}")
         self.stdout.write(f"  активных:      {active}")
-        self.stdout.write(f"  has_private_key: {with_pk} (по контейнерам CSP: {flagged})")
+        self.stdout.write(f"  уникальных ИНН: {unique_inns}")
+        self.stdout.write(f"  has_private_key (uMy PrivateKey Link): {with_pk}")
+        self.stdout.write(f"  ИНН готовых к auth (has_private_key): {auth_inns}")
         if skipped:
             self.stdout.write(self.style.WARNING(f"  пропущено (экспорт не удался): {skipped}"))
