@@ -3,7 +3,6 @@ import time
 from pathlib import Path
 
 from django.conf import settings
-from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 
 CERTMGR_BIN = "/opt/cprocsp/bin/amd64/certmgr"
 CRYPTCP_BIN = "/opt/cprocsp/bin/amd64/cryptcp"
@@ -26,8 +25,6 @@ NODEMAVEN_PROTOCOL = "http"
 
 _PROXY_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _PROXY_TTL_SECONDS = 60
-_NODEMAVEN_CLIENT: NodeMavenClient | None = None
-_NODEMAVEN_CLIENT_KEY: str | None = None
 _GOOD_PROXY_POOL: dict[str, tuple[float, list[str]]] = {}
 _GOOD_PROXY_TTL_SECONDS = 300
 _PROXY_LAST_CALL_TS: dict[str, float] = {}

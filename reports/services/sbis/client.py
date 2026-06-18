@@ -26,7 +26,24 @@ from requests.exceptions import ConnectionError, ProxyError, SSLError, Timeout
 from reports.models import Certificate
 from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 
-from .constants import *
+from .constants import (
+    AUTH_URL,
+    LOG_DIR,
+    NODEMAVEN_CITY,
+    NODEMAVEN_COUNTRY,
+    REPORTING_URL,
+    CertInvalidNoRetryError,
+    _RETRYABLE_HTTP_STATUSES,
+    _GOOD_PROXY_TTL_SECONDS,
+    _PROXY_TTL_SECONDS,
+    logger,
+)
+
+# Mutable state (import * не подтягивает имена с _)
+_PROXY_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
+_NODEMAVEN_CLIENT: NodeMavenClient | None = None
+_NODEMAVEN_CLIENT_KEY: str | None = None
+_GOOD_PROXY_POOL: dict[str, tuple[float, list[str]]] = {}
 
 _thread_http = threading.local()
 
