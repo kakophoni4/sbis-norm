@@ -849,11 +849,13 @@ class Command(BaseCommand):
                 if n and not quiet:
                     self.stdout.write(f"  деактивировано дублей ИНН {inn}: {n}")
 
+        Certificate.objects.update(has_private_key=False)
         update_private_key_flags()
 
         total = Certificate.objects.count()
         active = Certificate.objects.filter(is_active=True).count()
         with_pk = Certificate.objects.filter(has_private_key=True).count()
+        with_pk_active = Certificate.objects.filter(has_private_key=True, is_active=True).count()
         unique_inns = (
             Certificate.objects.filter(is_active=True)
             .exclude(inn="")
@@ -874,8 +876,8 @@ class Command(BaseCommand):
         self.stdout.write(f"  всего записей: {total}")
         self.stdout.write(f"  активных:      {active}")
         self.stdout.write(f"  уникальных ИНН: {unique_inns}")
-        self.stdout.write(f"  has_private_key (uMy PrivateKey Link): {with_pk}")
-        self.stdout.write(f"  ИНН готовых к auth (has_private_key): {auth_inns}")
+        self.stdout.write(f"  has_private_key (uMy): {with_pk} (активных: {with_pk_active})")
+        self.stdout.write(f"  ИНН готовых к auth: {auth_inns}")
         self.stdout.write(f"  создано: {created}, обновлено: {updated}")
         if skipped_copies:
             self.stdout.write(f"  пропущено «копия»: {skipped_copies}")
