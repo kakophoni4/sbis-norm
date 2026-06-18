@@ -209,12 +209,26 @@ def _collect_one(
                     proxy_warmup_budget_sec=proxy_budget,
                 ).authenticate()
                 meta["auth_status"] = "ok"
-                pack = sbis_list_our_organizations(
-                    inn,
-                    session_id,
-                    filter_inn=inn,
-                    filter_kpp=row["КПП"] or "",
-                )
+                kpp_filter = (row["КПП"] or "").strip()
+                # СБИС требует КПП в фильтре СвЮЛ; если star-pro не дал КПП — запрос без фильтра
+                if kpp_filter:
+                    pack = sbis_list_our_organizations(
+                        inn,
+                        session_id,
+                        filter_inn=inn,
+                        filter_kpp=kpp_filter,
+                    )
+                else:
+                    pack = sbis_list_our_organizations(inn, session_id)
+                if not pack.get("success"):
+                    err = pack.get("error")
+                    err_msg = (
+                        str(err.get("message") or err)
+                        if isinstance(err, dict)
+                        else str(err or "")
+                    ).lower()
+                    if "кпп" in err_msg:
+                        pack = sbis_list_our_organizations(inn, session_id)
             except SbisAuthError as e:
                 meta["sbis_error"] = str(e)[:300]
                 meta["auth_status"] = "fail"
