@@ -318,8 +318,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--progress-every",
             type=int,
-            default=25,
-            help="Каждые N ИНН писать строку в лог и обновлять *_progress.csv (даже с --quiet)",
+            default=0,
+            help="Строка в лог каждые N ИНН (0=авто: 1 при --quiet, иначе 10)",
         )
 
     def _write_csv(self, path: Path, rows: list[dict]) -> None:
@@ -327,6 +327,41 @@ class Command(BaseCommand):
             w = csv.DictWriter(f, fieldnames=EXPORT_COLUMNS, extrasaction="ignore")
             w.writeheader()
             w.writerows(rows)
+
+    def _write_status(
+        self,
+        path: Path,
+        *,
+        state: str,
+        total: int,
+        rows: list[dict],
+        started_at: str,
+        last_inn: str = "",
+        last_row: dict | None = None,
+        extra: dict | None = None,
+    ) -> None:
+        done = len(rows)
+        with_kpp = sum(1 for r in rows if r.get("КПП"))
+        with_name = sum(1 for r in rows if r.get("Наименование"))
+        sbis_err = sum(1 for r in rows if r.get("sbis_error"))
+        egrul_err = sum(1 for r in rows if r.get("egrul_error"))
+        payload = {
+            "state": state,
+            "done": done,
+            "total": total,
+            "percent": round(100.0 * done / total, 1) if total else 0,
+            "with_kpp": with_kpp,
+            "with_name": with_name,
+            "sbis_errors": sbis_err,
+            "egrul_errors": egrul_err,
+            "started_at": started_at,
+            "updated_at": dj_timezone.now().isoformat(),
+            "last_inn": last_inn,
+            "last": last_row,
+        }
+        if extra:
+            payload.update(extra)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def handle(self, *args, **options):
         if options["quiet"]:
@@ -365,6 +400,9 @@ class Command(BaseCommand):
         json_path = out_dir / f"organizations_{ts}.json"
         csv_path = out_dir / f"organizations_{ts}.csv"
         progress_csv_path = out_dir / f"organizations_{ts}_progress.csv"
+        live_status_path = out_dir / "collect_org_LIVE.status.json"
+        live_log_path = out_dir / "collect_org_LIVE.log"
+        live_csv_path = out_dir / "collect_org_LIVE_progress.csv"
         xlsx_path = out_dir / f"organizations_{ts}.xlsx"
         companies_dir = out_dir / f"companies_{ts}"
 
@@ -373,14 +411,20 @@ class Command(BaseCommand):
         call_egrul = not bool(options["no_egrul"])
         parse_cert = bool(options["parse_cert"])
         egrul_delay = max(0.0, float(options["egrul_delay"]))
-        progress_every = max(1, int(options.get("progress_every") or 25))
+        pe = int(options.get("progress_every") or 0)
+        progress_every = pe if pe > 0 else (1 if options["quiet"] else 10)
+        started_at = dj_timezone.now().isoformat()
 
         self.stdout.write(f"ИНН к сбору: {len(inns)}")
         self.stdout.write(f"СБИС СписокНашихОрганизаций: {'да' if call_sbis else 'нет'}")
         self.stdout.write(f"star-pro (КПП/ОГРН/имя): {'да' if call_egrul else 'нет'}")
         self.stdout.write(f"Парсинг сертификата (certmgr): {'да' if parse_cert else 'нет'}")
         self.stdout.write(f"Потоков: {workers}")
-        self.stdout.write(f"Промежуточный CSV: {progress_csv_path} (каждые {progress_every} ИНН)")
+        self.stdout.write(f"Лог прогресса:  {live_log_path}")
+        self.stdout.write(f"Статус live:    {live_status_path}")
+        self.stdout.write(f"CSV live:       {live_csv_path}")
+        self.stdout.write(f"Строка в лог каждые {progress_every} ИНН")
+        sys.stdout.flush()
         if auth_csv:
             self.stdout.write(f"Auth CSV: {auth_csv}")
         if not call_sbis and not call_egrul:
@@ -394,6 +438,24 @@ class Command(BaseCommand):
         lock = threading.Lock()
         done = [0]
         total = len(inns)
+
+        self._write_status(
+            live_status_path,
+            state="running",
+            total=total,
+            rows=rows,
+            started_at=started_at,
+            extra={
+                "sbis": call_sbis,
+                "egrul": call_egrul,
+                "workers": workers,
+                "pid": os.getpid(),
+            },
+        )
+        live_log_path.write_text(
+            f"START {started_at} total={total} sbis={call_sbis} egrul={call_egrul} workers={workers}\n",
+            encoding="utf-8",
+        )
 
         def _run(inn: str) -> dict:
             if call_egrul and egrul_delay > 0:
@@ -420,13 +482,40 @@ class Command(BaseCommand):
                     f"КПП={r['КПП'] or '—'}, "
                     f"имя={(r['Наименование'] or '—')[:35]}"
                 )
+                if r.get("sbis_error"):
+                    line += f" | sbis_err={(r['sbis_error'] or '')[:60]}"
+                if r.get("egrul_error"):
+                    line += f" | egrul_err={(r['egrul_error'] or '')[:40]}"
+
+                with live_log_path.open("a", encoding="utf-8") as lf:
+                    lf.write(line + "\n")
+
                 show = (not options["quiet"]) or (n % progress_every == 0) or (n == total)
                 if show:
                     self.stdout.write(line)
                     sys.stdout.flush()
+
+                snapshot = sorted(rows, key=lambda x: x.get("ИНН", ""))
+                self._write_csv(live_csv_path, snapshot)
                 if n % progress_every == 0 or n == total:
-                    snapshot = sorted(rows, key=lambda x: x.get("ИНН", ""))
                     self._write_csv(progress_csv_path, snapshot)
+
+                self._write_status(
+                    live_status_path,
+                    state="running",
+                    total=total,
+                    rows=rows,
+                    started_at=started_at,
+                    last_inn=r["ИНН"],
+                    last_row=r,
+                )
+
+                if options["per_inn_json"]:
+                    companies_dir.mkdir(parents=True, exist_ok=True)
+                    (companies_dir / f"{r['ИНН']}.json").write_text(
+                        json.dumps(r, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
 
         if workers <= 1:
             for inn in inns:
@@ -489,6 +578,17 @@ class Command(BaseCommand):
             xlsx_msg = str(xlsx_path)
         except ImportError:
             xlsx_msg = "(openpyxl не установлен — только JSON/CSV)"
+
+        self._write_status(
+            live_status_path,
+            state="done",
+            total=total,
+            rows=rows,
+            started_at=started_at,
+            extra={"json": str(json_path), "csv": str(csv_path)},
+        )
+        with live_log_path.open("a", encoding="utf-8") as lf:
+            lf.write(f"DONE {dj_timezone.now().isoformat()} records={len(rows)}\n")
 
         filled_kpp = sum(1 for r in rows if r.get("КПП"))
         filled_name = sum(1 for r in rows if r.get("Наименование"))
