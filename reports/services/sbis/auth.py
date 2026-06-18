@@ -125,18 +125,19 @@ def auth_sbis_by_cert(
         raise RuntimeError(f"СБИС не вернул result при аутентификации: {data}")
 
     enc_bin = base64.b64decode(enc_b64)
-    enc_path = "/tmp/sbis_report_auth.enc"
-    dec_path = "/tmp/sbis_report_auth.dec"
 
     logger.info("[SBIS auth] 3/4 Запись .enc, запуск cryptcp -decr (расшифровка)")
-    with open(enc_path, "wb") as f:
-        f.write(enc_bin)
+    with tempfile.TemporaryDirectory(prefix=f"sbis_auth_dec_{inn}_") as td:
+        enc_path = os.path.join(td, "auth.enc")
+        dec_path = os.path.join(td, "auth.dec")
+        with open(enc_path, "wb") as f:
+            f.write(enc_bin)
 
-    run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, enc_path, dec_path])
+        run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, enc_path, dec_path])
 
-    logger.info("[SBIS auth] 4/4 Чтение session_id из .dec")
-    with open(dec_path, "rb") as f:
-        session_id = f.read().decode("utf-8").strip()
+        logger.info("[SBIS auth] 4/4 Чтение session_id из .dec")
+        with open(dec_path, "rb") as f:
+            session_id = f.read().decode("utf-8").strip()
     return session_id
 
 def sbis_auth_session_for_inn(

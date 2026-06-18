@@ -4,21 +4,25 @@
 Пример:
   docker compose exec web python manage.py test_sbis_auth_all --quiet
   docker compose exec web python manage.py test_sbis_auth_all --limit 20
-  docker compose exec web python manage.py test_sbis_auth_all --output-dir /app/media/sbis_auth_scan
+  docker compose exec web python manage.py test_sbis_auth_all --workers 4 --delay 0.2 --quiet
 
 Полный прогон ~1004 ИНН (в screen/nohup):
-  nohup docker compose exec -T web python manage.py test_sbis_auth_all --quiet --delay 0.5 \\
-    > /tmp/sbis_auth_all.log 2>&1 &
+  nohup docker compose exec -T web python manage.py test_sbis_auth_all \\
+    --quiet --workers 4 --delay 0.2 > /tmp/sbis_auth_all.log 2>&1 &
   tail -f /tmp/sbis_auth_all.log
 """
 import csv
 import json
 import logging
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
+from django.db import close_old_connections
 from django.utils import timezone as dj_timezone
 
 from reports.models import Certificate
@@ -100,6 +104,52 @@ def _cert_expired(cert: Certificate, now) -> bool:
     return na <= now
 
 
+@dataclass
+class InnCheckResult:
+    inn: str
+    ok: bool
+    cat: str
+    cert: Certificate | None
+    msg: str = ""
+
+
+def _check_inn(
+    inn: str,
+    certs: list[Certificate],
+    *,
+    skip_expired: bool,
+) -> InnCheckResult:
+    close_old_connections()
+    if not certs:
+        return InnCheckResult(inn, False, "no_cert", None, "нет контейнера в БД")
+
+    now = dj_timezone.now()
+    last_cat = "other_error"
+    last_msg = ""
+    last_cert: Certificate | None = None
+
+    for cert in certs:
+        last_cert = cert
+        if skip_expired and _cert_expired(cert, now):
+            last_cat = "expired_local"
+            last_msg = f"not_after={_fmt_dt(cert.not_after)}"
+            continue
+
+        try:
+            session_id = SbisSessionService(certificate=cert).authenticate()
+            return InnCheckResult(inn, True, "ok", cert, session_id)
+        except SbisAuthError as e:
+            last_msg = str(e)
+            last_cat = classify_sbis_error(last_msg)
+            if last_cat in FAIL_FAST_CATEGORIES:
+                break
+        except Exception as e:
+            last_msg = str(e)
+            last_cat = classify_sbis_error(last_msg)
+
+    return InnCheckResult(inn, False, last_cat, last_cert, last_msg)
+
+
 class Command(BaseCommand):
     help = "Проверить авторизацию СБИС для всех ИНН и сохранить список валидных"
 
@@ -115,7 +165,14 @@ class Command(BaseCommand):
             "--delay",
             type=float,
             default=1.0,
-            help="Пауза между ИНН (сек), чтобы не душить NodeMaven",
+            help="Пауза между завершёнными ИНН (сек); при --workers>1 уменьшите до 0.1–0.3",
+        )
+        parser.add_argument(
+            "--workers",
+            type=int,
+            default=1,
+            metavar="N",
+            help="Потоков параллельно (1–6, по умолчанию 1). Рекомендуется 3–4.",
         )
         parser.add_argument(
             "--inn",
@@ -141,6 +198,7 @@ class Command(BaseCommand):
 
     def handle(self, *args, **options):
         skip_expired = not options["call_sbis_for_expired"]
+        workers = max(1, min(6, int(options.get("workers") or 1)))
         if options["quiet"]:
             for name in ("reports.services.sbis", "reports.services.sbis_mail"):
                 logging.getLogger(name).setLevel(logging.WARNING)
@@ -183,7 +241,14 @@ class Command(BaseCommand):
             .count()
         )
         self.stdout.write(f"ИНН к проверке: {total}")
+        self.stdout.write(f"Потоков: {workers}")
         self.stdout.write(f"БД: записей={db_total}, уникальных ИНН={db_unique}, ИНН с uMy={db_auth}")
+        if workers > 4:
+            self.stdout.write(
+                self.style.WARNING(
+                    "При >4 потоках возможны proxy_error / EMFILE — начните с --workers 3"
+                )
+            )
         if db_auth < 10 and db_total > 100:
             self.stdout.write(
                 self.style.WARNING(
@@ -193,9 +258,16 @@ class Command(BaseCommand):
             )
         self.stdout.write(f"Отчёт: {csv_path}")
 
+        inn_certs: dict[str, list[Certificate]] = {
+            inn: pick_certs_for_inn(inn, options["try_all_certs"]) for inn in inns
+        }
+
         valid_inns: list[str] = []
         failed_inns: list[str] = []
         stats: dict[str, int] = {}
+        lock = threading.Lock()
+        done = [0]
+        delay = max(0.0, float(options["delay"]))
 
         with csv_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
@@ -216,13 +288,7 @@ class Command(BaseCommand):
                 ]
             )
 
-            def write_row(
-                inn,
-                status,
-                cat,
-                cert_obj,
-                msg="",
-            ):
+            def write_row(inn, status, cat, cert_obj, msg=""):
                 writer.writerow(
                     [
                         inn,
@@ -240,59 +306,58 @@ class Command(BaseCommand):
                     ]
                 )
 
-            for idx, inn in enumerate(inns, start=1):
-                certs = pick_certs_for_inn(inn, options["try_all_certs"])
-                if not certs:
-                    write_row(inn, "fail", "no_cert", None, "нет контейнера в БД")
-                    stats["no_cert"] = stats.get("no_cert", 0) + 1
-                    failed_inns.append(inn)
-                    f.flush()
-                    self.stdout.write(f"[{idx}/{total}] {inn} — no_cert")
-                    continue
-
-                ok = False
-                last_cat = "other_error"
-                last_msg = ""
-                last_cert: Certificate | None = None
-
-                for cert in certs:
-                    last_cert = cert
-                    if skip_expired and _cert_expired(cert, now):
-                        last_cat = "expired_local"
-                        last_msg = f"not_after={_fmt_dt(cert.not_after)}"
-                        continue
-
-                    try:
-                        service = SbisSessionService(certificate=cert)
-                        session_id = service.authenticate()
-                        write_row(inn, "ok", "ok", cert, session_id)
-                        valid_inns.append(inn)
+            def apply_result(result: InnCheckResult) -> None:
+                nonlocal valid_inns, failed_inns, stats
+                with lock:
+                    done[0] += 1
+                    idx = done[0]
+                    if result.ok:
+                        write_row(result.inn, "ok", "ok", result.cert, result.msg)
+                        valid_inns.append(result.inn)
                         stats["ok"] = stats.get("ok", 0) + 1
-                        ok = True
-                        self.stdout.write(self.style.SUCCESS(f"[{idx}/{total}] {inn} — OK (cert {cert.id})"))
-                        break
-                    except SbisAuthError as e:
-                        last_msg = str(e)
-                        last_cat = classify_sbis_error(last_msg)
-                        if last_cat in FAIL_FAST_CATEGORIES:
-                            break
-                    except Exception as e:
-                        last_msg = str(e)
-                        last_cat = classify_sbis_error(last_msg)
-
-                if not ok:
-                    write_row(inn, "fail", last_cat, last_cert, last_msg)
-                    stats[last_cat] = stats.get(last_cat, 0) + 1
-                    failed_inns.append(inn)
-                    self.stdout.write(
-                        self.style.WARNING(
-                            f"[{idx}/{total}] {inn} — {last_cat}: {ERROR_CATEGORY_RU.get(last_cat, last_cat)}"
+                        self.stdout.write(
+                            self.style.SUCCESS(
+                                f"[{idx}/{total}] {result.inn} — OK (cert {result.cert.id})"
+                            )
                         )
-                    )
+                    else:
+                        write_row(result.inn, "fail", result.cat, result.cert, result.msg)
+                        stats[result.cat] = stats.get(result.cat, 0) + 1
+                        failed_inns.append(result.inn)
+                        self.stdout.write(
+                            self.style.WARNING(
+                                f"[{idx}/{total}] {result.inn} — {result.cat}: "
+                                f"{ERROR_CATEGORY_RU.get(result.cat, result.cat)}"
+                            )
+                        )
+                    f.flush()
+                    if delay > 0 and idx < total:
+                        time.sleep(delay)
 
-                f.flush()
-                if options["delay"] > 0 and idx < total:
-                    time.sleep(options["delay"])
+            if workers <= 1:
+                for inn in inns:
+                    apply_result(
+                        _check_inn(inn, inn_certs[inn], skip_expired=skip_expired)
+                    )
+            else:
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    futs = {
+                        pool.submit(
+                            _check_inn,
+                            inn,
+                            inn_certs[inn],
+                            skip_expired=skip_expired,
+                        ): inn
+                        for inn in inns
+                    }
+                    for fut in as_completed(futs):
+                        inn = futs[fut]
+                        try:
+                            apply_result(fut.result())
+                        except Exception as e:
+                            apply_result(
+                                InnCheckResult(inn, False, "other_error", None, str(e))
+                            )
 
         valid_path.write_text("\n".join(valid_inns) + ("\n" if valid_inns else ""), encoding="utf-8")
         failed_path.write_text("\n".join(failed_inns) + ("\n" if failed_inns else ""), encoding="utf-8")
@@ -300,6 +365,7 @@ class Command(BaseCommand):
             "checked_inns": total,
             "valid_count": len(valid_inns),
             "failed_count": len(failed_inns),
+            "workers": workers,
             "stats": stats,
             "error_categories_ru": ERROR_CATEGORY_RU,
             "csv": str(csv_path),
