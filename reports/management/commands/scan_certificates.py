@@ -66,10 +66,15 @@ def parse_cert_date(s: str) -> datetime | None:
         return None
 
 
-def get_inn_from_container_name(csptest_name: str) -> str | None:
+def normalize_container_id(csptest_name: str) -> str:
     name = csptest_name.rsplit("\\", 1)[-1].strip()
     if name.endswith(" копия"):
         name = name[:-6].strip()
+    return name
+
+
+def get_inn_from_container_name(csptest_name: str) -> str | None:
+    name = normalize_container_id(csptest_name)
     m = re.search(r"\d{10}", name)
     if m:
         return m.group(0)
@@ -77,26 +82,92 @@ def get_inn_from_container_name(csptest_name: str) -> str | None:
     return m.group(0) if m else None
 
 
-def get_inn_from_csp_folder(csptest_name: str) -> str | None:
-    if not csptest_name:
-        return None
-    container_id = csptest_name.rsplit("\\", 1)[-1].strip()
-    if container_id.endswith(" копия"):
-        container_id = container_id[:-6].strip()
+def find_csp_container_dir(csptest_name: str) -> tuple[str | None, Path | None]:
+    """Каталог ключей CSP_ROOT/{inn}/.../{container_id}/ если есть."""
+    container_id = normalize_container_id(csptest_name)
     if not container_id or not CSP_ROOT.is_dir():
-        return None
+        return None, None
     for inn_dir in CSP_ROOT.iterdir():
         if not inn_dir.is_dir():
             continue
         inn = inn_dir.name
         if not re.fullmatch(r"\d{10,12}", inn):
             continue
-        if (inn_dir / container_id).is_dir():
-            return inn
-        for sub in inn_dir.iterdir():
-            if sub.is_dir() and sub.name == container_id:
-                return inn
-    return None
+        direct = inn_dir / container_id
+        if direct.is_dir():
+            return inn, direct
+    for match in CSP_ROOT.rglob(container_id):
+        if not match.is_dir():
+            continue
+        parent = match.parent
+        if parent.parent == CSP_ROOT or parent.parent.parent == CSP_ROOT:
+            inn = parent.name if re.fullmatch(r"\d{10,12}", parent.name) else None
+            if not inn and parent.parent != CSP_ROOT:
+                inn = parent.parent.name
+            if inn and re.fullmatch(r"\d{10,12}", inn):
+                return inn, match
+    return None, None
+
+
+def get_inn_from_csp_folder(csptest_name: str) -> str | None:
+    inn, _ = find_csp_container_dir(csptest_name)
+    return inn
+
+
+def _pick_best_cer(cer_paths: list[Path], *, require_valid: bool) -> Path | None:
+    now = datetime.now(timezone.utc)
+    best: Path | None = None
+    best_not_after: datetime | None = None
+    fallback: Path | None = None
+    fallback_na: datetime | None = None
+    for cer in cer_paths:
+        if not cer.is_file():
+            continue
+        out = certmgr_list_file(str(cer))
+        if not out or "thumbprint" not in out.lower():
+            continue
+        info = parse_certmgr_listing(out, "")
+        not_after = info.get("not_after")
+        if not_after and (fallback_na is None or not_after > fallback_na):
+            fallback = cer
+            fallback_na = not_after
+        if not_after and not_after > now:
+            if best_not_after is None or not_after > best_not_after:
+                best_not_after = not_after
+                best = cer
+    if require_valid:
+        return best or fallback
+    return best or fallback
+
+
+def _cer_files_under(path: Path) -> list[Path]:
+    found: list[Path] = []
+    for pattern in ("*.cer", "*.crt", "*.CER", "*.CRT"):
+        found.extend(path.glob(pattern))
+        if path.is_dir():
+            found.extend(path.rglob(pattern))
+    return list(dict.fromkeys(found))
+
+
+def find_best_cer_for_inn(inn: str) -> Path | None:
+    inn_dir = CSP_ROOT / inn
+    if not inn_dir.is_dir():
+        return None
+    return _pick_best_cer(_cer_files_under(inn_dir), require_valid=True)
+
+
+def find_best_cer_near_container(csptest_name: str) -> tuple[str | None, Path | None]:
+    inn, cont_dir = find_csp_container_dir(csptest_name)
+    if cont_dir and cont_dir.is_dir():
+        best = _pick_best_cer(_cer_files_under(cont_dir), require_valid=True)
+        if best:
+            return inn, best
+    if inn:
+        return inn, find_best_cer_for_inn(inn)
+    name_inn = get_inn_from_container_name(csptest_name)
+    if name_inn:
+        return name_inn, find_best_cer_for_inn(name_inn)
+    return None, None
 
 
 def _inn_from_subject_line(subject_line: str) -> str | None:
@@ -154,28 +225,6 @@ def parse_certmgr_listing(out: str, csptest_name: str = "") -> dict:
     }
 
 
-def find_best_cer_for_inn(inn: str) -> Path | None:
-    inn_dir = CSP_ROOT / inn
-    if not inn_dir.is_dir():
-        return None
-    now = datetime.now(timezone.utc)
-    best: Path | None = None
-    best_not_after: datetime | None = None
-    for cer in inn_dir.rglob("*.cer"):
-        if not cer.is_file():
-            continue
-        out = certmgr_list_file(str(cer))
-        if not out or "thumbprint" not in out.lower():
-            continue
-        info = parse_certmgr_listing(out, "")
-        not_after = info.get("not_after")
-        if not_after and not_after > now:
-            if best_not_after is None or not_after > best_not_after:
-                best_not_after = not_after
-                best = cer
-    return best
-
-
 def obtain_cert_path(csptest_name: str) -> tuple[str | None, str]:
     """
     Путь к .cer для разбора: экспорт из контейнера или лучший .cer из CSP_ROOT/{inn}/.
@@ -193,11 +242,9 @@ def obtain_cert_path(csptest_name: str) -> tuple[str | None, str]:
                 if inn:
                     return dest, "export"
 
-    inn = get_inn_from_csp_folder(csptest_name) or get_inn_from_container_name(csptest_name)
-    if inn:
-        best = find_best_cer_for_inn(inn)
-        if best:
-            return str(best), "folder"
+    folder_inn, folder_cer = find_best_cer_near_container(csptest_name)
+    if folder_cer:
+        return str(folder_cer), "folder"
     return None, ""
 
 
@@ -325,6 +372,7 @@ class Command(BaseCommand):
                     update_fields=["inn", "thumbprint", "not_before", "not_after", "last_seen_at"]
                 )
                 updated += 1
+                self.stdout.write(f"    обновлён ИНН {inn} ({source})")
                 continue
 
             cert = Certificate.objects.create(
