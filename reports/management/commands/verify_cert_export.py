@@ -66,7 +66,7 @@ class Command(BaseCommand):
             dest = f"/tmp/verify_{hashlib.sha256(csptest_name.encode()).hexdigest()[:12]}.cer"
             export_ok, export_err = export_cert_from_container(csptest_name, dest)
 
-            cert_path, source = obtain_cert_path(csptest_name, csp_index)
+            cert_path, source, _has_key = obtain_cert_path(csptest_name, csp_index)
 
             if source == "folder":
                 folder_inn = csp_index.get_inn_from_csp_folder_for_cont(csptest_name)

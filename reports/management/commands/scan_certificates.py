@@ -16,6 +16,9 @@ CERTMGR_BIN = "/opt/cprocsp/bin/amd64/certmgr"
 CSP_ROOT = Path("/var/opt/cprocsp/keys/root")
 INN_DIR_RE = re.compile(r"^\d{10,12}$")
 CER_GLOBS = ("*.cer", "*.crt", "*.CER", "*.CRT")
+DEFAULT_EXPORT_TIMEOUT = 10
+DEFAULT_VERIFY_KEY_TIMEOUT = 5
+DEFAULT_INST_TIMEOUT = 15
 
 
 def _csp_use_sudo() -> bool:
@@ -47,13 +50,19 @@ def list_hdimage_containers() -> list[str]:
     return containers
 
 
-def export_cert_from_container(container_name: str, dest_path: str) -> tuple[bool, str]:
+def export_cert_from_container(
+    container_name: str, dest_path: str, *, timeout: int = DEFAULT_EXPORT_TIMEOUT
+) -> tuple[bool, str]:
     """Экспорт серта из контейнера. Возвращает (ok, stderr/stdout при ошибке)."""
-    result = subprocess.run(
-        _csp_cmd(CERTMGR_BIN, ["-export", "-cont", container_name, "-dest", dest_path]),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            _csp_cmd(CERTMGR_BIN, ["-export", "-cont", container_name, "-dest", dest_path]),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timeout ({timeout}s)"
     if result.returncode == 0:
         return True, ""
     err = (result.stderr or result.stdout or "").strip()
@@ -382,23 +391,37 @@ def _pick_best_cer(cer_paths: list[Path], *, require_valid: bool) -> Path | None
     return best or fallback
 
 
-def obtain_cert_path(csptest_name: str, csp_index: CspIndex) -> tuple[str | None, str]:
-    dest = f"/tmp/csp_scan_{hashlib.sha256(csptest_name.encode()).hexdigest()}.cer"
-    ok, _ = export_cert_from_container(csptest_name, dest)
-    if ok:
-        out = certmgr_list_file(dest)
-        if out and "thumbprint" in out.lower():
-            info = parse_certmgr_listing(out, csptest_name, csp_index)
-            if info.get("thumbprint") and (
-                info.get("inn")
-                or csp_index.resolve_inn_for_container(csptest_name, certmgr_out=out)
-            ):
-                return dest, "export"
+def obtain_cert_path(
+    csptest_name: str,
+    csp_index: CspIndex,
+    *,
+    export_timeout: int = DEFAULT_EXPORT_TIMEOUT,
+    verify_key_timeout: int = DEFAULT_VERIFY_KEY_TIMEOUT,
+) -> tuple[str | None, str, bool]:
+    """
+    Путь к .cer, источник (export/folder), есть ли ключ в контейнере.
+    Сначала csptest -verifycontext; export только если ключ есть (иначе certmgr висит).
+    """
+    has_key = verify_container_has_private_key(csptest_name, timeout=verify_key_timeout)
+
+    if has_key:
+        dest = f"/tmp/csp_scan_{hashlib.sha256(csptest_name.encode()).hexdigest()}.cer"
+        ok, _ = export_cert_from_container(csptest_name, dest, timeout=export_timeout)
+        if ok:
+            out = certmgr_list_file(dest)
+            if out and "thumbprint" in out.lower():
+                info = parse_certmgr_listing(out, csptest_name, csp_index)
+                if info.get("thumbprint") and (
+                    info.get("inn")
+                    or csp_index.resolve_inn_for_container(csptest_name, certmgr_out=out)
+                ):
+                    return dest, "export", True
 
     _, folder_cer = csp_index.find_best_cer_near_container(csptest_name)
     if folder_cer:
-        return str(folder_cer), "folder"
-    return None, ""
+        return str(folder_cer), "folder", has_key
+
+    return None, "", has_key
 
 
 def _subject_from_listing(out: str) -> str | None:
@@ -418,16 +441,20 @@ class ScanCandidate:
     has_container_key: bool = False
 
 
-def verify_container_has_private_key(csptest_name: str) -> bool:
+def verify_container_has_private_key(
+    csptest_name: str, *, timeout: int = DEFAULT_VERIFY_KEY_TIMEOUT
+) -> bool:
     """csptest -verifycontext: в контейнере реально есть приватный ключ."""
     try:
         result = subprocess.run(
             _csp_cmd(CSPTEST_BIN, ["-keyset", "-container", csptest_name, "-verifycontext"]),
             capture_output=True,
             text=True,
-            timeout=20,
+            timeout=timeout,
         )
-    except (subprocess.TimeoutExpired, OSError):
+    except subprocess.TimeoutExpired:
+        return False
+    except OSError:
         return False
     combined = f"{result.stdout}\n{result.stderr}".lower()
     return result.returncode == 0 or "success" in combined
@@ -459,16 +486,22 @@ def parse_umy_thumbprint_link(thumbprint: str) -> tuple[bool, str | None]:
     return False, container
 
 
-def install_cert_to_umy(cert_path: str, container_name: str) -> tuple[bool, str]:
+def install_cert_to_umy(
+    cert_path: str, container_name: str, *, timeout: int = DEFAULT_INST_TIMEOUT
+) -> tuple[bool, str]:
     """certmgr -inst -store uMy — PrivateKey Link для cryptcp -decr / SBIS auth."""
-    result = subprocess.run(
-        _csp_cmd(
-            CERTMGR_BIN,
-            ["-inst", "-store", "uMy", "-file", cert_path, "-cont", container_name],
-        ),
-        capture_output=True,
-        text=True,
-    )
+    try:
+        result = subprocess.run(
+            _csp_cmd(
+                CERTMGR_BIN,
+                ["-inst", "-store", "uMy", "-file", cert_path, "-cont", container_name],
+            ),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timeout ({timeout}s)"
     if result.returncode == 0:
         return True, ""
     err = (result.stderr or result.stdout or "").strip()
@@ -586,6 +619,18 @@ class Command(BaseCommand):
             action="store_true",
             help="Запись в БД для каждого контейнера (по умолчанию — один лучший на ИНН)",
         )
+        parser.add_argument(
+            "--limit",
+            type=int,
+            default=0,
+            help="Обработать только N контейнеров (0 = все)",
+        )
+        parser.add_argument(
+            "--export-timeout",
+            type=int,
+            default=DEFAULT_EXPORT_TIMEOUT,
+            help=f"Таймаут certmgr -export в секундах (по умолчанию {DEFAULT_EXPORT_TIMEOUT})",
+        )
 
     def handle(self, *args, **options):
         now = datetime.now(timezone.utc)
@@ -593,6 +638,8 @@ class Command(BaseCommand):
         skip_copies = options["skip_copies"]
         best_per_inn = not options["all_containers"]
         install_umy = options["install_uMy"]
+        export_timeout = options["export_timeout"]
+        verify_key_timeout = DEFAULT_VERIFY_KEY_TIMEOUT
 
         if options["clear"]:
             n = Certificate.objects.count()
@@ -610,7 +657,10 @@ class Command(BaseCommand):
         )
 
         containers = list_hdimage_containers()
-        self.stdout.write(f"Найдено контейнеров: {len(containers)}")
+        if options["limit"]:
+            containers = containers[: options["limit"]]
+        total_containers = len(containers)
+        self.stdout.write(f"Найдено контейнеров: {total_containers}")
         if skip_copies:
             self.stdout.write("  (--skip-copies: контейнеры «… копия» будут пропущены)")
         if best_per_inn:
@@ -624,23 +674,36 @@ class Command(BaseCommand):
         skipped_expired = 0
         installed_umy = 0
         install_umy_failed = 0
+        skipped_no_key = 0
         candidates: list[ScanCandidate] = []
 
-        for csptest_name in containers:
+        for idx, csptest_name in enumerate(containers, start=1):
             if skip_copies and is_copy_container(csptest_name):
                 skipped_copies += 1
                 continue
 
+            if quiet and idx % 50 == 0:
+                self.stdout.write(f"  ... {idx}/{total_containers}")
+                self.stdout.flush()
+
             if not quiet:
                 self.stdout.write(f"  контейнер: {csptest_name}")
 
-            cert_path, source = obtain_cert_path(csptest_name, csp_index)
+            cert_path, source, has_key = obtain_cert_path(
+                csptest_name,
+                csp_index,
+                export_timeout=export_timeout,
+                verify_key_timeout=verify_key_timeout,
+            )
             if not cert_path:
                 skipped_export += 1
+                if not has_key:
+                    skipped_no_key += 1
                 if not quiet:
                     self.stdout.write(
                         self.style.WARNING(
-                            "    пропуск: нет серта в контейнере и .cer в CSP_ROOT/{inn}/"
+                            "    пропуск: нет серта"
+                            + (" (нет ключа в контейнере)" if not has_key else "")
                         )
                     )
                 continue
@@ -675,7 +738,7 @@ class Command(BaseCommand):
                     not_after=not_after,
                     cert_path=cert_path,
                     source=source,
-                    has_container_key=verify_container_has_private_key(csptest_name),
+                    has_container_key=has_key,
                 )
             )
             if not quiet:
@@ -816,6 +879,8 @@ class Command(BaseCommand):
             self.stdout.write(f"  пропущено «копия»: {skipped_copies}")
         if skipped_export:
             self.stdout.write(self.style.WARNING(f"  пропущено (нет серта): {skipped_export}"))
+        if skipped_no_key:
+            self.stdout.write(f"  из них без ключа в контейнере: {skipped_no_key}")
         if skipped_parse:
             self.stdout.write(self.style.WARNING(f"  пропущено (парсинг): {skipped_parse}"))
         if skipped_expired:
