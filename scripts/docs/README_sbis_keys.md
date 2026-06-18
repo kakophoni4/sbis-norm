@@ -2,7 +2,15 @@
 
 Скрипт `sbis_keys_install_linux.sh` автоматизирует цепочку из инструкции: распаковка архивов с ключами → выравнивание подпапок → экспорт сертификатов → установка в uMy с привязкой к контейнеру → вывод команд для Django.
 
-Полная цепочка до SESSION_ID в Django описана в [SBIS_KEYS_LINUX_CHAIN.md](SBIS_KEYS_LINUX_CHAIN.md).
+Полная цепочка до SESSION_ID в Django (ручная + Docker + массовая) — **[SBIS_KEYS_LINUX_CHAIN.md](SBIS_KEYS_LINUX_CHAIN.md)**.
+
+## Быстрый старт на сервере `/opt/sbis-norm`
+
+```bash
+sudo bash scripts/ops/install_signatures_from_bundle.sh
+docker compose exec web python manage.py sync_has_private_key
+docker compose exec web python manage.py test_sbis_auth_one 9722082369
+```
 
 ## Требования
 
