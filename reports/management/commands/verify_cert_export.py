@@ -25,9 +25,9 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--limit", type=int, default=0, help="Проверить N контейнеров (0 = все)")
         parser.add_argument(
-            "--include-copies",
+            "--skip-copies",
             action="store_true",
-            help="Включить контейнеры «… копия»",
+            help="Пропустить контейнеры «… копия»",
         )
 
     def handle(self, *args, **options):
@@ -56,7 +56,7 @@ class Command(BaseCommand):
         samples_folder: list[str] = []
         samples_fail: list[str] = []
 
-        skip_copies = not options["include_copies"]
+        skip_copies = options["skip_copies"]
 
         for csptest_name in containers:
             if skip_copies and is_copy_container(csptest_name):

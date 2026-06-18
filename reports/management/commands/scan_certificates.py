@@ -81,7 +81,7 @@ def normalize_container_id(csptest_name: str) -> str:
 
 
 def is_copy_container(csptest_name: str) -> bool:
-    """Дубликаты «… копия» — мусорные контейнеры без ключей."""
+    """Контейнер с суффиксом « копия» (типично при переносе с Windows). Имя полное — так в csptest/certmgr."""
     return csptest_name.rsplit("\\", 1)[-1].strip().endswith(" копия")
 
 
@@ -508,9 +508,9 @@ class Command(BaseCommand):
             help="Установить лучший сертификат на ИНН в uMy (certmgr -inst -store uMy -cont ...)",
         )
         parser.add_argument(
-            "--include-copies",
+            "--skip-copies",
             action="store_true",
-            help="Не пропускать контейнеры «… копия» (по умолчанию пропускаются)",
+            help="Пропустить контейнеры с суффиксом « копия» (обычно не нужно — это валидные имена в csptest)",
         )
         parser.add_argument(
             "--all-containers",
@@ -521,7 +521,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         now = datetime.now(timezone.utc)
         quiet = options["quiet"]
-        skip_copies = not options["include_copies"]
+        skip_copies = options["skip_copies"]
         best_per_inn = not options["all_containers"]
         install_umy = options["install_uMy"]
 
@@ -543,7 +543,7 @@ class Command(BaseCommand):
         containers = list_hdimage_containers()
         self.stdout.write(f"Найдено контейнеров: {len(containers)}")
         if skip_copies:
-            self.stdout.write("  (контейнеры «копия» пропускаются; --include-copies чтобы включить)")
+            self.stdout.write("  (--skip-copies: контейнеры «… копия» будут пропущены)")
         if best_per_inn:
             self.stdout.write("  (в БД — один лучший контейнер на ИНН; --all-containers для всех)")
 
