@@ -10,6 +10,11 @@
   nohup docker compose exec -T web python manage.py test_sbis_auth_all \\
     --quiet --workers 12 --delay 0 > /tmp/sbis_auth_all.log 2>&1 &
   tail -f /tmp/sbis_auth_all.log
+
+Повтор только proxy_error из прошлого CSV:
+  docker compose exec web python manage.py test_sbis_auth_all --quiet --workers 4 \\
+    --from-csv /app/media/sbis_auth_scan/sbis_auth_report_20260618_133531.csv \\
+    --category proxy_error
 """
 import csv
 import json
@@ -156,6 +161,41 @@ def _check_inn(
     return InnCheckResult(inn, False, last_cat, last_cert, last_msg)
 
 
+def _load_inns_from_file(path: Path) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Файл не найден: {path}")
+    out: list[str] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        inn = line.strip()
+        if inn and not inn.startswith("#"):
+            out.append(inn)
+    return out
+
+
+def _load_inns_from_csv(
+    path: Path,
+    *,
+    category: str = "",
+    status: str = "",
+) -> list[str]:
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV не найден: {path}")
+    want_cat = (category or "").strip()
+    want_status = (status or "").strip()
+    out: list[str] = []
+    with path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            if want_cat and (row.get("error_category") or "").strip() != want_cat:
+                continue
+            if want_status and (row.get("status") or "").strip() != want_status:
+                continue
+            inn = (row.get("inn") or "").strip()
+            if inn:
+                out.append(inn)
+    return sorted(set(out))
+
+
 class Command(BaseCommand):
     help = "Проверить авторизацию СБИС для всех ИНН и сохранить список валидных"
 
@@ -197,6 +237,26 @@ class Command(BaseCommand):
             action="append",
             default=[],
             help="Проверить только указанные ИНН (можно несколько --inn)",
+        )
+        parser.add_argument(
+            "--from-file",
+            default="",
+            help="Список ИНН из txt (по одному в строке). Путь внутри контейнера: /app/media/...",
+        )
+        parser.add_argument(
+            "--from-csv",
+            default="",
+            help="ИНН из прошлого sbis_auth_report_*.csv (см. --category / --status)",
+        )
+        parser.add_argument(
+            "--category",
+            default="",
+            help="Фильтр error_category для --from-csv (например proxy_error)",
+        )
+        parser.add_argument(
+            "--status",
+            default="",
+            help="Фильтр status для --from-csv (ok или fail)",
         )
         parser.add_argument(
             "--quiet",
@@ -243,20 +303,36 @@ class Command(BaseCommand):
         summary_path = out_dir / f"summary_{ts}.json"
 
         only_inns = [x.strip() for x in options["inn"] if x and x.strip()]
-        inn_qs = (
-            Certificate.objects.filter(has_private_key=True, is_active=True)
-            .exclude(inn="")
-            .values_list("inn", flat=True)
-            .distinct()
-            .order_by("inn")
-        )
+        if options.get("from_file"):
+            only_inns.extend(_load_inns_from_file(Path(options["from_file"])))
+        if options.get("from_csv"):
+            only_inns.extend(
+                _load_inns_from_csv(
+                    Path(options["from_csv"]),
+                    category=options.get("category") or "",
+                    status=options.get("status") or "",
+                )
+            )
+        only_inns = sorted(set(only_inns))
         if only_inns:
-            inn_qs = inn_qs.filter(inn__in=only_inns)
-        inns = list(inn_qs)
-        if options["offset"]:
-            inns = inns[options["offset"] :]
-        if options["limit"]:
-            inns = inns[: options["limit"]]
+            inns = list(only_inns)
+            if options["offset"]:
+                inns = inns[options["offset"] :]
+            if options["limit"]:
+                inns = inns[: options["limit"]]
+        else:
+            inn_qs = (
+                Certificate.objects.filter(has_private_key=True, is_active=True)
+                .exclude(inn="")
+                .values_list("inn", flat=True)
+                .distinct()
+                .order_by("inn")
+            )
+            inns = list(inn_qs)
+            if options["offset"]:
+                inns = inns[options["offset"] :]
+            if options["limit"]:
+                inns = inns[: options["limit"]]
 
         total = len(inns)
         db_total = Certificate.objects.count()
