@@ -176,7 +176,8 @@ class Command(BaseCommand):
             cert = Certificate.objects.filter(csptest_name=csptest_name).first()
             if cert:
                 cert.last_seen_at = now
-                cert.save(update_fields=["last_seen_at"])
+                cert.has_private_key = True
+                cert.save(update_fields=["last_seen_at", "has_private_key"])
                 updated += 1
                 continue
 
@@ -206,7 +207,7 @@ class Command(BaseCommand):
                 source="LOCAL",
                 not_before=info.get("not_before"),
                 not_after=info.get("not_after"),
-                has_private_key=False,
+                has_private_key=True,
                 last_seen_at=now,
                 meta={},
             )
@@ -217,12 +218,17 @@ class Command(BaseCommand):
 
         update_private_key_flags()
 
+        container_set = set(containers)
+        flagged = Certificate.objects.filter(csptest_name__in=container_set).update(has_private_key=True)
+
         total = Certificate.objects.count()
         active = Certificate.objects.filter(is_active=True).count()
+        with_pk = Certificate.objects.filter(has_private_key=True).count()
 
         self.stdout.write("")
         self.stdout.write("Статистика по таблице Certificate:")
         self.stdout.write(f"  всего записей: {total}")
         self.stdout.write(f"  активных:      {active}")
+        self.stdout.write(f"  has_private_key: {with_pk} (по контейнерам CSP: {flagged})")
         if skipped:
             self.stdout.write(self.style.WARNING(f"  пропущено (экспорт не удался): {skipped}"))
