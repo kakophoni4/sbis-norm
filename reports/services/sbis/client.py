@@ -115,6 +115,7 @@ def _is_revoked_or_untrusted_cert_response(body_text: str) -> bool:
         or "регистрация клиента ещё не завершилась" in t
         or "схема для клиента в процессе разворачи" in t
         or "не зарегистрирован" in t
+        or "вход в личный кабинет по сертификату" in t
     )
 
 def _nodemaven_client() -> NodeMavenClient:

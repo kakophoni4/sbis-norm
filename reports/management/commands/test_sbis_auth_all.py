@@ -43,6 +43,7 @@ ERROR_CATEGORY_RU = {
     "registration_pending": "Ожидает регистрации в СБИС",
     "umy_not_linked": "Нет PrivateKey Link в uMy",
     "proxy_error": "Ошибка прокси NodeMaven / сети",
+    "cert_login_forbidden": "Вход по сертификату запрещён в СБИС",
     "no_cert": "Нет сертификата в БД",
     "other_error": "Прочая ошибка",
 }
@@ -62,6 +63,8 @@ def classify_sbis_error(message: str) -> str:
         return "registration_pending"
     if "proxy/http failed" in m or "transport error" in m or "не удалось подобрать живой прокси" in m:
         return "proxy_error"
+    if "вход в личный кабинет по сертификату" in m and "запрещен" in m:
+        return "cert_login_forbidden"
     if "не указано имя контейнера" in m or "не найден активный сертификат" in m:
         return "no_cert"
     return "other_error"
@@ -75,6 +78,7 @@ FAIL_FAST_CATEGORIES = frozenset(
         "expired_local",
         "registration_pending",
         "umy_not_linked",
+        "cert_login_forbidden",
     }
 )
 
