@@ -790,6 +790,8 @@ class Command(BaseCommand):
                         )
 
             winners_by_inn[winner.inn] = winner
+
+            cert = Certificate.objects.filter(csptest_name=winner.csptest_name).first()
             if not cert and best_per_inn:
                 cert = (
                     Certificate.objects.filter(inn=winner.inn, is_active=True)
