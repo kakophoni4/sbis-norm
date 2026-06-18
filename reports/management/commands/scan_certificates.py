@@ -1,6 +1,7 @@
 import re
 import subprocess
 from datetime import datetime, timezone
+from pathlib import Path
 
 from django.core.management.base import BaseCommand
 
@@ -9,6 +10,7 @@ from reports.models import Certificate
 
 CSPTEST_BIN = "/opt/cprocsp/bin/amd64/csptest"
 CERTMGR_BIN = "/opt/cprocsp/bin/amd64/certmgr"
+CSP_ROOT = Path("/var/opt/cprocsp/keys/root")
 
 
 def run_cmd(args: list[str]) -> str:
@@ -51,16 +53,58 @@ def parse_cert_date(s: str) -> datetime | None:
         return None
 
 
-def parse_cert_info(cert_path: str) -> dict:
+def get_inn_from_csp_folder(csptest_name: str) -> str | None:
+    """ИНН из каталога CSP_ROOT/{inn}/, где лежит контейнер."""
+    if not csptest_name:
+        return None
+    container_id = csptest_name.rsplit("\\", 1)[-1].strip()
+    if container_id.endswith(" копия"):
+        container_id = container_id[:-6].strip()
+    if not container_id or not CSP_ROOT.is_dir():
+        return None
+    for inn_dir in CSP_ROOT.iterdir():
+        if not inn_dir.is_dir():
+            continue
+        inn = inn_dir.name
+        if not re.fullmatch(r"\d{10,12}", inn):
+            continue
+        if (inn_dir / container_id).is_dir():
+            return inn
+        for sub in inn_dir.iterdir():
+            if sub.is_dir() and sub.name == container_id:
+                return inn
+    return None
+
+
+def _inn_from_subject_line(subject_line: str) -> str | None:
+    for pattern in (r"ИНН ЮЛ=([0-9]+)", r"ИНН ФЛ=([0-9]+)", r"ИНН=([0-9]+)"):
+        m = re.search(pattern, subject_line)
+        if m:
+            return m.group(1)
+    return None
+
+
+def resolve_certificate_inn(subject_line: str | None, csptest_name: str) -> str | None:
+    """ИНН ЮЛ из Subject; иначе из папки CSP; иначе ИНН ФЛ/физлица."""
+    inn_ul = _inn_from_subject_line(subject_line or "") if subject_line else None
+    if inn_ul and len(inn_ul) == 10:
+        return inn_ul
+    folder_inn = get_inn_from_csp_folder(csptest_name)
+    if folder_inn:
+        return folder_inn
+    return inn_ul
+
+
+def parse_cert_info(cert_path: str, csptest_name: str = "") -> dict:
     """
     Распарсить вывод `certmgr -list -file`:
-    - ИНН ЮЛ
+    - ИНН из Subject (не Issuer)
     - SHA1 Thumbprint
     - not_before / not_after
     """
     out = run_cmd([CERTMGR_BIN, "-list", "-file", cert_path])
 
-    inn = None
+    subject_line = None
     thumb = None
     not_before = None
     not_after = None
@@ -68,10 +112,8 @@ def parse_cert_info(cert_path: str) -> dict:
     for line in out.splitlines():
         line = line.strip()
 
-        if inn is None and ("ИНН ЮЛ=" in line or "ИНН ФЛ=" in line or "ИНН=" in line):
-            m = re.search(r"ИНН(?: ЮЛ| ФЛ)?=([0-9]+)", line)
-            if m:
-                inn = m.group(1)
+        if line.startswith("Subject"):
+            subject_line = line
 
         if line.startswith("SHA1 Thumbprint"):
             parts = line.split(":", 1)
@@ -85,6 +127,8 @@ def parse_cert_info(cert_path: str) -> dict:
         if line.startswith("Not valid after"):
             ts = line.split(":", 1)[1].strip()
             not_after = parse_cert_date(ts)
+
+    inn = resolve_certificate_inn(subject_line, csptest_name)
 
     return {
         "inn": inn,
@@ -180,7 +224,7 @@ class Command(BaseCommand):
                 )
                 skipped += 1
                 continue
-            info = parse_cert_info(tmp_cert)
+            info = parse_cert_info(tmp_cert, csptest_name)
 
             inn = info.get("inn")
             thumb = info.get("thumbprint")

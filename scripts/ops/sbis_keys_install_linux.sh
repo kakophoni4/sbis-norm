@@ -147,14 +147,54 @@ list_containers() {
 # Имя контейнера в certmgr передаём как из csptest (один \ перед каждой частью).
 # Удваивать слэши не нужно — иначе PrivateKey Link не создаётся.
 
-# ИНН из сертификата (certmgr -list -file)
-get_inn_from_cert() {
+# ИНН из Subject (не Issuer — у ФНС в Issuer всегда ИНН ЮЛ=7707329152)
+get_inn_ul_from_cert() {
   local cert_path="$1"
-  local out
-  out="$("$CERTMGR" -list -file "$cert_path" 2>/dev/null || true)"
-  echo "$out" | grep -oE 'ИНН ЮЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || \
-  echo "$out" | grep -oE 'ИНН ФЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || \
-  echo "$out" | grep -oE 'ИНН=[0-9]+' | head -1 | grep -oE '[0-9]+' || echo ""
+  local subject
+  subject="$("$CERTMGR" -list -file "$cert_path" 2>/dev/null | grep -E '^Subject[[:space:]]*:' | head -1)"
+  [[ -z "$subject" ]] && { echo ""; return; }
+  echo "$subject" | grep -oE 'ИНН ЮЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || echo ""
+}
+
+get_inn_other_from_cert() {
+  local cert_path="$1"
+  local subject
+  subject="$("$CERTMGR" -list -file "$cert_path" 2>/dev/null | grep -E '^Subject[[:space:]]*:' | head -1)"
+  [[ -z "$subject" ]] && { echo ""; return; }
+  echo "$subject" | grep -oE 'ИНН ФЛ=[0-9]+' | head -1 | grep -oE '[0-9]+' || \
+  echo "$subject" | grep -oE 'ИНН=[0-9]+' | head -1 | grep -oE '[0-9]+' || echo ""
+}
+
+# ИНН каталога ключей CSP_ROOT/{inn}/ по имени контейнера (UUID и т.п.)
+get_inn_from_csp_folder_for_cont() {
+  local cont="$1"
+  local id inn_dir inn
+  id="${cont##*\\}"
+  id="${id%% копия}"
+  id="${id%% *}"
+  [[ -z "$id" ]] && { echo ""; return; }
+  for inn_dir in "$CSP_ROOT"/*/; do
+    [[ -d "$inn_dir" ]] || continue
+    inn="$(basename "$inn_dir")"
+    [[ "$inn" =~ ^[0-9]{10,12}$ ]] || continue
+    if [[ -d "${inn_dir}${id}" ]] || find "$inn_dir" -maxdepth 2 -type d -name "$id" 2>/dev/null | grep -q .; then
+      echo "$inn"
+      return
+    fi
+  done
+  echo ""
+}
+
+get_inn_from_cert() {
+  local cert_path="$1" cont="$2"
+  local inn_ul folder_inn
+  inn_ul="$(get_inn_ul_from_cert "$cert_path")"
+  [[ -n "$inn_ul" ]] && { echo "$inn_ul"; return; }
+  if [[ -n "$cont" ]]; then
+    folder_inn="$(get_inn_from_csp_folder_for_cont "$cont")"
+    [[ -n "$folder_inn" ]] && { echo "$folder_inn"; return; }
+  fi
+  get_inn_other_from_cert "$cert_path"
 }
 
 # SHA1 Thumbprint из сертификата
@@ -184,13 +224,21 @@ inn_in_seen() {
   return 1
 }
 
-# Epoch Not valid after из .cer (0 если не удалось)
+# Epoch Not valid after из .cer (0 если не удалось). certmgr: DD/MM/YYYY HH:MM:SS UTC
 cert_not_after_epoch_from_file() {
   local cert_path="$1"
-  local raw normalized
+  local raw normalized day month year time
   raw="$("$CERTMGR" -list -file "$cert_path" 2>/dev/null | grep -i "Not valid after" | head -1 | sed 's/.*:[[:space:]]*//' | tr -d '\r')"
   [[ -z "$raw" ]] && { echo "0"; return; }
   normalized="${raw% UTC}"
+  if [[ "$normalized" =~ ^([0-9]{2})/([0-9]{2})/([0-9]{4})\ ([0-9]{2}:[0-9]{2}:[0-9]{2})$ ]]; then
+    day="${BASH_REMATCH[1]}"
+    month="${BASH_REMATCH[2]}"
+    year="${BASH_REMATCH[3]}"
+    time="${BASH_REMATCH[4]}"
+    date -u -d "${year}-${month}-${day} ${time}" +%s 2>/dev/null || echo "0"
+    return
+  fi
   date -u -d "$normalized" +%s 2>/dev/null || echo "0"
 }
 
@@ -316,18 +364,18 @@ for cont in "${containers[@]}"; do
       continue
     fi
   fi
-  inn=$(get_inn_from_cert "$cert_file")
+  inn=$(get_inn_from_cert "$cert_file" "$cont")
   thumb=$(get_thumbprint_from_cert "$cert_file")
   epoch="$(cert_not_after_epoch_from_file "$cert_file")"
   [[ "$epoch" =~ ^[0-9]+$ ]] || epoch=0
   echo "  Контейнер: $cont"
   echo "    ИНН: $inn, Thumbprint: $thumb, NotAfterEpoch: $epoch"
   if [[ -z "$inn" ]]; then
-    echo "    Пропуск контейнера (не удалось определить ИНН из сертификата)"
+    echo "    Пропуск контейнера (не удалось определить ИНН из Subject/папки CSP)"
     ((i++)) || true
     continue
   fi
-  if (( epoch <= now_epoch )); then
+  if (( epoch > 0 && epoch <= now_epoch )); then
     echo "    Пропуск контейнера (сертификат просрочен)"
     ((i++)) || true
     continue
