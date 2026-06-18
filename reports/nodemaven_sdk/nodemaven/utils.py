@@ -34,7 +34,7 @@ _api_credentials_cache = None
 
 def get_api_key() -> Optional[str]:
     """Get API key from environment variables."""
-    return os.getenv('NODEMAVEN_APIKEY')
+    return os.getenv('NODEMAVEN_APIKEY') or os.getenv('NODEMAVEN_API_KEY')
 
 
 def get_proxy_username() -> Optional[str]:

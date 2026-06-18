@@ -1,3 +1,5 @@
+import os
+
 import environ
 from pathlib import Path
 
@@ -159,4 +161,8 @@ SIGNER_FIO_FOR_SEARCH = env('SIGNER_FIO_FOR_SEARCH', default=None)
 NODEMAVEN_API_KEY = env('NODEMAVEN_API_KEY', default='')
 SBIS_DEFAULT_INN = env('SBIS_DEFAULT_INN', default='')
 CSP_USE_SUDO = env.bool('CSP_USE_SUDO', default=True)
+
+# nodemaven SDK utils читают NODEMAVEN_APIKEY
+if NODEMAVEN_API_KEY and not os.environ.get('NODEMAVEN_APIKEY'):
+    os.environ['NODEMAVEN_APIKEY'] = NODEMAVEN_API_KEY
 
