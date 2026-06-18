@@ -55,7 +55,13 @@ docker-compose exec web python manage.py sync_has_private_key
 docker-compose exec web python manage.py test_sbis_auth_one 9722082369
 ```
 
-Альтернатива шагу 2 на хосте (до scan): `sudo bash scripts/ops/sbis_keys_install_linux.sh --install-only`
+**Не запускайте** `sbis_keys_install_linux.sh` на хосте — CryptoPro там не видит контейнеры. Только внутри Docker:
+
+```bash
+docker compose exec web bash /app/scripts/ops/sbis_keys_install_linux.sh --install-only
+```
+
+Альтернатива шагу 2 (то же, что `--install-uMy` выше):
 
 Создание суперпользователя:
 

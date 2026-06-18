@@ -196,9 +196,21 @@ class CspIndex:
                     pass
         return None
 
-    def resolve_inn_for_container(self, csptest_name: str, subject_line: str | None = None) -> str | None:
-        if subject_line:
-            inn = _inn_from_subject_line(subject_line)
+    def resolve_inn_for_container(
+        self,
+        csptest_name: str,
+        subject_line: str | None = None,
+        certmgr_out: str | None = None,
+    ) -> str | None:
+        if certmgr_out:
+            inn = _inn_from_certmgr_output(certmgr_out)
+            if inn:
+                return inn
+        subject_full = subject_line or ""
+        if certmgr_out and not subject_full:
+            subject_full = _subject_text_from_listing(certmgr_out)
+        if subject_full:
+            inn = _inn_from_text(subject_full)
             if inn:
                 return inn
         for resolver in (
@@ -249,21 +261,63 @@ class CspIndex:
         return None, None
 
 
-def _inn_from_subject_line(subject_line: str) -> str | None:
+def _inn_from_text(text: str) -> str | None:
+    """ИНН из Subject (предпочтительно ИНН ЮЛ, не Issuer ФНС)."""
+    if not text:
+        return None
     for pattern in (r"ИНН ЮЛ=([0-9]+)", r"ИНН ФЛ=([0-9]+)", r"ИНН=([0-9]+)"):
-        m = re.search(pattern, subject_line)
+        m = re.search(pattern, text)
         if m:
             return m.group(1)
     return None
 
 
+def _inn_from_certmgr_output(out: str) -> str | None:
+    """ИНН из полного вывода certmgr -list -file (Subject может быть на нескольких строках)."""
+    return _inn_from_text(out)
+
+
+def _subject_text_from_listing(out: str) -> str:
+    """Склеить Subject / Субъект из certmgr (включая переносы строк)."""
+    parts: list[str] = []
+    in_subject = False
+    for raw in out.splitlines():
+        line = raw.strip()
+        if line.startswith("Subject") or line.startswith("Субъект"):
+            in_subject = True
+            parts.append(line.split(":", 1)[-1].strip() if ":" in line else "")
+            continue
+        if in_subject:
+            if not line:
+                continue
+            if re.match(
+                r"^(Issuer|Издатель|Not valid|SHA1|Serial|Extended|Signature|Public)",
+                line,
+                re.I,
+            ):
+                break
+            parts.append(line)
+    return " ".join(p for p in parts if p)
+
+
+def _inn_from_subject_line(subject_line: str) -> str | None:
+    return _inn_from_text(subject_line)
+
+
 def resolve_certificate_inn(
-    subject_line: str | None, csptest_name: str, csp_index: CspIndex | None = None
+    subject_line: str | None,
+    csptest_name: str,
+    csp_index: CspIndex | None = None,
+    certmgr_out: str | None = None,
 ) -> str | None:
     if csp_index:
-        return csp_index.resolve_inn_for_container(csptest_name, subject_line)
+        return csp_index.resolve_inn_for_container(csptest_name, subject_line, certmgr_out)
+    if certmgr_out:
+        inn = _inn_from_certmgr_output(certmgr_out)
+        if inn:
+            return inn
     if subject_line:
-        inn = _inn_from_subject_line(subject_line)
+        inn = _inn_from_text(subject_line)
         if inn:
             return inn
     return get_inn_from_container_name(csptest_name)
@@ -293,7 +347,7 @@ def parse_certmgr_listing(
         if line.startswith("Not valid after"):
             not_after = parse_cert_date(line.split(":", 1)[1].strip())
 
-    inn = resolve_certificate_inn(subject_line, csptest_name, csp_index)
+    inn = resolve_certificate_inn(subject_line, csptest_name, csp_index, out)
     return {
         "inn": inn,
         "thumbprint": thumb,
@@ -335,8 +389,9 @@ def obtain_cert_path(csptest_name: str, csp_index: CspIndex) -> tuple[str | None
         out = certmgr_list_file(dest)
         if out and "thumbprint" in out.lower():
             info = parse_certmgr_listing(out, csptest_name, csp_index)
-            if info.get("thumbprint") and csp_index.resolve_inn_for_container(
-                csptest_name, _subject_from_listing(out)
+            if info.get("thumbprint") and (
+                info.get("inn")
+                or csp_index.resolve_inn_for_container(csptest_name, certmgr_out=out)
             ):
                 return dest, "export"
 
@@ -347,11 +402,8 @@ def obtain_cert_path(csptest_name: str, csp_index: CspIndex) -> tuple[str | None
 
 
 def _subject_from_listing(out: str) -> str | None:
-    for line in out.splitlines():
-        line = line.strip()
-        if line.startswith("Subject") or line.startswith("Субъект"):
-            return line
-    return None
+    text = _subject_text_from_listing(out)
+    return text or None
 
 
 def install_cert_to_umy(cert_path: str, container_name: str) -> tuple[bool, str]:

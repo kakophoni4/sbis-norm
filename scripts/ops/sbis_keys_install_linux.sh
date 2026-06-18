@@ -315,7 +315,15 @@ for c in "${containers[@]}"; do
   echo "  $c"
 done
 if [[ ${#containers[@]} -eq 0 ]]; then
-  echo "  Контейнеры не найдены. Проверьте пути и права (sudo)."
+  echo "  Контейнеры не найдены." >&2
+  if [[ ! -x "$CSPTEST" ]]; then
+    echo "  CryptoPro csptest не найден: $CSPTEST" >&2
+  fi
+  echo "" >&2
+  echo "  На хосте без Linux-CSP контейнеры не видны. Запускайте ВНУТРИ Docker:" >&2
+  echo "    docker compose exec web bash /app/scripts/ops/sbis_keys_install_linux.sh --install-only" >&2
+  echo "  Или только Django (то же самое для uMy):" >&2
+  echo "    docker compose exec web python manage.py scan_certificates --install-uMy --quiet" >&2
   exit 1
 fi
 
