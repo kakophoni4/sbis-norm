@@ -8,10 +8,12 @@
 """
 import csv
 import json
+import logging
 import time
 from pathlib import Path
 
 from django.core.management.base import BaseCommand
+from django.db.models import Q
 from django.utils import timezone
 
 from reports.models import Certificate
@@ -22,6 +24,8 @@ def classify_sbis_error(message: str) -> str:
     m = (message or "").lower()
     if "отозван" in m or "не является доверенным" in m or "выберите другой сертификат" in m:
         return "revoked_or_untrusted"
+    if "не зарегистрирован" in m:
+        return "not_registered_in_sbis"
     if "просрочен" in m or "аутентификация по просроченному" in m:
         return "expired"
     if "регистрация клиента" in m or "схема для клиента" in m:
@@ -31,6 +35,13 @@ def classify_sbis_error(message: str) -> str:
     if "не указано имя контейнера" in m or "не найден активный сертификат" in m:
         return "no_cert"
     return "other_error"
+
+
+def _cert_filter():
+    """Все активные контейнеры с именем (has_private_key в БД часто false)."""
+    return Certificate.objects.filter(is_active=True).exclude(
+        Q(csptest_name__isnull=True) | Q(csptest_name="")
+    )
 
 
 class Command(BaseCommand):
@@ -56,8 +67,17 @@ class Command(BaseCommand):
             default=[],
             help="Проверить только указанные ИНН (можно несколько --inn)",
         )
+        parser.add_argument(
+            "--quiet",
+            action="store_true",
+            help="Меньше логов SBIS в консоли",
+        )
 
     def handle(self, *args, **options):
+        if options["quiet"]:
+            for name in ("reports.services.sbis", "reports.services.sbis_mail"):
+                logging.getLogger(name).setLevel(logging.WARNING)
+
         out_dir = Path(options["output_dir"])
         out_dir.mkdir(parents=True, exist_ok=True)
         ts = timezone.now().strftime("%Y%m%d_%H%M%S")
@@ -67,7 +87,7 @@ class Command(BaseCommand):
 
         only_inns = [x.strip() for x in options["inn"] if x and x.strip()]
         inn_qs = (
-            Certificate.objects.filter(has_private_key=True, is_active=True)
+            _cert_filter()
             .exclude(inn="")
             .values_list("inn", flat=True)
             .distinct()
@@ -96,12 +116,12 @@ class Command(BaseCommand):
 
             for idx, inn in enumerate(inns, start=1):
                 certs = list(
-                    Certificate.objects.filter(
-                        inn=inn, has_private_key=True, is_active=True
-                    ).order_by("-not_after", "-id")
+                    _cert_filter()
+                    .filter(inn=inn)
+                    .order_by("-has_private_key", "-not_after", "-id")
                 )
                 if not certs:
-                    row = [inn, "fail", "no_cert", "", "", "нет активного сертификата с ключом"]
+                    row = [inn, "fail", "no_cert", "", "", "нет контейнера в БД"]
                     writer.writerow(row)
                     stats["no_cert"] = stats.get("no_cert", 0) + 1
                     f.flush()
@@ -131,6 +151,13 @@ class Command(BaseCommand):
                     except SbisAuthError as e:
                         last_msg = str(e)
                         last_cat = classify_sbis_error(last_msg)
+                        if last_cat in (
+                            "revoked_or_untrusted",
+                            "not_registered_in_sbis",
+                            "expired",
+                            "registration_pending",
+                        ):
+                            break
                     except Exception as e:
                         last_msg = str(e)
                         last_cat = classify_sbis_error(last_msg)

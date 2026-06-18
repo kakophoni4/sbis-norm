@@ -28,6 +28,7 @@ from django.conf import settings
 
 from ..models import Certificate, CertificateAuditLog
 from .sbis import auth_sbis_by_cert, export_cert_der, get_thumbprint_from_cert  # noqa: F401
+from .sbis.constants import CertInvalidNoRetryError
 
 logger = logging.getLogger(__name__)
 
@@ -735,13 +736,21 @@ class SbisSessionService:
             thumbprint = get_thumbprint_from_cert(cert_path)
             _progress("Авторизация в СБИС (HTTP + cryptcp -decr)...")
             session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn_value)
+        except CertInvalidNoRetryError as exc:
+            self._write_audit("ERROR", str(exc))
+            logger.error(
+                "Авторизация в СБИС завершилась ошибкой (certificate_id=%s): %s",
+                self.certificate.pk,
+                exc,
+            )
+            raise SbisAuthError(str(exc)) from exc
         except (SbisAuthError, RuntimeError) as exc:
             self._write_audit("ERROR", str(exc))
             logger.error(
                 "Авторизация в СБИС завершилась ошибкой (certificate_id=%s): %s",
                 self.certificate.pk,
                 exc,
-                exc_info=True,
+                exc_info=not isinstance(exc, RuntimeError),
             )
             raise SbisAuthError(str(exc)) from exc
         except Exception as exc:
