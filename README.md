@@ -115,11 +115,14 @@ docker cp $(docker-compose ps -q web):/app/media/org_export/organizations_YYYYMM
 В `app.env`:
 
 ```env
-ONE_C_MOLE_BASE_URL=http://45.142.193.159/demo/hs/mole
+# продакшн (рабочая база 1С)
+ONE_C_MOLE_BASE_URL=http://45.142.193.159/base/hs/mole
 ONE_C_MOLE_USER=mole
 ONE_C_MOLE_PASSWORD=...
 ONE_C_MOLE_TIMEOUT_SEC=300
 ```
+
+Тестовая база: `http://45.142.193.159/demo/hs/mole`
 
 Проверка Basic auth:
 
