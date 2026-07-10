@@ -146,7 +146,7 @@ python manage.py list_requirement_documents --limit 20
 
 Ежедневный сканер (Celery Beat): **17:00 Europe/Moscow** (`crontab` 14:00 UTC при `CELERY_TIMEZONE=UTC`) — задача `reports.tasks.fetch_requirements_daily_task` (`--days 10`, все ИНН с `has_private_key=True`).
 
-Проверено на БАСТИОН `9707039440` (КПП `770701001`): полный цикл prepare → decrypt → execute → квитанция Утверждение (или «уже подтверждено»).
+Проверено на БАСТИОН `9707039440` (КПП `770701001`): полный цикл — после `Обработать служебное` подтверждение через **`Подтвердить получение`** (подпись содержимого `KV_*.xml`, не хеша) → `receipt_sent=True`.
 
 ---
 
