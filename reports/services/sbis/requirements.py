@@ -1351,17 +1351,61 @@ def sbis_read_document(inn: str, *, session_id: str, doc_id: str) -> dict:
     return {"success": True, "result": data.get("result") or {}}
 
 
+def _iter_prepare_attachments(prepare_raw: dict) -> list[dict]:
+    stages = prepare_raw.get("Этап") or []
+    if isinstance(stages, dict):
+        stages = [stages]
+    if not stages:
+        return []
+    st0 = stages[0] or {}
+    atts = st0.get("Вложение") or []
+    return [a for a in atts if isinstance(a, dict)] if isinstance(atts, list) else []
+
+
+def _load_prepare_attachment_bytes(
+    inn: str,
+    *,
+    session_id: str,
+    att: dict,
+) -> tuple[bytes | None, str]:
+    """Достать байты файла из prepare: ДвоичныеДанные или Ссылка. Возвращает (bytes|None, source)."""
+    file_obj = att.get("Файл") or {}
+    if not isinstance(file_obj, dict):
+        return None, "no_file"
+    b64 = (file_obj.get("ДвоичныеДанные") or "").strip()
+    if b64:
+        try:
+            return base64.b64decode(b64), "binary"
+        except Exception:
+            return None, "bad_b64"
+    href = (file_obj.get("Ссылка") or "").strip()
+    if href:
+        try:
+            content, _ = sbis_download_file_by_link(inn, session_id=session_id, href=href)
+            return content, "href"
+        except Exception as e:
+            logger.warning("download prepare att failed: %s", e)
+            return None, f"href_err:{e}"
+    return None, "empty"
+
+
 def _build_execute_attachments_from_prepare(
     *,
     prepare_raw: dict,
     decrypted_by_id: dict[str, bytes],
     thumbprint: str,
     csptest_name: str,
+    inn: str | None = None,
+    session_id: str | None = None,
+    include_file_payload: bool = False,
+    prefer_sign_file: bool = True,
 ) -> list[dict]:
     """
-    Собрать Вложение[] для ВыполнитьДействие:
-    - при наличии расшифрованных байт — ДвоичныеДанные + подпись файла;
-    - если есть Хеш и нужно подписание — подпись хеша.
+    Собрать Вложение[] для ВыполнитьДействие.
+
+    Для подтверждения получения (KV_*.xml): подписываем СОДЕРЖИМОЕ файла и шлём
+    только Идентификатор+Подпись (как в НДС), без повторной загрузки ДвоичныеДанные.
+    Подпись хеша даёт «подпись не соответствует файлу» — не используем, если есть файл.
     """
     stages = prepare_raw.get("Этап") or []
     if isinstance(stages, dict):
@@ -1372,6 +1416,13 @@ def _build_execute_attachments_from_prepare(
     atts = st0.get("Вложение") or []
     if not isinstance(atts, list):
         return []
+
+    action = st0.get("Действие") or {}
+    if isinstance(action, list) and action:
+        action = action[0] if isinstance(action[0], dict) else {}
+    action_needs_sign = isinstance(action, dict) and str(
+        action.get("ТребуетПодписание") or action.get("ТребуетПодписания") or ""
+    ).strip() == "Да"
 
     out: list[dict] = []
     for att in atts:
@@ -1385,35 +1436,46 @@ def _build_execute_attachments_from_prepare(
             file_obj = {}
         needs_sign = str(
             att.get("ТребуетПодписание") or att.get("ТребуетПодписания") or ""
-        ).strip() == "Да"
-        # иногда флаг на действии, не на вложении
-        action = st0.get("Действие") or {}
-        if isinstance(action, list) and action:
-            action = action[0] if isinstance(action[0], dict) else {}
-        if isinstance(action, dict) and str(
-            action.get("ТребуетПодписание") or action.get("ТребуетПодписания") or ""
-        ).strip() == "Да":
-            needs_sign = True
+        ).strip() == "Да" or action_needs_sign
 
         item: dict = {"Идентификатор": att_id}
         payload = decrypted_by_id.get(att_id)
-        hash_b64 = _file_hash_b64(file_obj)
+        source = "decrypted" if payload is not None else ""
+
+        if payload is None and prefer_sign_file and inn and session_id:
+            payload, source = _load_prepare_attachment_bytes(inn, session_id=session_id, att=att)
 
         if payload is not None:
-            item["Файл"] = {"ДвоичныеДанные": base64.b64encode(payload).decode("ascii")}
-            # после расшифровки СБИС ждёт подпись вложения при ВыполнитьДействие
-            try:
-                sig_b64 = _sign_bytes_detached(payload, thumbprint=thumbprint, csptest_name=csptest_name, suffix="att")
-                item["Подпись"] = [{"Файл": {"ДвоичныеДанные": sig_b64}}]
-            except Exception as e:
-                logger.warning("sign decrypted att %s: %s", att_id[:20], e)
-        elif hash_b64 and needs_sign:
-            try:
-                raw_hash = base64.b64decode(hash_b64)
-                sig_b64 = _sign_bytes_detached(raw_hash, thumbprint=thumbprint, csptest_name=csptest_name, suffix="hash")
-                item["Подпись"] = [{"Файл": {"ДвоичныеДанные": sig_b64}}]
-            except Exception as e:
-                logger.warning("sign hash att %s: %s", att_id[:20], e)
+            if include_file_payload:
+                item["Файл"] = {"ДвоичныеДанные": base64.b64encode(payload).decode("ascii")}
+            if needs_sign or prefer_sign_file:
+                try:
+                    sig_b64 = _sign_bytes_detached(
+                        payload, thumbprint=thumbprint, csptest_name=csptest_name, suffix="att"
+                    )
+                    item["Подпись"] = [{"Файл": {"ДвоичныеДанные": sig_b64}}]
+                    logger.info(
+                        "signed att %s source=%s bytes=%s sig_len=%s",
+                        att_id[:20],
+                        source,
+                        len(payload),
+                        len(sig_b64),
+                    )
+                except Exception as e:
+                    logger.warning("sign file att %s: %s", att_id[:20], e)
+        elif needs_sign:
+            # fallback: только если файла нет — подпись хеша (редко нужно)
+            hash_b64 = _file_hash_b64(file_obj)
+            if hash_b64:
+                try:
+                    raw_hash = base64.b64decode(hash_b64)
+                    sig_b64 = _sign_bytes_detached(
+                        raw_hash, thumbprint=thumbprint, csptest_name=csptest_name, suffix="hash"
+                    )
+                    item["Подпись"] = [{"Файл": {"ДвоичныеДанные": sig_b64}}]
+                    logger.warning("signed HASH (no file) att %s — may fail SBIS verify", att_id[:20])
+                except Exception as e:
+                    logger.warning("sign hash att %s: %s", att_id[:20], e)
 
         out.append(item)
     return out
@@ -1437,6 +1499,10 @@ def execute_prepared_requirement_stage(
         decrypted_by_id=decrypted_by_id or {},
         thumbprint=thumbprint,
         csptest_name=csptest_name,
+        inn=inn,
+        session_id=session_id,
+        include_file_payload=bool(decrypted_by_id),
+        prefer_sign_file=True,
     )
     return sbis_execute_action(
         inn,
@@ -1530,13 +1596,28 @@ def acknowledge_requirement_receipt(
     session_id = (prep.get("result") or {}).get("session_id") or session_id
     thumbprint = (prep.get("result") or {}).get("thumbprint") or thumbprint
 
+    # Подписываем содержимое KV_*.xml из prepare (не хеш) — иначе СБИС: «подпись не соответствует файлу»
     attachments = _build_execute_attachments_from_prepare(
         prepare_raw=prepare_raw,
         decrypted_by_id={},
         thumbprint=thumbprint,
         csptest_name=csptest_name,
+        inn=inn,
+        session_id=session_id,
+        include_file_payload=False,
+        prefer_sign_file=True,
     )
-    # для «Подтвердить получение» обычно нужна только подпись хеша/вложений из prepare
+    if not attachments or not any(a.get("Подпись") for a in attachments):
+        return {
+            "success": False,
+            "skipped": False,
+            "error": {
+                "message": "не удалось подготовить подписи вложений для подтверждения",
+                "attachments": attachments,
+                "prepare_att_count": len(_iter_prepare_attachments(prepare_raw)),
+            },
+        }
+
     exe = sbis_execute_action(
         inn,
         session_id=session_id,
@@ -1553,7 +1634,7 @@ def acknowledge_requirement_receipt(
         msg = str(err.get("message") or err)
         if any(x in msg.lower() for x in ("уже", "выполнен", "закрыт", "нет доступных")):
             return {"success": True, "skipped": True, "comment": msg, "error": err}
-        return {"success": False, "error": err, "skipped": False}
+        return {"success": False, "error": err, "skipped": False, "attachments_sent": len(attachments)}
 
     return {
         "success": True,
