@@ -168,25 +168,64 @@ def sign_xml_if_needed(
     out_sign = f"{xml_path}.sgn"
     tp = re.sub(r"\s+", "", (thumbprint or "").strip()).lower()
     errors: list[str] = []
+    cont = (csptest_name or "").strip()
+
+    # Перед подписью убеждаемся, что серт есть в uMy (decrypt этого не требует, -sign — да)
+    cer_path = None
+    if cont:
+        try:
+            cer_path = f"/tmp/sbis_sign_{re.sub(r'[^0-9A-Za-z]+', '_', cont)[-40:]}.cer"
+            export_cert_der(cont, cer_path)
+            try:
+                run_cmd([CERTMGR_BIN, "-inst", "-store", "uMy", "-file", cer_path, "-cont", cont], timeout_sec=60)
+            except Exception as e:
+                errors.append(f"certmgr -inst: {e}")
+                try:
+                    run_cmd([CRYPTCP_BIN, "-instcert", "-cont", cont], timeout_sec=60)
+                except Exception as e2:
+                    errors.append(f"cryptcp -instcert: {e2}")
+        except Exception as e:
+            errors.append(f"export before sign: {e}")
 
     attempts: list[list[str]] = [
-        [CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-thumbprint", tp, xml_path, out_sign],
-        [CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-uMy", "-thumbprint", tp, xml_path, out_sign],
+        [CRYPTCP_BIN, "-sign", "-detached", "-der", "-nochain", "-norev", "-thumbprint", tp, xml_path, out_sign],
+        [CRYPTCP_BIN, "-sign", "-detached", "-der", "-silent", "-nochain", "-norev", "-thumbprint", tp, xml_path, out_sign],
+        [CRYPTCP_BIN, "-sign", "-detached", "-der", "-nochain", "-norev", "-uMy", "-thumbprint", tp, xml_path, out_sign],
     ]
-    cont = (csptest_name or "").strip()
+    if cer_path and os.path.exists(cer_path):
+        attempts.append(
+            [CRYPTCP_BIN, "-sign", "-detached", "-der", "-nochain", "-norev", "-f", cer_path, xml_path, out_sign]
+        )
+        if cont:
+            attempts.append(
+                [
+                    CRYPTCP_BIN,
+                    "-sign",
+                    "-detached",
+                    "-der",
+                    "-nochain",
+                    "-norev",
+                    "-f",
+                    cer_path,
+                    "-cont",
+                    cont,
+                    xml_path,
+                    out_sign,
+                ]
+            )
     if cont:
         attempts.append(
-            [CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-cont", cont, xml_path, out_sign]
+            [CRYPTCP_BIN, "-sign", "-detached", "-der", "-nochain", "-norev", "-cont", cont, xml_path, out_sign]
         )
 
     for args in attempts:
         try:
             if os.path.exists(out_sign):
                 os.remove(out_sign)
-            run_cmd(args)
+            run_cmd(args, timeout_sec=90)
             if os.path.exists(out_sign):
                 return out_sign
-            errors.append(f"{' '.join(args[1:6])}…: no {out_sign}")
+            errors.append(f"{' '.join(args[1:8])}…: no {out_sign}")
         except Exception as e:
             errors.append(str(e))
 
