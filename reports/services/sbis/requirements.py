@@ -1383,12 +1383,16 @@ def _build_execute_attachments_from_prepare(
         file_obj = att.get("Файл") or {}
         if not isinstance(file_obj, dict):
             file_obj = {}
-        needs_sign = str(att.get("ТребуетПодписание") or "").strip() == "Да"
+        needs_sign = str(
+            att.get("ТребуетПодписание") or att.get("ТребуетПодписания") or ""
+        ).strip() == "Да"
         # иногда флаг на действии, не на вложении
         action = st0.get("Действие") or {}
         if isinstance(action, list) and action:
             action = action[0] if isinstance(action[0], dict) else {}
-        if isinstance(action, dict) and str(action.get("ТребуетПодписание") or "").strip() == "Да":
+        if isinstance(action, dict) and str(
+            action.get("ТребуетПодписание") or action.get("ТребуетПодписания") or ""
+        ).strip() == "Да":
             needs_sign = True
 
         item: dict = {"Идентификатор": att_id}
