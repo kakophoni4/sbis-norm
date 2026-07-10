@@ -558,22 +558,37 @@ def update_private_key_flags():
     has_pk = False
     container_line = None
 
+    def _norm_tp(tp: str) -> str:
+        return re.sub(r"\s+", "", (tp or "").strip()).lower()
+
     def flush():
         nonlocal current_thumb, has_pk, container_line
         if not current_thumb:
             return
-        cert = Certificate.objects.filter(thumbprint=current_thumb.lower()).first()
+        tp = _norm_tp(current_thumb)
+        cert = (
+            Certificate.objects.filter(thumbprint=tp).first()
+            or Certificate.objects.filter(thumbprint=current_thumb.lower()).first()
+            or Certificate.objects.filter(thumbprint__iexact=tp).first()
+        )
+        if not cert:
+            # иногда в БД отпечаток с пробелами
+            for c in Certificate.objects.exclude(thumbprint="").exclude(thumbprint__isnull=True).iterator():
+                if _norm_tp(c.thumbprint or "") == tp:
+                    cert = c
+                    break
         if not cert:
             current_thumb = None
             has_pk = False
             container_line = None
             return
         cert.has_private_key = has_pk
+        cert.thumbprint = tp
         if container_line:
             parts = container_line.split(":", 1)
             if len(parts) == 2:
                 cert.hdimage_path = parts[1].strip()
-        cert.save(update_fields=["has_private_key", "hdimage_path"])
+        cert.save(update_fields=["has_private_key", "hdimage_path", "thumbprint"])
         current_thumb = None
         has_pk = False
         container_line = None
