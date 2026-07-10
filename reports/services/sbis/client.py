@@ -160,6 +160,21 @@ def _thread_local_sbis_session() -> requests.Session:
     _thread_http.sess = sess
     return sess
 
+
+def close_thread_local_sbis_session() -> None:
+    """Закрыть Session потока — освободить FD после обработки одной организации."""
+    s = getattr(_thread_http, "sess", None)
+    if s is None:
+        return
+    try:
+        s.close()
+    except Exception:
+        pass
+    try:
+        delattr(_thread_http, "sess")
+    except Exception:
+        _thread_http.sess = None
+
 def _nodemaven_proxies(inn: str, sticky_key: str, *, city: str | None = NODEMAVEN_CITY) -> dict:
     """
     Возвращает proxies для requests.

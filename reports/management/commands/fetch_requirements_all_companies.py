@@ -45,10 +45,31 @@ from reports.requirement_file_sniff import guess_requirement_extension
 from reports.services.requirements_notify import notify_requirement_saved
 from reports.services.requirements_scan_scope import get_requirements_scan_inns
 from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
+from reports.services.sbis.client import close_thread_local_sbis_session
 from reports.services.sbis.crypto import export_cert_der, parse_kpp_from_cert_file
 
 
 logger = logging.getLogger(__name__)
+
+
+def is_resource_pressure_error(text: str) -> bool:
+    """EMFILE / Too many open files / HTTP 429 — нужно тормозить и ретраить ИНН."""
+    t = (text or "").lower()
+    return any(
+        x in t
+        for x in (
+            "too many open files",
+            "errno 24",
+            "emfile",
+            "http 429",
+            "status=429",
+            "status\":429",
+            " 429 ",
+            "rate limit",
+            "too many requests",
+            "tunnel connection failed: 429",
+        )
+    )
 
 # Ключевые слова в названии документа для фильтра «похоже на требование ФНС»
 REQUIREMENT_KEYWORDS = (
@@ -246,6 +267,7 @@ def _process_one_cert(
         "saved": 0,
         "fetch_error": 0,
         "dates_updated": 0,
+        "resource_pressure": 0,
     }
     # True только если дошли до конца обработки incoming без исключения и выполнены критерии ниже
     scan_eligible_for_cache = False
@@ -273,6 +295,8 @@ def _process_one_cert(
             stats["list_error"] = 1
             err = result.get("error") or {}
             msg = (err.get("message", str(result)) or "")[:120]
+            if is_resource_pressure_error(str(err) + " " + msg):
+                stats["resource_pressure"] = 1
             if not quiet:
                 write_fn(f"      Ошибка СписокСлужебныхЭтапов: {msg}", "error")
             return stats
@@ -410,6 +434,8 @@ def _process_one_cert(
             if not fetch.get("success"):
                 stats["fetch_error"] += 1
                 err = (fetch.get("error") or {}).get("message", "")[:80]
+                if is_resource_pressure_error(str(fetch.get("error") or "") + " " + err):
+                    stats["resource_pressure"] = 1
                 if not quiet:
                     write_fn(f"        Ошибка: {err}", "error")
                 continue
@@ -586,8 +612,14 @@ class Command(BaseCommand):
         parser.add_argument(
             "--max-rounds",
             type=int,
-            default=5,
-            help="Максимум раундов: при ошибках (список/скачивание) повторять проход по необработанным ИНН (по умолчанию 5).",
+            default=10,
+            help="Максимум раундов: при ошибках (список/скачивание/EMFILE/429) повторять проход по необработанным ИНН (по умолчанию 10).",
+        )
+        parser.add_argument(
+            "--pressure-sleep",
+            type=int,
+            default=90,
+            help="Пауза (сек) после Too many open files / HTTP 429 перед следующим ИНН (по умолчанию 90).",
         )
         parser.add_argument(
             "--force",
@@ -620,8 +652,9 @@ class Command(BaseCommand):
         workers = max(1, min(8, int(options.get("workers", 1))))
         retry_workers = max(1, min(8, int(options.get("retry_workers", 1))))
         round_sleep_sec = max(15, int(options.get("round_sleep", 90)))
-        max_rounds = max(1, int(options.get("max_rounds", 5)))
+        max_rounds = max(1, int(options.get("max_rounds", 10)))
         client_date_filter = not bool(options.get("download_any_doc_date"))
+        pressure_sleep_sec = max(15, int(options.get("pressure_sleep", 90)))
 
         date_to = datetime.now()
         date_from = date_to - timedelta(days=days)
@@ -771,6 +804,7 @@ class Command(BaseCommand):
             "fetch_error": 0,
             "dates_updated": 0,
             "skipped_cached": skipped_cached,
+            "resource_pressure_hits": 0,
         }
         lock = threading.Lock()
 
@@ -785,8 +819,24 @@ class Command(BaseCommand):
                 else:
                     self.stdout.write(msg)
 
+        def handle_pressure(reason: str):
+            nonlocal throttle_after_emfile
+            throttle_after_emfile = True
+            stats["resource_pressure_hits"] += 1
+            write_fn(
+                f"Resource pressure ({reason}) — пауза {pressure_sleep_sec}с, дальше 1 поток. "
+                f"Успешные ИНН уже в кэше дня; повтор без --force продолжит с места.",
+                "warning",
+            )
+            try:
+                close_thread_local_sbis_session()
+            except Exception:
+                pass
+            close_old_connections()
+            time.sleep(pressure_sleep_sec)
+
         certs_to_try = certs
-        # После EMFILE на любом раунде — дальше только 1 поток, иначе снова исчерпываются FD
+        # После EMFILE/429 — дальше только 1 поток
         throttle_after_emfile = False
 
         for round_num in range(1, max_rounds + 1):
@@ -801,17 +851,20 @@ class Command(BaseCommand):
                 if not quiet:
                     self.stdout.write("")
                 write_fn(
-                    f"Раунд {round_num}: повтор по {total_orgs} ИНН (ошибки в прошлом проходе). "
-                    f"Потоков в этом раунде: {round_workers}"
-                    + (" (принудительно 1 из‑за ранее пойманного EMFILE)" if throttle_after_emfile else ""),
+                    f"Раунд {round_num}/{max_rounds}: повтор по {total_orgs} ИНН (ошибки в прошлом проходе). "
+                    f"Потоков: {round_workers}"
+                    + (" (throttle после EMFILE/429)" if throttle_after_emfile else ""),
                     "warning",
                 )
 
             round_failed_inns = set()
+            # ИНН, которые ещё не трогали в этом раунде (если прервали пул из‑за pressure)
+            pending_inns = {(c.inn or "").strip() for c in certs_to_try}
 
             if round_workers <= 1:
                 for idx, cert in enumerate(certs_to_try, 1):
                     inn = (cert.inn or "").strip()
+                    pending_inns.discard(inn)
                     kpp = resolve_kpp_for_inn(inn, cert)
                     try:
                         s = _process_one_cert(
@@ -824,9 +877,13 @@ class Command(BaseCommand):
                             record_scan_state=record_scan_state,
                         )
                         for k in stats:
+                            if k in ("resource_pressure_hits", "skipped_cached"):
+                                continue
                             stats[k] += s.get(k, 0)
                         if s.get("list_error") or s.get("fetch_error"):
                             round_failed_inns.add(inn)
+                        if s.get("resource_pressure"):
+                            handle_pressure(f"inn={inn}")
                         if s.get("skipped_no_kpp") and stats["skipped_no_kpp"] == 6 and not quiet:
                             write_fn("  ... (остальные ИНН без КПП не выводятся)", "warning")
                     except Exception as e:
@@ -834,8 +891,14 @@ class Command(BaseCommand):
                         stats["list_error"] += 1
                         round_failed_inns.add(inn)
                         es = str(e)
-                        if "Too many open files" in es or "Errno 24" in es:
-                            throttle_after_emfile = True
+                        if is_resource_pressure_error(es):
+                            handle_pressure(es[:80])
+                    finally:
+                        try:
+                            close_thread_local_sbis_session()
+                        except Exception:
+                            pass
+                        close_old_connections()
             else:
                 def task(item):
                     close_old_connections()
@@ -865,6 +928,10 @@ class Command(BaseCommand):
                             ),
                         )
                     finally:
+                        try:
+                            close_thread_local_sbis_session()
+                        except Exception:
+                            pass
                         close_old_connections()
 
                 if not quiet:
@@ -876,26 +943,42 @@ class Command(BaseCommand):
                     futures = {executor.submit(task, (idx, cert)): cert for idx, cert in enumerate(certs_to_try, 1)}
                     for future in as_completed(futures):
                         cert = futures[future]
+                        inn = (cert.inn or "").strip()
+                        pending_inns.discard(inn)
                         try:
                             _, s = future.result()
                             for k in stats:
+                                if k in ("resource_pressure_hits", "skipped_cached"):
+                                    continue
                                 stats[k] += s.get(k, 0)
                             if s.get("list_error") or s.get("fetch_error"):
-                                round_failed_inns.add((cert.inn or "").strip())
+                                round_failed_inns.add(inn)
+                            if s.get("resource_pressure"):
+                                handle_pressure(f"inn={inn}")
+                                for fut, c2 in futures.items():
+                                    if not fut.done():
+                                        round_failed_inns.add((c2.inn or "").strip())
+                                        pending_inns.discard((c2.inn or "").strip())
                         except Exception as e:
-                            write_fn(f"  ИНН {(cert.inn or '')}: исключение — {e}", "error")
+                            write_fn(f"  ИНН {inn}: исключение — {e}", "error")
                             stats["list_error"] += 1
-                            round_failed_inns.add((cert.inn or "").strip())
+                            round_failed_inns.add(inn)
                             es = str(e)
-                            if "Too many open files" in es or "Errno 24" in es:
-                                throttle_after_emfile = True
+                            if is_resource_pressure_error(es):
+                                handle_pressure(es[:80])
+                                for fut, c2 in futures.items():
+                                    if not fut.done():
+                                        round_failed_inns.add((c2.inn or "").strip())
+
+            # не обработанные в раунде (если прервали) — тоже на ретрай
+            round_failed_inns |= pending_inns
 
             if not round_failed_inns:
                 break
             certs_to_try = get_certs_for_inns(list(round_failed_inns))
             if certs_to_try and not quiet:
                 write_fn(
-                    f"Все потоки раунда завершены. Пауза {round_sleep_sec} с перед следующим раундом...",
+                    f"К ретраю: {len(certs_to_try)} ИНН. Пауза {round_sleep_sec} с перед раундом {round_num + 1}...",
                     None,
                 )
             if certs_to_try:
@@ -913,6 +996,14 @@ class Command(BaseCommand):
             f"пропущено (уже по doc_id): {stats['skipped_dup_doc_id']}, "
             f"пропущено (дубль по SHA за дату): {stats['skipped_dup_sha']}, "
             f"ошибки скачивания: {stats['fetch_error']}, "
+            f"resource pressure hits: {stats.get('resource_pressure_hits', 0)}, "
             f"обновлено дат у существующих: {stats['dates_updated']}, "
             f"сохранено: {stats['saved']}."
         )
+        if stats.get("list_error") or stats.get("fetch_error"):
+            self.stdout.write(
+                self.style.WARNING(
+                    "Есть ошибки. Повтор без --force продолжит только по ИНН без успешного кэша за сегодня "
+                    f"(окно {window_key})."
+                )
+            )
