@@ -24,7 +24,7 @@ services:
       sh -c "
         while ! nc -z db 5432; do sleep 0.1; done &&
         python manage.py migrate &&
-        gunicorn tax_service.wsgi:application --bind 0.0.0.0:8000 --workers 4
+        gunicorn tax_service.wsgi:application --bind 0.0.0.0:8000 --workers 4 --timeout 300
       "
     volumes:
       - .:/app
