@@ -1458,34 +1458,52 @@ def acknowledge_requirement_receipt(
     org_name: str = "",
 ) -> dict:
     """
-    Подтверждение получения по доке Saby:
-    ПрочитатьДокумент → этап с действием «Утверждение» → ПодготовитьДействие → подпись → ВыполнитьДействие.
+    Подтверждение получения требования ФНС:
+    ПрочитатьДокумент → этап «Подтверждение» / действие «Подтвердить получение»
+    (в EDI иногда «Утверждение») → ПодготовитьДействие → подпись → ВыполнитьДействие.
     """
     read = sbis_read_document(inn, session_id=session_id, doc_id=doc_id)
     if not read.get("success"):
         return {"success": False, "error": read.get("error"), "skipped": False}
 
     result = read.get("result") or {}
+    # приоритет: ФНС-требования, затем EDI
+    preferred_actions = ("Подтвердить получение", "Утверждение")
     stage_id = None
-    action_name = "Утверждение"
-    for st in result.get("Этап") or []:
-        if not isinstance(st, dict):
-            continue
-        actions = st.get("Действие") or []
-        if isinstance(actions, dict):
-            actions = [actions]
-        for a in actions:
-            if isinstance(a, dict) and (a.get("Название") or "").strip() == "Утверждение":
-                stage_id = (st.get("Идентификатор") or "").strip()
+    action_name = None
+    for want in preferred_actions:
+        for st in result.get("Этап") or []:
+            if not isinstance(st, dict):
+                continue
+            actions = st.get("Действие") or []
+            if isinstance(actions, dict):
+                actions = [actions]
+            for a in actions:
+                if isinstance(a, dict) and (a.get("Название") or "").strip() == want:
+                    stage_id = (st.get("Идентификатор") or "").strip()
+                    action_name = want
+                    break
+            if stage_id:
                 break
         if stage_id:
             break
 
-    if not stage_id:
+    if not stage_id or not action_name:
+        available = []
+        for st in result.get("Этап") or []:
+            if not isinstance(st, dict):
+                continue
+            actions = st.get("Действие") or []
+            if isinstance(actions, dict):
+                actions = [actions]
+            for a in actions:
+                if isinstance(a, dict) and a.get("Название"):
+                    available.append(f"{st.get('Название')}/{a.get('Название')}")
         return {
             "success": True,
             "skipped": True,
-            "comment": "нет действия Утверждение (уже подтверждено или иной статус)",
+            "comment": "нет действия Подтвердить получение/Утверждение",
+            "available_actions": available[:20],
             "state": (result.get("Состояние") or {}),
         }
 
@@ -1498,10 +1516,13 @@ def acknowledge_requirement_receipt(
         action_name=action_name,
     )
     if not prep.get("success"):
-        return {"success": False, "error": prep.get("error"), "skipped": False}
+        err = prep.get("error") or {}
+        msg = str(err.get("message") or err).lower()
+        if prep.get("already_done") or "уже обработано" in msg:
+            return {"success": True, "skipped": True, "comment": "подтверждение уже обработано", "error": err}
+        return {"success": False, "error": err, "skipped": False}
 
     prepare_raw = (prep.get("result") or {}).get("raw") or {}
-    # session/thumb из prepare могут обновиться — используем переданные + raw
     session_id = (prep.get("result") or {}).get("session_id") or session_id
     thumbprint = (prep.get("result") or {}).get("thumbprint") or thumbprint
 
@@ -1511,6 +1532,7 @@ def acknowledge_requirement_receipt(
         thumbprint=thumbprint,
         csptest_name=csptest_name,
     )
+    # для «Подтвердить получение» обычно нужна только подпись хеша/вложений из prepare
     exe = sbis_execute_action(
         inn,
         session_id=session_id,
@@ -1520,16 +1542,23 @@ def acknowledge_requirement_receipt(
         thumbprint=thumbprint,
         fio=fio,
         attachments=attachments,
+        stage_name="Подтверждение" if action_name == "Подтвердить получение" else None,
     )
     if not exe.get("success"):
         err = exe.get("error") or {}
         msg = str(err.get("message") or err)
-        # уже обработано — не считаем фатальным
         if any(x in msg.lower() for x in ("уже", "выполнен", "закрыт", "нет доступных")):
             return {"success": True, "skipped": True, "comment": msg, "error": err}
         return {"success": False, "error": err, "skipped": False}
 
-    return {"success": True, "skipped": False, "receipt_sent": True, "result": exe.get("result")}
+    return {
+        "success": True,
+        "skipped": False,
+        "receipt_sent": True,
+        "action_name": action_name,
+        "stage_id": stage_id,
+        "result": exe.get("result"),
+    }
 
 
 def drain_service_stages(

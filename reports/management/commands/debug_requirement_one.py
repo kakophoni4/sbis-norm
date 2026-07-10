@@ -302,14 +302,14 @@ class Command(BaseCommand):
                     f"  Этап={st.get('Название')!r} id={(st.get('Идентификатор') or '')[:36]} "
                     f"Действие={aname!r} sign={a.get('ТребуетПодписание')} decr={a.get('ТребуетРасшифровки')}"
                 )
-                if aname == "Утверждение":
+                if aname in ("Утверждение", "Подтвердить получение"):
                     has_utv = True
-        self.stdout.write(f"has_Утверждение={has_utv}")
+        self.stdout.write(f"has_confirm_action={has_utv}")
         if stop_after == "read":
             return
 
         # --- 6. ACK ---
-        self.stdout.write(self.style.MIGRATE_HEADING("\n=== 6/6 ACK Утверждение (квитанция) ==="))
+        self.stdout.write(self.style.MIGRATE_HEADING("\n=== 6/6 ACK Подтвердить получение / Утверждение ==="))
         if skip_execute and not options.get("ack_only"):
             self.stdout.write("SKIPPED (because --skip-execute)")
             return
