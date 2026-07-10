@@ -19,3 +19,10 @@ if default_inn:
         "schedule": crontab(minute="*/30"),
         "args": (default_inn, 7),
     }
+
+# 17:00 Europe/Moscow = 14:00 UTC (CELERY_TIMEZONE=UTC)
+app.conf.beat_schedule["fetch-requirements-daily"] = {
+    "task": "reports.tasks.fetch_requirements_daily_task",
+    "schedule": crontab(hour=14, minute=0),
+    "kwargs": {"days": 10},
+}

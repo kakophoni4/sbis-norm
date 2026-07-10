@@ -42,7 +42,8 @@ from django.utils import timezone
 
 from reports.models import Certificate, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
-from reports.services.sbis import sbis_list_service_stages, fetch_requirement_file_b64
+from reports.services.requirements_notify import notify_requirement_saved
+from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
 
 
 logger = logging.getLogger(__name__)
@@ -330,7 +331,26 @@ def _process_one_cert(
             if RequirementDocument.objects.filter(inn=inn, sbis_doc_id=doc_id).exists():
                 stats["skipped_dup_doc_id"] += 1
                 if not quiet:
-                    write_fn(f"      — {doc_title_short}: уже в БД (doc_id), пропуск", None)
+                    write_fn(f"      — {doc_title_short}: уже в БД (doc_id), пробуем ack/служебные...", None)
+                try:
+                    ack_fetch = finalize_requirement_ack(
+                        inn,
+                        kpp=kpp,
+                        doc_id=doc_id,
+                        date_from_str=date_from_str,
+                        date_to_str=date_to_str,
+                    )
+                    if not quiet:
+                        r = ack_fetch.get("result") or {}
+                        write_fn(
+                            f"        ack receipt={r.get('receipt_sent')} "
+                            f"skipped={r.get('receipt_skipped')} stages={r.get('service_stages_done')}"
+                            + (f" err={ack_fetch.get('error')}" if not ack_fetch.get("success") else ""),
+                            None,
+                        )
+                except Exception as e:
+                    if not quiet:
+                        write_fn(f"        ack error: {e}", "warning")
                 continue
 
             doc_date = parse_document_date(doc)
@@ -343,13 +363,15 @@ def _process_one_cert(
             doc_title = (doc.get("Название") or "")[:512]
 
             if not quiet:
-                write_fn(f"      — {doc_title_short}: скачивание PDF...", None)
+                write_fn(f"      — {doc_title_short}: скачивание + execute/ack...", None)
 
-            fetch = fetch_requirement_file_b64(
+            fetch = fetch_requirement_full(
                 inn,
                 kpp=kpp,
                 requirement_doc_id=doc_id,
                 requirement_stage_id=stage_id,
+                date_from_str=date_from_str,
+                date_to_str=date_to_str,
             )
             if not fetch.get("success"):
                 stats["fetch_error"] += 1
@@ -383,7 +405,7 @@ def _process_one_cert(
 
             if not dry_run:
                 with transaction.atomic():
-                    RequirementDocument.objects.create(
+                    obj = RequirementDocument.objects.create(
                         inn=inn,
                         document_date=document_date,
                         sbis_doc_id=doc_id,
@@ -393,11 +415,21 @@ def _process_one_cert(
                         file_b64=b64,
                         storage_file_name=storage_file_name,
                     )
+                try:
+                    notify_requirement_saved(obj)
+                except Exception:
+                    logger.exception("notify_requirement_saved failed inn=%s", inn)
             stats["saved"] += 1
             if not quiet:
                 size = len(raw_bytes)
                 size_str = f"{size // 1024} КБ" if size >= 1024 else f"{size} Б"
-                write_fn(f"        Сохранён. Дата док.: {document_date}, размер {size_str}" + (" (dry-run)" if dry_run else ""), "success")
+                rmeta = fetch.get("result") or {}
+                write_fn(
+                    f"        Сохранён. Дата док.: {document_date}, размер {size_str}"
+                    f" executed={rmeta.get('executed')} receipt={rmeta.get('receipt_sent')}"
+                    + (" (dry-run)" if dry_run else ""),
+                    "success",
+                )
 
         # Сюда попадаем только без исключения в теле try (в т.ч. после полного цикла по incoming)
         scan_eligible_for_cache = (
@@ -447,6 +479,12 @@ class Command(BaseCommand):
             type=int,
             default=0,
             help="Максимум организаций обработать (0 — все)",
+        )
+        parser.add_argument(
+            "--inn",
+            type=str,
+            default="",
+            help="Обработать только указанный ИНН (для проверки одной организации)",
         )
         parser.add_argument(
             "--page-size",
@@ -524,6 +562,7 @@ class Command(BaseCommand):
                     Certificate.objects.filter(
                         inn=inn_val,
                         csptest_name__isnull=False,
+                        has_private_key=True,
                     )
                     .exclude(csptest_name="")
                     .filter(is_active=True)
@@ -537,12 +576,19 @@ class Command(BaseCommand):
         inns_with_cert = (
             Certificate.objects.filter(
                 csptest_name__isnull=False,
+                has_private_key=True,
             )
             .exclude(csptest_name="")
             .filter(is_active=True)
             .values_list("inn", flat=True)
             .distinct()
         )
+        only_inn = (options.get("inn") or "").strip()
+        if only_inn:
+            inns_with_cert = [i for i in inns_with_cert if str(i).strip() == only_inn]
+            if not inns_with_cert:
+                self.stderr.write(self.style.ERROR(f"Нет активного сертификата с has_private_key для ИНН {only_inn}"))
+                return
         certs = get_certs_for_inns(list(inns_with_cert))
 
         skipped_cached = 0

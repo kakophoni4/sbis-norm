@@ -34,9 +34,13 @@ from .crypto import (
     get_fio_from_cert_file,
     get_thumbprint_from_cert,
     parse_kpp_from_cert_file,
+    run_cmd,
+    sign_xml_if_needed,
     sbis_decrypt_bytes_with_cert_thumbprint,
     _try_decrypt_bytes_with_cert,
 )
+
+logger = logging.getLogger(__name__)
 
 def sbis_get_our_org_from_service_info(inn: str, session_id: str, target_inn: str) -> dict | None:
     """
@@ -1250,5 +1254,606 @@ def fetch_requirement_file_b64(
             "b64": chosen["b64"],
             "attachments_count": len(attachments_out),
             "attachments_all": attachments_out,
+            "executed": False,
+            "receipt_sent": False,
+            "service_stages_done": 0,
         },
     }
+
+
+def _file_hash_b64(file_obj: dict) -> str:
+    if not isinstance(file_obj, dict):
+        return ""
+    return (file_obj.get("Хеш") or file_obj.get("Хэш") or "").strip()
+
+
+def _sign_bytes_detached(data: bytes, *, thumbprint: str, csptest_name: str, suffix: str = "sgn") -> str:
+    """Подписать байты отсоединённой подписью, вернуть base64 .sgn."""
+    with tempfile.TemporaryDirectory(prefix=f"sbis_{suffix}_") as td:
+        path = os.path.join(td, "payload.bin")
+        Path(path).write_bytes(data)
+        sgn = sign_xml_if_needed(path, None, thumbprint, csptest_name=csptest_name)
+        return base64.b64encode(Path(sgn).read_bytes()).decode("ascii")
+
+
+def sbis_execute_action(
+    inn: str,
+    *,
+    session_id: str,
+    doc_id: str,
+    stage_id: str,
+    action_name: str,
+    thumbprint: str,
+    fio: str,
+    attachments: list[dict],
+    stage_name: str | None = None,
+) -> dict:
+    """СБИС.ВыполнитьДействие для служебного/подтверждающего этапа."""
+    stage: dict = {
+        "Идентификатор": stage_id,
+        "Действие": {
+            "Название": action_name,
+            "Сертификат": {"Отпечаток": thumbprint, "ИНН": inn, "ФИО": fio},
+        },
+        "Вложение": attachments,
+    }
+    if stage_name:
+        stage["Название"] = stage_name
+
+    data = sbis_rpc(
+        inn=inn,
+        session_id=session_id,
+        method="СБИС.ВыполнитьДействие",
+        params={"Документ": {"Идентификатор": doc_id, "Этап": stage}},
+        timeout=90,
+        total_budget_sec=120,
+    )
+    if data.get("error"):
+        return {"success": False, "error": data["error"]}
+    return {"success": True, "result": data.get("result")}
+
+
+def sbis_read_document(inn: str, *, session_id: str, doc_id: str) -> dict:
+    data = sbis_rpc(
+        inn=inn,
+        session_id=session_id,
+        method="СБИС.ПрочитатьДокумент",
+        params={"Документ": {"Идентификатор": doc_id}},
+        timeout=45,
+    )
+    if data.get("error"):
+        return {"success": False, "error": data["error"]}
+    return {"success": True, "result": data.get("result") or {}}
+
+
+def _build_execute_attachments_from_prepare(
+    *,
+    prepare_raw: dict,
+    decrypted_by_id: dict[str, bytes],
+    thumbprint: str,
+    csptest_name: str,
+) -> list[dict]:
+    """
+    Собрать Вложение[] для ВыполнитьДействие:
+    - при наличии расшифрованных байт — ДвоичныеДанные + подпись файла;
+    - если есть Хеш и нужно подписание — подпись хеша.
+    """
+    stages = prepare_raw.get("Этап") or []
+    if isinstance(stages, dict):
+        stages = [stages]
+    if not stages:
+        return []
+    st0 = stages[0] or {}
+    atts = st0.get("Вложение") or []
+    if not isinstance(atts, list):
+        return []
+
+    out: list[dict] = []
+    for att in atts:
+        if not isinstance(att, dict):
+            continue
+        att_id = (att.get("Идентификатор") or "").strip()
+        if not att_id:
+            continue
+        file_obj = att.get("Файл") or {}
+        if not isinstance(file_obj, dict):
+            file_obj = {}
+        needs_sign = str(att.get("ТребуетПодписание") or "").strip() == "Да"
+        # иногда флаг на действии, не на вложении
+        action = st0.get("Действие") or {}
+        if isinstance(action, list) and action:
+            action = action[0] if isinstance(action[0], dict) else {}
+        if isinstance(action, dict) and str(action.get("ТребуетПодписание") or "").strip() == "Да":
+            needs_sign = True
+
+        item: dict = {"Идентификатор": att_id}
+        payload = decrypted_by_id.get(att_id)
+        hash_b64 = _file_hash_b64(file_obj)
+
+        if payload is not None:
+            item["Файл"] = {"ДвоичныеДанные": base64.b64encode(payload).decode("ascii")}
+            # после расшифровки СБИС ждёт подпись вложения при ВыполнитьДействие
+            try:
+                sig_b64 = _sign_bytes_detached(payload, thumbprint=thumbprint, csptest_name=csptest_name, suffix="att")
+                item["Подпись"] = [{"Файл": {"ДвоичныеДанные": sig_b64}}]
+            except Exception as e:
+                logger.warning("sign decrypted att %s: %s", att_id[:20], e)
+        elif hash_b64 and needs_sign:
+            try:
+                raw_hash = base64.b64decode(hash_b64)
+                sig_b64 = _sign_bytes_detached(raw_hash, thumbprint=thumbprint, csptest_name=csptest_name, suffix="hash")
+                item["Подпись"] = [{"Файл": {"ДвоичныеДанные": sig_b64}}]
+            except Exception as e:
+                logger.warning("sign hash att %s: %s", att_id[:20], e)
+
+        out.append(item)
+    return out
+
+
+def execute_prepared_requirement_stage(
+    inn: str,
+    *,
+    session_id: str,
+    doc_id: str,
+    stage_id: str,
+    action_name: str,
+    prepare_raw: dict,
+    decrypted_by_id: dict[str, bytes],
+    thumbprint: str,
+    fio: str,
+    csptest_name: str,
+) -> dict:
+    attachments = _build_execute_attachments_from_prepare(
+        prepare_raw=prepare_raw or {},
+        decrypted_by_id=decrypted_by_id or {},
+        thumbprint=thumbprint,
+        csptest_name=csptest_name,
+    )
+    return sbis_execute_action(
+        inn,
+        session_id=session_id,
+        doc_id=doc_id,
+        stage_id=stage_id,
+        action_name=action_name,
+        thumbprint=thumbprint,
+        fio=fio,
+        attachments=attachments,
+    )
+
+
+def acknowledge_requirement_receipt(
+    inn: str,
+    *,
+    session_id: str,
+    doc_id: str,
+    kpp: str,
+    thumbprint: str,
+    fio: str,
+    csptest_name: str,
+    org_name: str = "",
+) -> dict:
+    """
+    Подтверждение получения по доке Saby:
+    ПрочитатьДокумент → этап с действием «Утверждение» → ПодготовитьДействие → подпись → ВыполнитьДействие.
+    """
+    read = sbis_read_document(inn, session_id=session_id, doc_id=doc_id)
+    if not read.get("success"):
+        return {"success": False, "error": read.get("error"), "skipped": False}
+
+    result = read.get("result") or {}
+    stage_id = None
+    action_name = "Утверждение"
+    for st in result.get("Этап") or []:
+        if not isinstance(st, dict):
+            continue
+        actions = st.get("Действие") or []
+        if isinstance(actions, dict):
+            actions = [actions]
+        for a in actions:
+            if isinstance(a, dict) and (a.get("Название") or "").strip() == "Утверждение":
+                stage_id = (st.get("Идентификатор") or "").strip()
+                break
+        if stage_id:
+            break
+
+    if not stage_id:
+        return {
+            "success": True,
+            "skipped": True,
+            "comment": "нет действия Утверждение (уже подтверждено или иной статус)",
+            "state": (result.get("Состояние") or {}),
+        }
+
+    prep = sbis_prepare_action(
+        inn,
+        kpp=kpp,
+        org_name=org_name,
+        doc_id=doc_id,
+        stage_id=stage_id,
+        action_name=action_name,
+    )
+    if not prep.get("success"):
+        return {"success": False, "error": prep.get("error"), "skipped": False}
+
+    prepare_raw = (prep.get("result") or {}).get("raw") or {}
+    # session/thumb из prepare могут обновиться — используем переданные + raw
+    session_id = (prep.get("result") or {}).get("session_id") or session_id
+    thumbprint = (prep.get("result") or {}).get("thumbprint") or thumbprint
+
+    attachments = _build_execute_attachments_from_prepare(
+        prepare_raw=prepare_raw,
+        decrypted_by_id={},
+        thumbprint=thumbprint,
+        csptest_name=csptest_name,
+    )
+    exe = sbis_execute_action(
+        inn,
+        session_id=session_id,
+        doc_id=doc_id,
+        stage_id=stage_id,
+        action_name=action_name,
+        thumbprint=thumbprint,
+        fio=fio,
+        attachments=attachments,
+    )
+    if not exe.get("success"):
+        err = exe.get("error") or {}
+        msg = str(err.get("message") or err)
+        # уже обработано — не считаем фатальным
+        if any(x in msg.lower() for x in ("уже", "выполнен", "закрыт", "нет доступных")):
+            return {"success": True, "skipped": True, "comment": msg, "error": err}
+        return {"success": False, "error": err, "skipped": False}
+
+    return {"success": True, "skipped": False, "receipt_sent": True, "result": exe.get("result")}
+
+
+def drain_service_stages(
+    inn: str,
+    *,
+    kpp: str,
+    session_id: str,
+    thumbprint: str,
+    fio: str,
+    csptest_name: str,
+    org_name: str = "",
+    date_from_str: str,
+    date_to_str: str,
+    max_rounds: int = 8,
+) -> dict:
+    """Цикл СписокСлужебныхЭтапов → prepare → sign → execute (извещения и пр.)."""
+    done = 0
+    errors: list[str] = []
+    for _ in range(max_rounds):
+        listed = sbis_list_service_stages(
+            inn,
+            date_from=date_from_str,
+            date_to=date_to_str,
+            page_size=50,
+            only_reporting=False,
+        )
+        if not listed.get("success"):
+            errors.append(str((listed.get("error") or {}).get("message") or listed))
+            break
+        docs = ((listed.get("result") or {}).get("docs") or [])
+        if not docs:
+            break
+        progressed = False
+        for doc in docs:
+            doc_id = (doc.get("Идентификатор") or "").strip()
+            if not doc_id:
+                continue
+            stages = doc.get("Этап") or []
+            if not isinstance(stages, list):
+                continue
+            for st in stages:
+                if not isinstance(st, dict):
+                    continue
+                stage_id = (st.get("Идентификатор") or "").strip()
+                actions = st.get("Действие") or []
+                if isinstance(actions, dict):
+                    actions = [actions]
+                if not actions:
+                    continue
+                action = actions[0] if isinstance(actions[0], dict) else None
+                if not action:
+                    continue
+                action_name = (action.get("Название") or "").strip()
+                if not stage_id or not action_name:
+                    continue
+                prep = sbis_prepare_action(
+                    inn,
+                    kpp=kpp,
+                    org_name=org_name,
+                    doc_id=doc_id,
+                    stage_id=stage_id,
+                    action_name=action_name,
+                )
+                if not prep.get("success"):
+                    errors.append(str((prep.get("error") or {}).get("message") or prep)[:200])
+                    continue
+                session_id = (prep.get("result") or {}).get("session_id") or session_id
+                thumbprint = (prep.get("result") or {}).get("thumbprint") or thumbprint
+                prepare_raw = (prep.get("result") or {}).get("raw") or {}
+
+                # скачать/расшифровать если нужно
+                decrypted_by_id: dict[str, bytes] = {}
+                files_meta = _extract_files_from_prepare_raw(prepare_raw)
+                for fmeta in files_meta:
+                    href = (fmeta.get("href") or "").strip()
+                    # идентификатор из raw — ищем в prepare
+                    # упрощённо: качаем и кладём по имени
+                # более надёжно: пройти Вложение из prepare_raw
+                st_list = prepare_raw.get("Этап") or []
+                if isinstance(st_list, dict):
+                    st_list = [st_list]
+                st0 = (st_list[0] if st_list else {}) or {}
+                for att in st0.get("Вложение") or []:
+                    if not isinstance(att, dict):
+                        continue
+                    att_id = (att.get("Идентификатор") or "").strip()
+                    file_obj = att.get("Файл") or {}
+                    href = (file_obj.get("Ссылка") or "").strip() if isinstance(file_obj, dict) else ""
+                    if not att_id or not href:
+                        continue
+                    try:
+                        content, _ = sbis_download_file_by_link(inn, session_id=session_id, href=href)
+                        if str(att.get("Зашифрован") or "").strip() == "Да":
+                            content2, _ = _try_decrypt_bytes_with_cert(
+                                inn=inn, thumbprint=thumbprint, content=content
+                            )
+                            content = content2
+                        decrypted_by_id[att_id] = content
+                    except Exception as e:
+                        logger.warning("drain download %s: %s", att_id[:16], e)
+
+                exe = execute_prepared_requirement_stage(
+                    inn,
+                    session_id=session_id,
+                    doc_id=doc_id,
+                    stage_id=stage_id,
+                    action_name=action_name,
+                    prepare_raw=prepare_raw,
+                    decrypted_by_id=decrypted_by_id,
+                    thumbprint=thumbprint,
+                    fio=fio,
+                    csptest_name=csptest_name,
+                )
+                if exe.get("success"):
+                    done += 1
+                    progressed = True
+                else:
+                    errors.append(str((exe.get("error") or {}).get("message") or exe)[:200])
+        if not progressed:
+            break
+    return {"success": True, "service_stages_done": done, "errors": errors[:10]}
+
+
+def _resolve_requirement_cert(inn: str):
+    return (
+        Certificate.objects.filter(inn=inn, has_private_key=True, is_active=True)
+        .exclude(csptest_name="")
+        .order_by("-id")
+        .first()
+    ) or Certificate.objects.filter(inn=inn).exclude(csptest_name="").order_by("-id").first()
+
+
+def finalize_requirement_ack(
+    inn: str,
+    *,
+    kpp: str,
+    doc_id: str,
+    org_name: str = "",
+    date_from_str: str | None = None,
+    date_to_str: str | None = None,
+) -> dict:
+    """
+    Drain служебных этапов + квитанция «Утверждение» без повторного скачивания файла.
+    Для документов, уже сохранённых в БД.
+    """
+    cert = _resolve_requirement_cert(inn)
+    if not cert or not cert.csptest_name:
+        return {"success": False, "error": {"message": "нет сертификата"}}
+
+    cert_path = f"/tmp/sbis_report_{inn}.cer"
+    export_cert_der(cert.csptest_name, cert_path)
+    thumbprint = get_thumbprint_from_cert(cert_path)
+    fio = (get_fio_from_cert_file(cert_path) or "—").strip() or "—"
+    try:
+        session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn)
+    except Exception as e:
+        return {"success": False, "error": {"message": str(e)}}
+
+    if not date_from_str or not date_to_str:
+        today = datetime.now()
+        date_to_str = today.strftime("%d.%m.%Y")
+        date_from_str = (today - timedelta(days=10)).strftime("%d.%m.%Y")
+
+    drained = drain_service_stages(
+        inn,
+        kpp=kpp,
+        session_id=session_id,
+        thumbprint=thumbprint,
+        fio=fio,
+        csptest_name=cert.csptest_name,
+        org_name=org_name,
+        date_from_str=date_from_str,
+        date_to_str=date_to_str,
+    )
+    ack = acknowledge_requirement_receipt(
+        inn,
+        session_id=session_id,
+        doc_id=doc_id,
+        kpp=kpp,
+        thumbprint=thumbprint,
+        fio=fio,
+        csptest_name=cert.csptest_name,
+        org_name=org_name,
+    )
+    return {
+        "success": bool(ack.get("success")),
+        "result": {
+            "executed": False,
+            "service_stages_done": drained.get("service_stages_done", 0),
+            "service_stage_errors": drained.get("errors") or [],
+            "receipt_sent": bool(ack.get("receipt_sent")),
+            "receipt_skipped": bool(ack.get("skipped")),
+            "receipt_comment": ack.get("comment"),
+            "receipt_error": ack.get("error") if not ack.get("success") else None,
+        },
+        "error": ack.get("error") if not ack.get("success") else None,
+    }
+
+
+def fetch_requirement_full(
+    inn: str,
+    *,
+    kpp: str,
+    requirement_doc_id: str,
+    requirement_stage_id: str,
+    action_name: str = "Обработать служебное",
+    org_name: str = "",
+    date_from_str: str | None = None,
+    date_to_str: str | None = None,
+    save_to: str | None = None,
+) -> dict:
+    """
+    Полный цикл по доке Saby:
+    prepare → download/decrypt → execute → drain служебных → ack Утверждение.
+    """
+    base = fetch_requirement_file_b64(
+        inn,
+        kpp=kpp,
+        requirement_doc_id=requirement_doc_id,
+        requirement_stage_id=requirement_stage_id,
+        action_name=action_name,
+        save_to=save_to,
+    )
+    if not base.get("success"):
+        return base
+
+    cert = _resolve_requirement_cert(inn)
+    if not cert or not cert.csptest_name:
+        return base
+
+    cert_path = f"/tmp/sbis_report_{inn}.cer"
+    export_cert_der(cert.csptest_name, cert_path)
+    thumbprint = get_thumbprint_from_cert(cert_path)
+    fio = (get_fio_from_cert_file(cert_path) or "—").strip() or "—"
+    try:
+        session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn)
+    except Exception as e:
+        r = base.get("result") or {}
+        r["executed"] = False
+        r["execute_error"] = str(e)
+        base["result"] = r
+        return base
+
+    # Повторный prepare, чтобы получить raw для execute (fetch_requirement_file_b64 не возвращает raw)
+    prep = sbis_prepare_action(
+        inn,
+        kpp=kpp,
+        org_name=org_name,
+        doc_id=requirement_doc_id,
+        stage_id=requirement_stage_id,
+        action_name=action_name,
+    )
+    prepare_raw = ((prep.get("result") or {}).get("raw") or {}) if prep.get("success") else {}
+    session_id = ((prep.get("result") or {}).get("session_id") or session_id)
+    thumbprint = ((prep.get("result") or {}).get("thumbprint") or thumbprint)
+
+    decrypted_by_id: dict[str, bytes] = {}
+    st_list = prepare_raw.get("Этап") or []
+    if isinstance(st_list, dict):
+        st_list = [st_list]
+    st0 = (st_list[0] if st_list else {}) or {}
+    prep_atts = [a for a in (st0.get("Вложение") or []) if isinstance(a, dict)]
+    all_atts = ((base.get("result") or {}).get("attachments_all") or [])
+    for i, att in enumerate(prep_atts):
+        att_id = (att.get("Идентификатор") or "").strip()
+        if not att_id:
+            continue
+        if i < len(all_atts) and all_atts[i].get("b64"):
+            try:
+                decrypted_by_id[att_id] = base64.b64decode(all_atts[i]["b64"])
+            except Exception:
+                pass
+
+    result = base.get("result") or {}
+    if prepare_raw:
+        exe = execute_prepared_requirement_stage(
+            inn,
+            session_id=session_id,
+            doc_id=requirement_doc_id,
+            stage_id=requirement_stage_id,
+            action_name=action_name,
+            prepare_raw=prepare_raw,
+            decrypted_by_id=decrypted_by_id,
+            thumbprint=thumbprint,
+            fio=fio,
+            csptest_name=cert.csptest_name,
+        )
+        result["executed"] = bool(exe.get("success"))
+        if not exe.get("success"):
+            err = exe.get("error") or {}
+            msg = str(err.get("message") or err).lower()
+            result["execute_error"] = err
+            # этап уже закрыт — продолжаем drain/ack
+            if any(x in msg for x in ("уже", "выполнен", "закрыт", "нет доступных")):
+                result["executed"] = True
+                result["execute_already_done"] = True
+        else:
+            result["execute_result_keys"] = (
+                list((exe.get("result") or {}).keys()) if isinstance(exe.get("result"), dict) else None
+            )
+    else:
+        result["executed"] = False
+        result["execute_error"] = (prep.get("error") if prep else {"message": "prepare failed"})
+
+    if not date_from_str or not date_to_str:
+        today = datetime.now()
+        date_to_str = today.strftime("%d.%m.%Y")
+        date_from_str = (today - timedelta(days=10)).strftime("%d.%m.%Y")
+    drained = drain_service_stages(
+        inn,
+        kpp=kpp,
+        session_id=session_id,
+        thumbprint=thumbprint,
+        fio=fio,
+        csptest_name=cert.csptest_name,
+        org_name=org_name,
+        date_from_str=date_from_str,
+        date_to_str=date_to_str,
+    )
+    result["service_stages_done"] = drained.get("service_stages_done", 0)
+    if drained.get("errors"):
+        result["service_stage_errors"] = drained["errors"]
+
+    ack = acknowledge_requirement_receipt(
+        inn,
+        session_id=session_id,
+        doc_id=requirement_doc_id,
+        kpp=kpp,
+        thumbprint=thumbprint,
+        fio=fio,
+        csptest_name=cert.csptest_name,
+        org_name=org_name,
+    )
+    result["receipt_sent"] = bool(ack.get("receipt_sent"))
+    result["receipt_skipped"] = bool(ack.get("skipped"))
+    if not ack.get("success"):
+        result["receipt_error"] = ack.get("error")
+    elif ack.get("comment"):
+        result["receipt_comment"] = ack.get("comment")
+
+    logger.info(
+        "fetch_requirement_full inn=%s doc=%s executed=%s receipt_sent=%s receipt_skipped=%s stages=%s",
+        inn,
+        requirement_doc_id[:24],
+        result.get("executed"),
+        result.get("receipt_sent"),
+        result.get("receipt_skipped"),
+        result.get("service_stages_done"),
+    )
+    base["result"] = result
+    return base
+

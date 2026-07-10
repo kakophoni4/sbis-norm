@@ -173,3 +173,26 @@ def periodic_mail_check_task(self, inn: str, days_back: int = 7):
     except Exception as exc:
         logger.exception(f"[periodic_mail_check_task] Ошибка для ИНН {inn}")
         raise self.retry(exc=exc)
+
+
+@shared_task(bind=True, max_retries=1, soft_time_limit=6 * 3600, time_limit=6 * 3600 + 300)
+def fetch_requirements_daily_task(self, days: int = 10):
+    """
+    Ежедневный сканер требований ФНС (полный цикл Saby: prepare→decrypt→execute→ack).
+    По умолчанию все ИНН с has_private_key=True, окно --days 10.
+    """
+    from django.core.management import call_command
+
+    days = max(1, int(days or 10))
+    logger.info("[fetch_requirements_daily_task] start days=%s", days)
+    try:
+        call_command(
+            "fetch_requirements_all_companies",
+            days=days,
+            verbosity=1,
+        )
+        logger.info("[fetch_requirements_daily_task] done days=%s", days)
+        return {"ok": True, "days": days}
+    except Exception as exc:
+        logger.exception("[fetch_requirements_daily_task] failed")
+        raise self.retry(exc=exc)

@@ -124,23 +124,29 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 
 ## 5. Требования ФНС (получение / «подтверждение»)
 
-Отдельного REST для 1С пока нет. Логика на стороне сервиса:
+Отдельного REST для 1С пока нет. Логика на стороне сервиса — **полный цикл по [доке Saby](https://saby.ru/help/integration/api/reporting/claim)**:
 
 1. `СБИС.СписокСлужебныхЭтапов` — список входящих служебных (требования и т.п.)
-2. `СБИС.ПодготовитьДействие` с действием **`Обработать служебное`** — получить вложения + ссылки
+2. `СБИС.ПодготовитьДействие` с действием **`Обработать служебное`** — вложения + ссылки
 3. Скачать файлы по ссылке (часто зашифрованы) → `cryptcp -decr` → PDF/XML
-4. Сохранение в `RequirementDocument`
+4. `СБИС.ВыполнитьДействие` по тому же этапу (вложения/подписи после расшифровки)
+5. Цикл служебных извещений: снова СписокСлужебныхЭтапов → prepare → sign → execute, пока список не пуст
+6. Подтверждение получения: `СБИС.ПрочитатьДокумент` → если есть действие **`Утверждение`** → prepare (квитанция) → sign → execute
+7. Сохранение в `RequirementDocument`; после save — хук `notify_requirement_saved` (пока лог, позже внешний сервис)
+
+Флаги в логах/результате fetch: `executed`, `receipt_sent`, `receipt_skipped`, `service_stages_done`.
 
 Операционно:
 
 ```bash
-python manage.py fetch_requirements_all_companies --days 30 --limit 5 --force
+python manage.py probe_requirement_status --inn 9707039440 --days 10
+python manage.py fetch_requirements_all_companies --days 10 --force
 python manage.py list_requirement_documents --limit 20
 ```
 
-«Подтверждение получения» в терминах СБИС здесь — прохождение этапа **Обработать служебное** (подготовка действия + скачивание), не отдельный HTTP-метод для 1С.
+Ежедневный сканер (Celery Beat): **17:00 Europe/Moscow** (`crontab` 14:00 UTC при `CELERY_TIMEZONE=UTC`) — задача `reports.tasks.fetch_requirements_daily_task` (`--days 10`, все ИНН с `has_private_key=True`).
 
-Проверено на БАСТИОН `9707039440` (КПП `770701001`): 4 требования сохранены (PKCS7 → PDF).
+Проверено на БАСТИОН `9707039440` (КПП `770701001`): полный цикл prepare → decrypt → execute → квитанция Утверждение (или «уже подтверждено»).
 
 ---
 
