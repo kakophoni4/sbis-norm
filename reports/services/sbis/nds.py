@@ -191,7 +191,15 @@ def send_nds_extra(
     if not os.path.exists(xml_path):
         return {"success": False, "error": {"message": f"Файл сведений не найден: {xml_path}"}}
 
-    cert = Certificate.objects.filter(inn=inn).first()
+    cert = (
+        Certificate.objects.filter(inn=inn, has_private_key=True, is_active=True)
+        .exclude(csptest_name__isnull=True)
+        .exclude(csptest_name="")
+        .order_by("-id")
+        .first()
+    )
+    if not cert:
+        cert = Certificate.objects.filter(inn=inn).exclude(csptest_name="").order_by("-id").first()
     if not cert:
         return {"success": False, "error": {"message": "Не найден сертификат для ИНН"}}
 
@@ -200,7 +208,9 @@ def send_nds_extra(
     thumbprint = get_thumbprint_from_cert(cert_path)
 
     try:
-        sign_path_final = sign_xml_if_needed(xml_path, sign_path, thumbprint)
+        sign_path_final = sign_xml_if_needed(
+            xml_path, sign_path, thumbprint, csptest_name=cert.csptest_name
+        )
     except Exception as e:
         return {"success": False, "error": {"message": f"Ошибка подписи: {e}"}}
 
@@ -241,7 +251,7 @@ def send_nds_extra(
             category = "Основное"
             title = sved.get("Описание", {}).get("ИмяФормы") or "Отчет"
         else:
-            sp = sign_xml_if_needed(file_path, None, thumbprint)
+            sp = sign_xml_if_needed(file_path, None, thumbprint, csptest_name=cert.csptest_name)
             category = "Приложение"
             title = f"Приложение {os.path.basename(file_path)}"
 
@@ -368,7 +378,7 @@ def send_nds_extra(
         file_ident = file_id_map[file_path]
         sig_path = f"{file_path}.sgn"
         try:
-            run_cmd([CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-thumbprint", thumbprint, file_path, sig_path])
+            sign_xml_if_needed(file_path, None, thumbprint, csptest_name=cert.csptest_name)
             with open(sig_path, "rb") as f:
                 sig_b64 = base64.b64encode(f.read()).decode("ascii")
             attachments.append({"Идентификатор": file_ident, "Подпись": [{"Файл": {"ДвоичныеДанные": sig_b64}}]})
@@ -552,7 +562,15 @@ def send_nds_extra_1c(
     validate_book_names: bool = True,
     dry_run: bool = False,
 ) -> tuple[int, dict]:
-    cert = Certificate.objects.filter(inn=inn).first()
+    cert = (
+        Certificate.objects.filter(inn=inn, has_private_key=True, is_active=True)
+        .exclude(csptest_name__isnull=True)
+        .exclude(csptest_name="")
+        .order_by("-id")
+        .first()
+    )
+    if not cert:
+        cert = Certificate.objects.filter(inn=inn).exclude(csptest_name="").order_by("-id").first()
     if not cert:
         return 403, {"success": False, "comment": "Ошибка доступа: нет подписи по указанному ИНН"}
     if not getattr(cert, "csptest_name", None):

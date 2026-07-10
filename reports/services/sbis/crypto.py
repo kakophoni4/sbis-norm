@@ -69,7 +69,8 @@ def get_thumbprint_from_certmgr_listing(out: str) -> str:
         if line.startswith("SHA1 Thumbprint"):
             parts = line.split(":", 1)
             if len(parts) == 2:
-                return parts[1].strip().lower()
+                # cryptcp надёжнее принимает отпечаток без пробелов
+                return re.sub(r"\s+", "", parts[1].strip()).lower()
     raise RuntimeError("Не удалось вытащить SHA1 Thumbprint из файла сертификата")
 
 def get_fio_from_cert_file(cert_path: str) -> str:
@@ -155,16 +156,41 @@ def parse_kpp_from_cert_file(
 
     return parse_kpp_from_subject_text("\n".join(blobs))
 
-def sign_xml_if_needed(xml_path: str, sign_path: str | None, thumbprint: str) -> str:
+def sign_xml_if_needed(
+    xml_path: str,
+    sign_path: str | None,
+    thumbprint: str,
+    csptest_name: str | None = None,
+) -> str:
     if sign_path and os.path.exists(sign_path):
         return sign_path
 
     out_sign = f"{xml_path}.sgn"
-    run_cmd([CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-thumbprint", thumbprint, xml_path])
+    tp = re.sub(r"\s+", "", (thumbprint or "").strip()).lower()
+    errors: list[str] = []
 
-    if not os.path.exists(out_sign):
-        raise RuntimeError(f"Не удалось создать подпись {out_sign}")
-    return out_sign
+    attempts: list[list[str]] = [
+        [CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-thumbprint", tp, xml_path, out_sign],
+        [CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-uMy", "-thumbprint", tp, xml_path, out_sign],
+    ]
+    cont = (csptest_name or "").strip()
+    if cont:
+        attempts.append(
+            [CRYPTCP_BIN, "-sign", "-detached", "-der", *CRYPTCP_SIGN_FLAGS, "-cont", cont, xml_path, out_sign]
+        )
+
+    for args in attempts:
+        try:
+            if os.path.exists(out_sign):
+                os.remove(out_sign)
+            run_cmd(args)
+            if os.path.exists(out_sign):
+                return out_sign
+            errors.append(f"{' '.join(args[1:6])}…: no {out_sign}")
+        except Exception as e:
+            errors.append(str(e))
+
+    raise RuntimeError("Ошибка подписи: " + " | ".join(errors))
 
 def sbis_decrypt_bytes_with_cert_thumbprint(
     enc_bytes: bytes,
