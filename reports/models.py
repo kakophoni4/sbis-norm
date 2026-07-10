@@ -86,6 +86,12 @@ class RequirementDocument(models.Model):
     file_b64 = models.TextField(verbose_name="Base64 содержимого PDF/XML")
     storage_file_name = models.CharField(max_length=255, blank=True, null=True, verbose_name="Имя файла для экспорта")
     created_at = models.DateTimeField(auto_now_add=True, verbose_name="Создано")
+    external_synced_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Забрано внешним сервисом",
+    )
 
     class Meta:
         verbose_name = "Требование (документ ФНС)"

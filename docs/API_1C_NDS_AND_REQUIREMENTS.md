@@ -124,27 +124,70 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 
 ## 5. Требования ФНС (получение / «подтверждение»)
 
-Отдельного REST для 1С пока нет. Логика на стороне сервиса — **полный цикл по [доке Saby](https://saby.ru/help/integration/api/reporting/claim)**:
+### Сканер (Celery Beat)
 
-1. `СБИС.СписокСлужебныхЭтапов` — список входящих служебных (требования и т.п.)
-2. `СБИС.ПодготовитьДействие` с действием **`Обработать служебное`** — вложения + ссылки
-3. Скачать файлы по ссылке (часто зашифрованы) → `cryptcp -decr` → PDF/XML
-4. `СБИС.ВыполнитьДействие` по тому же этапу (вложения/подписи после расшифровки)
-5. Цикл служебных извещений: снова СписокСлужебныхЭтапов → prepare → sign → execute, пока список не пуст
-6. Подтверждение получения: `СБИС.ПрочитатьДокумент` → действие **`Подтвердить получение`** (этап «Подтверждение»; в EDI иногда «Утверждение») → prepare → sign → execute
-7. Сохранение в `RequirementDocument`; после save — хук `notify_requirement_saved` (пока лог, позже внешний сервис)
+- **Когда:** каждый день **17:00 Europe/Moscow** (`crontab` 14:00 UTC)
+- **Кого:** все ИНН с `Certificate.has_private_key=True` (~1000 после absorb)
+- **Окно:** последние **10 дней** (`СписокСлужебныхЭтапов` + фильтр даты документа)
+- **Что делает:** полный цикл Saby (prepare → decrypt → execute → **Подтвердить получение**) + сохранение в `RequirementDocument`
 
-Флаги в логах/результате fetch: `executed`, `receipt_sent`, `receipt_skipped`, `service_stages_done`.
+Задача: `reports.tasks.fetch_requirements_daily_task`.
 
-Операционно:
+### Хранение
+
+Таблица `RequirementDocument`: ИНН, дата, `sbis_doc_id`, title, sha256, **`file_b64`** (PDF/XML), `storage_file_name`, `created_at`, `external_synced_at` (когда забрал внешний сервис).
+
+### REST для внешнего сервиса
+
+Опционально заголовок `X-API-Key: <REQUIREMENTS_API_TOKEN>` (если токен задан в env).
+
+```http
+GET /api/sbis/requirements/?unsynced=1&limit=50
+GET /api/sbis/requirements/?inn=9707039440&date_from=2026-06-01&include_file=0
+GET /api/sbis/requirements/123/
+POST /api/sbis/requirements/mark-synced/
+Content-Type: application/json
+
+{"ids": [123, 124]}
+```
+
+Ответ list (без файла по умолчанию):
+
+```json
+{
+  "count": 1,
+  "results": [{
+    "id": 123,
+    "inn": "9707039440",
+    "document_date": "2026-07-06",
+    "sbis_doc_id": "...",
+    "doc_title": "Требование ФНС",
+    "content_sha256": "...",
+    "storage_file_name": "Требование ФНС (9707039440) (2026-07-06).pdf",
+    "created_at": "...",
+    "external_synced_at": null,
+    "file_size": 12345
+  }]
+}
+```
+
+Detail (`GET .../123/`) добавляет `file_b64`.
+
+### Webhook (push, опционально)
+
+Env `REQUIREMENTS_WEBHOOK_URL` — после save POST JSON метаданных (без файла; файл тянуть через GET detail).  
+`REQUIREMENTS_WEBHOOK_TOKEN` → `Authorization: Bearer ...` / `X-API-Key`.
+
+Хук: `notify_requirement_saved` в `reports/services/requirements_notify.py`.
+
+### Ops
 
 ```bash
 python manage.py probe_requirement_status --inn 9707039440 --days 10
 python manage.py fetch_requirements_all_companies --days 10 --force
 python manage.py list_requirement_documents --limit 20
+curl -s "http://127.0.0.1:8000/api/sbis/requirements/?unsynced=1&limit=5"
 ```
-
-Ежедневный сканер (Celery Beat): **17:00 Europe/Moscow** (`crontab` 14:00 UTC при `CELERY_TIMEZONE=UTC`) — задача `reports.tasks.fetch_requirements_daily_task` (`--days 10`, все ИНН с `has_private_key=True`).
 
 Проверено на БАСТИОН `9707039440` (КПП `770701001`): полный цикл — после `Обработать служебное` подтверждение через **`Подтвердить получение`** (подпись содержимого `KV_*.xml`, не хеша) → `receipt_sent=True`.
 
