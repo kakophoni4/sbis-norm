@@ -56,6 +56,7 @@ class Command(BaseCommand):
         date_from = date_to - timedelta(days=days)
         stages = sbis_list_service_stages(
             inn,
+            kpp=kpp,
             date_from=date_from.strftime("%d.%m.%Y"),
             date_to=date_to.strftime("%d.%m.%Y"),
             page_size=50,

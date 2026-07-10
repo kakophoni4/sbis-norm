@@ -1526,6 +1526,8 @@ def drain_service_stages(
     for _ in range(max_rounds):
         listed = sbis_list_service_stages(
             inn,
+            kpp=kpp,
+            org_name=org_name,
             date_from=date_from_str,
             date_to=date_to_str,
             page_size=50,
