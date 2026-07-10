@@ -127,9 +127,12 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 ### Сканер (Celery Beat)
 
 - **Когда:** каждый день **17:00 Europe/Moscow** (`crontab` 14:00 UTC)
-- **Кого:** все ИНН с `Certificate.has_private_key=True` (~1000 после absorb)
-- **Окно:** последние **10 дней** (`СписокСлужебныхЭтапов` + фильтр даты документа)
-- **Что делает:** полный цикл Saby (prepare → decrypt → execute → **Подтвердить получение**) + сохранение в `RequirementDocument`
+- **Кого:** **только whitelist** — `docs/requirements_scan_inns.txt`  
+  (= ИНН из `лавки Ване.xlsx` / `docs/lavki_vane_inns.txt` + `docs/new_companies_2026-07-10.txt`).  
+  **Не** весь пул `has_private_key` (тестовый мусор исключён).  
+  Override: env `REQUIREMENTS_SCAN_INNS` / `REQUIREMENTS_SCAN_INNS_FILES`, флаги `--inn`, `--inns-file`, `--all-certs`.
+- **Окно:** последние **10 дней**
+- **Что делает:** полный цикл Saby + сохранение в `RequirementDocument`
 
 Задача: `reports.tasks.fetch_requirements_daily_task`.
 

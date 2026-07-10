@@ -43,6 +43,7 @@ from django.utils import timezone
 from reports.models import Certificate, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
 from reports.services.requirements_notify import notify_requirement_saved
+from reports.services.requirements_scan_scope import get_requirements_scan_inns
 from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
 
 
@@ -575,6 +576,17 @@ class Command(BaseCommand):
             action="store_true",
             help="Не фильтровать по дате документа на стороне приложения (скачивать все «требования» из ответа списка, как раньше).",
         )
+        parser.add_argument(
+            "--all-certs",
+            action="store_true",
+            help="Игнорировать whitelist (лавки+новые) и обойти все Certificate с has_private_key (только для отладки).",
+        )
+        parser.add_argument(
+            "--inns-file",
+            type=str,
+            default="",
+            help="Файл со списком ИНН (по одному в строке). Перекрывает дефолтный whitelist.",
+        )
 
     def handle(self, *args, **options):
         days = max(1, options["days"])
@@ -616,23 +628,56 @@ class Command(BaseCommand):
                     certs_out.append(c)
             return certs_out
 
-        inns_with_cert = (
-            Certificate.objects.filter(
-                csptest_name__isnull=False,
-                has_private_key=True,
-            )
-            .exclude(csptest_name="")
-            .filter(is_active=True)
-            .values_list("inn", flat=True)
-            .distinct()
-        )
+        from reports.services.requirements_scan_scope import load_inns_file
+
         only_inn = (options.get("inn") or "").strip()
+        inns_file = (options.get("inns_file") or "").strip()
+        use_all_certs = bool(options.get("all_certs"))
+
         if only_inn:
-            inns_with_cert = [i for i in inns_with_cert if str(i).strip() == only_inn]
-            if not inns_with_cert:
-                self.stderr.write(self.style.ERROR(f"Нет активного сертификата с has_private_key для ИНН {only_inn}"))
-                return
-        certs = get_certs_for_inns(list(inns_with_cert))
+            scope_inns = [only_inn]
+            scope_label = f"один ИНН {only_inn}"
+        elif inns_file:
+            scope_inns = load_inns_file(inns_file)
+            scope_label = f"файл {inns_file} ({len(scope_inns)} ИНН)"
+        elif use_all_certs:
+            scope_inns = list(
+                Certificate.objects.filter(
+                    csptest_name__isnull=False,
+                    has_private_key=True,
+                )
+                .exclude(csptest_name="")
+                .filter(is_active=True)
+                .values_list("inn", flat=True)
+                .distinct()
+            )
+            scope_label = f"--all-certs ({len(scope_inns)} ИНН)"
+        else:
+            scope_inns = get_requirements_scan_inns()
+            scope_label = f"whitelist лавки+новые ({len(scope_inns)} ИНН)"
+
+        if not scope_inns:
+            self.stderr.write(
+                self.style.ERROR(
+                    "Пустой список ИНН для сканера. Проверь docs/requirements_scan_inns.txt "
+                    "или docs/lavki_vane_inns.txt + docs/new_companies_*.txt "
+                    "(либо --inns-file / --all-certs / --inn)."
+                )
+            )
+            return
+
+        if not quiet:
+            self.stdout.write(self.style.WARNING(f"Scope сканера: {scope_label}"))
+
+        certs = get_certs_for_inns(scope_inns)
+        missing_pk = [i for i in scope_inns if i not in {(c.inn or "").strip() for c in certs}]
+        if missing_pk and not quiet:
+            self.stdout.write(
+                self.style.WARNING(
+                    f"В whitelist без активного has_private_key: {len(missing_pk)} "
+                    f"(пример: {', '.join(missing_pk[:5])}{'…' if len(missing_pk) > 5 else ''})"
+                )
+            )
 
         skipped_cached = 0
         if use_skip_cache:
