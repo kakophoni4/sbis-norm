@@ -1,0 +1,192 @@
+# API для 1С: отправка НДС и связанные методы
+
+Базовый URL (прод): `http://<host>:8000/api/`  
+Content-Type: `application/json`
+
+Авторизация HTTP на эти эндпоинты сейчас не требуется (`permission_classes = []`).  
+Подпись берётся **по ИНН** из БД CryptoPro (`Certificate` с `csptest_name` / private key).
+
+**Критично:** `inn` в JSON, `ИННЮЛ` в XML и ЭЦП в CryptoPro должны совпадать. Иначе dry_run может пройти, а реальная отправка в СБИС/ФНС — нет или уйдёт «не тем» подписантом.
+
+---
+
+## 1. Отправка декларации НДС (основной метод для 1С)
+
+`POST /api/sbis/send-nds-extra-1c/`
+
+### Тело запроса
+
+```json
+{
+  "inn": "9729337785",
+  "main_xml_b64": "<base64 XML основного файла NO_NDS_...>",
+  "book_xml_b64_list": [
+    "<base64 XML книги покупок NO_NDS.8_...>",
+    "<base64 XML книги продаж NO_NDS.9_...>"
+  ],
+  "dry_run": false
+}
+```
+
+| Поле | Обязательно | Описание |
+|------|-------------|----------|
+| `inn` | да | ИНН организации (= ИНН в XML и ЭЦП) |
+| `main_xml_b64` | да | Основной XML декларации в base64 (алиасы: `xml_b64`, `main_b64`) |
+| `book_xml_b64_list` | нет | Список base64 книг; можно `books_b64` / `book_b64_list`; элементы — строки или `{ "b64": "..." }` |
+| `dry_run` | нет | `true` — только разбор/проверка имён книг, **без** отправки в СБИС |
+
+### Успех (HTTP 200)
+
+```json
+{
+  "success": true,
+  "result": { "...": "ответ СБИС.ВыполнитьДействие" },
+  "send_meta": {
+    "sbis_doc_id": "...",
+    "sent_at": "...",
+    "sent_date": "YYYY-MM-DD"
+  }
+}
+```
+
+При `dry_run: true` вместо `result`/`send_meta` приходит блок `parsed` (имена файлов, ожидаемые книги).
+
+### Ошибки
+
+| HTTP | Смысл |
+|------|--------|
+| 400 | Входные данные / имена книг не совпали с основным XML |
+| 401 | У ИНН нет валидной подписи (`csptest_name`) |
+| 403 | Нет сертификата по ИНН |
+| 404 | Ошибка СБИС при отправке (тело в `error`) |
+
+### Пример curl (dry_run)
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "inn": "9729337785",
+    "main_xml_b64": "'"$MAIN_B64"'",
+    "book_xml_b64_list": ["'"$BOOK8_B64"'","'"$BOOK9_B64"'"],
+    "dry_run": true
+  }'
+```
+
+---
+
+## 2. PDF квитанции из архива СБИС
+
+`POST /api/sbis/get-receipt-pdf-1c/`
+
+```json
+{
+  "inn": "9729337785",
+  "sbis_doc_id": "<из send_meta после отправки>",
+  "sent_date": "YYYY-MM-DD"
+}
+```
+
+Ответ: `{ "success": true, "pdf_b64": "..." }` или ошибка.
+
+Квитанция появляется не мгновенно: если сразу после отправки PDF ещё нет — повторить через несколько минут с теми же `sbis_doc_id` / `sent_date`.
+
+---
+
+## 3. Выписка книги продаж по контрагенту
+
+`POST /api/sbis/get-sales-book-extract/`
+
+```json
+{
+  "inn": "9707039440",
+  "counterparty_id": "",
+  "date_from": "2025-01-01",
+  "date_to": "2025-12-31",
+  "max_docs": 30
+}
+```
+
+---
+
+## 4. Загрузка организаций в 1С (обратный поток: мы → mole 1С)
+
+Не HTTP API Django, а наш клиент к HTTP-сервису 1С `mole`:
+
+- `GET {ONE_C_MOLE_BASE_URL}/health`
+- `POST {ONE_C_MOLE_BASE_URL}/units` — массив организаций
+
+Поля единицы (CSV/`collect_org_data`): `ИНН`, `КПП`, `ОГРН`, `Наименование`, `НаименованиеПолное`, `НаименованиеСокращенное`, …
+
+Команда: `python manage.py upload_org_units_1c --from-csv ...`
+
+---
+
+## 5. Требования ФНС (получение / «подтверждение»)
+
+Отдельного REST для 1С пока нет. Логика на стороне сервиса:
+
+1. `СБИС.СписокСлужебныхЭтапов` — список входящих служебных (требования и т.п.)
+2. `СБИС.ПодготовитьДействие` с действием **`Обработать служебное`** — получить вложения + ссылки
+3. Скачать файлы по ссылке (часто зашифрованы) → `cryptcp -decr` → PDF/XML
+4. Сохранение в `RequirementDocument`
+
+Операционно:
+
+```bash
+python manage.py fetch_requirements_all_companies --days 30 --limit 5 --force
+python manage.py list_requirement_documents --limit 20
+```
+
+«Подтверждение получения» в терминах СБИС здесь — прохождение этапа **Обработать служебное** (подготовка действия + скачивание), не отдельный HTTP-метод для 1С.
+
+Проверено на БАСТИОН `9707039440` (КПП `770701001`): 4 требования сохранены (PKCS7 → PDF).
+
+---
+
+## 6. Полный цикл проверки на сервере (БАСТИОН → HTTP API 1С)
+
+Всё делается **только на сервере** (`/opt/sbis-norm`), через те же HTTP-эндпоинты, что будет звать 1С (`127.0.0.1:8000`). Не через Django shell / `send_nds_extra_1c` напрямую.
+
+Скрипт: `docs/make_bastion_nds_and_send_1c.py`  
+— переписывает sample `NO_NDS_*9729337785*` под **ООО БАСТИОН** (`9707039440` / КПП `770701001` / КодНО `7707`, `НомКорр=99`)  
+— `POST /api/sbis/send-nds-extra-1c/` (dry_run → real)  
+— при успехе `POST /api/sbis/get-receipt-pdf-1c/`
+
+```bash
+cd /opt/sbis-norm
+
+# если скрипта ещё нет в образе — скопируй docs/make_bastion_nds_and_send_1c.py на сервер
+
+# из контейнера web (сеть до gunicorn на :8000)
+docker compose exec -T web python /app/docs/make_bastion_nds_and_send_1c.py --dry-run
+docker compose exec -T web python /app/docs/make_bastion_nds_and_send_1c.py --send
+```
+
+Если `/app/docs` пустой — положить скрипт и sample XML в volume или:
+
+```bash
+docker compose cp docs/make_bastion_nds_and_send_1c.py web:/app/docs/
+docker compose cp docs/NO_NDS_7733_7733_9729337785773301001_20260317_daaede5d_5b5c_4108.xml web:/app/docs/
+docker compose cp docs/NO_NDS_8_7733_7733_9729337785773301001_20260317_48988d9e_a98b_4eea.xml web:/app/docs/
+docker compose cp docs/NO_NDS_9_7733_7733_9729337785773301001_20260317_7f273f8e_c097_4a97.xml web:/app/docs/
+```
+
+| Шаг | Ожидание |
+|-----|----------|
+| dry_run | HTTP 200, `success`, книги matched |
+| --send | HTTP 200, `send_meta.sbis_doc_id` |
+| receipt | `pdf_b64` (может появиться с задержкой) |
+
+`--send` **реально уходит в СБИС/ФНС**. XML тестовый (цифры от sample), `НомКорр=99`.
+
+---
+
+## Замечания для интегратора
+
+1. ИНН в JSON, в XML (`ИННЮЛ`) и ЭЦП в CryptoPro должны совпадать.
+2. Имена файлов книг в основном XML (`КнигаПокуп` / `КнигаПрод`) должны совпасть с `ИдФайл` переданных book-XML (проверка при `validate_book_names`).
+3. XML обычно в windows-1251; в base64 передаётся как есть.
+4. Реальная отправка (`dry_run: false`) уходит в СБИС/ФНС — для проверки контракта сначала `dry_run: true`.
+5. Ошибка СБИС «Регистрация клиента еще не завершилась» — статус кабинета в СБИС, не прокси и не формат запроса.
+6. Для dry_run можно подставить чужой sample XML под другой `inn` (проверка парсера). Для шага C — только совпадающий ИНН.

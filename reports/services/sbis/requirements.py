@@ -31,6 +31,7 @@ from .auth import auth_sbis_by_cert, sbis_auth_session_for_inn
 from .client import _sbis_get, _sbis_post, _sbis_request, sbis_rpc
 from .crypto import (
     export_cert_der,
+    get_fio_from_cert_file,
     get_thumbprint_from_cert,
     parse_kpp_from_cert_file,
     sbis_decrypt_bytes_with_cert_thumbprint,
