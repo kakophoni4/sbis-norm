@@ -142,8 +142,9 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 
 ### REST для внешнего сервиса
 
-Опционально заголовок `X-API-Key: <REQUIREMENTS_API_TOKEN>` (если токен задан в env).
+Полная документация для интегратора: [`docs/API_REQUIREMENTS_EXTERNAL.md`](API_REQUIREMENTS_EXTERNAL.md).
 
+Кратко:
 ```http
 GET /api/sbis/requirements/?unsynced=1&limit=50
 GET /api/sbis/requirements/?inn=9707039440&date_from=2026-06-01&include_file=0
