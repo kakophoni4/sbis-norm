@@ -40,11 +40,12 @@ from django.db import transaction
 from django.db import close_old_connections
 from django.utils import timezone
 
-from reports.models import Certificate, RequirementDocument, RequirementFetchScanState
+from reports.models import Certificate, Organization, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
 from reports.services.requirements_notify import notify_requirement_saved
 from reports.services.requirements_scan_scope import get_requirements_scan_inns
 from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
+from reports.services.sbis.crypto import export_cert_der, parse_kpp_from_cert_file
 
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,28 @@ def unpack_zip_and_pick_file(zip_bytes: bytes) -> tuple[bytes, str]:
         return zip_bytes, ".bin"
 
 
+def resolve_kpp_for_inn(inn: str, cert: Certificate | None = None) -> str:
+    """КПП: Certificate → Organization → из .cer файла."""
+    kpp = ((getattr(cert, "kpp", None) if cert else None) or "").strip()
+    if kpp:
+        return kpp
+    org = Organization.objects.filter(inn=inn).first()
+    kpp = ((org.kpp if org else None) or "").strip()
+    if kpp:
+        return kpp
+    if cert and (cert.csptest_name or "").strip():
+        try:
+            cert_path = f"/tmp/sbis_kpp_{inn}.cer"
+            export_cert_der(cert.csptest_name, cert_path)
+            kpp = (parse_kpp_from_cert_file(cert_path) or "").strip()
+            if kpp and cert.pk:
+                Certificate.objects.filter(pk=cert.pk).update(kpp=kpp)
+            return kpp
+        except Exception:
+            logger.exception("resolve_kpp_for_inn failed inn=%s", inn)
+    return ""
+
+
 def _process_one_cert(
     idx: int,
     total_orgs: int,
@@ -231,7 +254,7 @@ def _process_one_cert(
         if not kpp:
             stats["skipped_no_kpp"] = 1
             if not quiet and idx <= 5:
-                write_fn(f"  [{idx}/{total_orgs}] ИНН {inn}: пропуск — нет КПП в Certificate.", "warning")
+                write_fn(f"  [{idx}/{total_orgs}] ИНН {inn}: пропуск — нет КПП (Certificate/Organization/cert).", "warning")
             return stats
 
         if not quiet:
@@ -789,7 +812,7 @@ class Command(BaseCommand):
             if round_workers <= 1:
                 for idx, cert in enumerate(certs_to_try, 1):
                     inn = (cert.inn or "").strip()
-                    kpp = (getattr(cert, "kpp", None) or "").strip()
+                    kpp = resolve_kpp_for_inn(inn, cert)
                     try:
                         s = _process_one_cert(
                             idx, total_orgs, inn, kpp,
@@ -818,7 +841,7 @@ class Command(BaseCommand):
                     close_old_connections()
                     idx, cert = item
                     inn = (cert.inn or "").strip()
-                    kpp = (getattr(cert, "kpp", None) or "").strip()
+                    kpp = resolve_kpp_for_inn(inn, cert)
                     try:
                         return (
                             cert,
