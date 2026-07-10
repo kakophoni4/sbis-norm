@@ -144,41 +144,66 @@ python manage.py list_requirement_documents --limit 20
 
 ---
 
-## 6. Полный цикл проверки на сервере (БАСТИОН → HTTP API 1С)
+## 6. Путь 1С (как должно работать автоматически)
 
-Всё делается **только на сервере** (`/opt/sbis-norm`), через те же HTTP-эндпоинты, что будет звать 1С (`127.0.0.1:8000`). Не через Django shell / `send_nds_extra_1c` напрямую.
+```
+1С                              Django API                         СБИС / CryptoPro
+───                             ──────────                         ────────────────
+собрать NO_NDS XML
+(+ книги 8/9) base64
+        │
+        ▼
+POST /api/sbis/send-nds-extra-1c/
+  inn, main_xml_b64,
+  book_xml_b64_list
+  dry_run=false  ──────────►  выбрать Certificate(inn, pk)
+                              export + uMy (если нужно)
+                              cryptcp -sign XML/книги
+                              auth СБИС
+                              ЗаписатьКомплект
+                              ПодготовитьДействие «Отправить»
+                              ВыполнитьДействие
+                     ◄──────  success + send_meta
+                              { sbis_doc_id, sent_date, sent_at }
 
-Скрипт: `docs/make_bastion_nds_and_send_1c.py`  
-— переписывает sample `NO_NDS_*9729337785*` под **ООО БАСТИОН** (`9707039440` / КПП `770701001` / КодНО `7707`, `НомКорр=99`)  
-— `POST /api/sbis/send-nds-extra-1c/` (dry_run → real)  
-— при успехе `POST /api/sbis/get-receipt-pdf-1c/`
+сохранить send_meta
+        │
+        │  (через N минут / по статусу в СБИС —
+        │   квитанция ФНС появляется не сразу)
+        ▼
+POST /api/sbis/get-receipt-pdf-1c/
+  inn, sbis_doc_id, sent_date
+                     ──────────►  СписокДокументов → архив
+                                  вытащить PDF справки
+                     ◄──────  pdf_b64   или 400 «ещё нет справки»
+```
+
+**Проверено на БАСТИОН `9707039440` (2026-07-10):**  
+`send-nds-extra-1c` → HTTP 200, `sbis_doc_id=73696d74-690b-4acd-82ff-176a37c16d7c`, ушло в ИФНС №7.  
+`get-receipt-pdf-1c` сразу после отправки → 400: в архиве пока только PDF декларации/книг (`PDF/NO_NDS*`), справки ФНС ещё нет — **повторять позже** с тем же `send_meta`.
+
+Требования ФНС — отдельный серверный цикл (`fetch_requirements_*`), не этот REST.
+
+---
+
+## 7. Полный цикл проверки на сервере (ops)
+
+Всё на сервере (`/opt/sbis-norm`), HTTP как у 1С (`127.0.0.1:8000`).
 
 ```bash
 cd /opt/sbis-norm
-
-# если скрипта ещё нет в образе — скопируй docs/make_bastion_nds_and_send_1c.py на сервер
-
-# из контейнера web (сеть до gunicorn на :8000)
+# при необходимости: bash scripts/ops/install_bastion_umy_and_test_sign.sh
 docker compose exec -T web python /app/docs/make_bastion_nds_and_send_1c.py --dry-run
 docker compose exec -T web python /app/docs/make_bastion_nds_and_send_1c.py --send
 ```
 
-Если `/app/docs` пустой — положить скрипт и sample XML в volume или:
-
-```bash
-docker compose cp docs/make_bastion_nds_and_send_1c.py web:/app/docs/
-docker compose cp docs/NO_NDS_7733_7733_9729337785773301001_20260317_daaede5d_5b5c_4108.xml web:/app/docs/
-docker compose cp docs/NO_NDS_8_7733_7733_9729337785773301001_20260317_48988d9e_a98b_4eea.xml web:/app/docs/
-docker compose cp docs/NO_NDS_9_7733_7733_9729337785773301001_20260317_7f273f8e_c097_4a97.xml web:/app/docs/
-```
-
 | Шаг | Ожидание |
 |-----|----------|
-| dry_run | HTTP 200, `success`, книги matched |
+| dry_run | HTTP 200, книги matched |
 | --send | HTTP 200, `send_meta.sbis_doc_id` |
-| receipt | `pdf_b64` (может появиться с задержкой) |
+| receipt | `pdf_b64` **после** появления справки в архиве СБИС |
 
-`--send` **реально уходит в СБИС/ФНС**. XML тестовый (цифры от sample), `НомКорр=99`.
+`--send` реально уходит в СБИС/ФНС.
 
 ---
 
