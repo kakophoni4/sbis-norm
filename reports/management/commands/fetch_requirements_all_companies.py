@@ -43,7 +43,7 @@ from django.utils import timezone
 from reports.models import Certificate, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
 from reports.services.requirements_notify import notify_requirement_saved
-from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
+from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full
 
 
 logger = logging.getLogger(__name__)
@@ -331,26 +331,35 @@ def _process_one_cert(
             if RequirementDocument.objects.filter(inn=inn, sbis_doc_id=doc_id).exists():
                 stats["skipped_dup_doc_id"] += 1
                 if not quiet:
-                    write_fn(f"      — {doc_title_short}: уже в БД (doc_id), пробуем ack/служебные...", None)
+                    write_fn(
+                        f"      — {doc_title_short}: уже в БД (doc_id), закрываем этап (execute/ack)...",
+                        None,
+                    )
                 try:
-                    ack_fetch = finalize_requirement_ack(
+                    ack_fetch = fetch_requirement_full(
                         inn,
                         kpp=kpp,
-                        doc_id=doc_id,
+                        requirement_doc_id=doc_id,
+                        requirement_stage_id=stage_id,
                         date_from_str=date_from_str,
                         date_to_str=date_to_str,
+                        do_drain=False,
                     )
                     if not quiet:
                         r = ack_fetch.get("result") or {}
                         write_fn(
-                            f"        ack receipt={r.get('receipt_sent')} "
-                            f"skipped={r.get('receipt_skipped')} stages={r.get('service_stages_done')}"
-                            + (f" err={ack_fetch.get('error')}" if not ack_fetch.get("success") else ""),
+                            f"        executed={r.get('executed')} receipt={r.get('receipt_sent')} "
+                            f"skipped={r.get('receipt_skipped')}"
+                            + (
+                                f" err={ack_fetch.get('error') or r.get('execute_error') or r.get('receipt_error')}"
+                                if not ack_fetch.get("success") or r.get("execute_error") or r.get("receipt_error")
+                                else ""
+                            ),
                             None,
                         )
                 except Exception as e:
                     if not quiet:
-                        write_fn(f"        ack error: {e}", "warning")
+                        write_fn(f"        execute/ack error: {e}", "warning")
                 continue
 
             doc_date = parse_document_date(doc)
@@ -372,6 +381,7 @@ def _process_one_cert(
                 requirement_stage_id=stage_id,
                 date_from_str=date_from_str,
                 date_to_str=date_to_str,
+                do_drain=False,
             )
             if not fetch.get("success"):
                 stats["fetch_error"] += 1

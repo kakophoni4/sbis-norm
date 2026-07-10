@@ -1519,6 +1519,7 @@ def drain_service_stages(
     date_from_str: str,
     date_to_str: str,
     max_rounds: int = 8,
+    only_doc_id: str | None = None,
 ) -> dict:
     """Цикл СписокСлужебныхЭтапов → prepare → sign → execute (извещения и пр.)."""
     done = 0
@@ -1543,6 +1544,13 @@ def drain_service_stages(
         for doc in docs:
             doc_id = (doc.get("Идентификатор") or "").strip()
             if not doc_id:
+                continue
+            if only_doc_id and doc_id != only_doc_id:
+                continue
+            # не трогаем исходящие НД/НДС в drain требований
+            title = doc.get("Название") or ""
+            direction = doc.get("Направление") or ""
+            if direction == "Исходящий" and ("НДС" in title or title.startswith("НД ")):
                 continue
             stages = doc.get("Этап") or []
             if not isinstance(stages, list):
@@ -1577,14 +1585,7 @@ def drain_service_stages(
                 thumbprint = (prep.get("result") or {}).get("thumbprint") or thumbprint
                 prepare_raw = (prep.get("result") or {}).get("raw") or {}
 
-                # скачать/расшифровать если нужно
                 decrypted_by_id: dict[str, bytes] = {}
-                files_meta = _extract_files_from_prepare_raw(prepare_raw)
-                for fmeta in files_meta:
-                    href = (fmeta.get("href") or "").strip()
-                    # идентификатор из raw — ищем в prepare
-                    # упрощённо: качаем и кладём по имени
-                # более надёжно: пройти Вложение из prepare_raw
                 st_list = prepare_raw.get("Этап") or []
                 if isinstance(st_list, dict):
                     st_list = [st_list]
@@ -1624,7 +1625,12 @@ def drain_service_stages(
                     done += 1
                     progressed = True
                 else:
-                    errors.append(str((exe.get("error") or {}).get("message") or exe)[:200])
+                    err = exe.get("error") or {}
+                    msg = str(err.get("message") or err)
+                    if any(x in msg.lower() for x in ("уже", "выполнен", "закрыт", "нет доступных")):
+                        progressed = True
+                    else:
+                        errors.append(msg[:200])
         if not progressed:
             break
     return {"success": True, "service_stages_done": done, "errors": errors[:10]}
@@ -1717,10 +1723,12 @@ def fetch_requirement_full(
     date_from_str: str | None = None,
     date_to_str: str | None = None,
     save_to: str | None = None,
+    do_drain: bool = False,
 ) -> dict:
     """
     Полный цикл по доке Saby:
-    prepare → download/decrypt → execute → drain служебных → ack Утверждение.
+    prepare → download/decrypt → execute → ack Утверждение.
+    do_drain=True — дополнительно пройти служебные этапы по этому doc_id (дорого по прокси).
     """
     base = fetch_requirement_file_b64(
         inn,
@@ -1815,20 +1823,24 @@ def fetch_requirement_full(
         today = datetime.now()
         date_to_str = today.strftime("%d.%m.%Y")
         date_from_str = (today - timedelta(days=10)).strftime("%d.%m.%Y")
-    drained = drain_service_stages(
-        inn,
-        kpp=kpp,
-        session_id=session_id,
-        thumbprint=thumbprint,
-        fio=fio,
-        csptest_name=cert.csptest_name,
-        org_name=org_name,
-        date_from_str=date_from_str,
-        date_to_str=date_to_str,
-    )
-    result["service_stages_done"] = drained.get("service_stages_done", 0)
-    if drained.get("errors"):
-        result["service_stage_errors"] = drained["errors"]
+    if do_drain:
+        drained = drain_service_stages(
+            inn,
+            kpp=kpp,
+            session_id=session_id,
+            thumbprint=thumbprint,
+            fio=fio,
+            csptest_name=cert.csptest_name,
+            org_name=org_name,
+            date_from_str=date_from_str,
+            date_to_str=date_to_str,
+            only_doc_id=requirement_doc_id,
+        )
+        result["service_stages_done"] = drained.get("service_stages_done", 0)
+        if drained.get("errors"):
+            result["service_stage_errors"] = drained["errors"]
+    else:
+        result["service_stages_done"] = 0
 
     ack = acknowledge_requirement_receipt(
         inn,
