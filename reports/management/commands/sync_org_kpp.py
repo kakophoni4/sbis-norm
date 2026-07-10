@@ -120,6 +120,16 @@ class Command(BaseCommand):
             default="",
             help="Referer для запроса. Или env KPP_SYNC_REFERER",
         )
+        parser.add_argument(
+            "--inns-file",
+            default="",
+            help="Файл со списком ИНН (по одному в строке). Ограничивает обработку этим списком.",
+        )
+        parser.add_argument(
+            "--requirements-whitelist",
+            action="store_true",
+            help="Только ИНН из whitelist сканера требований (docs/requirements_scan_inns.txt / лавки+новые).",
+        )
 
     def handle(self, *args, **options):
         dry = options["dry_run"]
@@ -140,6 +150,19 @@ class Command(BaseCommand):
                 sys.exit(1)
         referer = (options.get("referer") or "").strip() or None
 
+        inns_filter: set[str] | None = None
+        inns_file = (options.get("inns_file") or "").strip()
+        if options.get("requirements_whitelist"):
+            from reports.services.requirements_scan_scope import get_requirements_scan_inns
+
+            inns_filter = set(get_requirements_scan_inns())
+            self.stdout.write(f"Whitelist требований: {len(inns_filter)} ИНН")
+        elif inns_file:
+            from reports.services.requirements_scan_scope import load_inns_file
+
+            inns_filter = set(load_inns_file(inns_file))
+            self.stdout.write(f"ИНН из файла {inns_file}: {len(inns_filter)}")
+
         if from_certs:
             self._run_from_certificates(
                 dry=dry,
@@ -150,6 +173,7 @@ class Command(BaseCommand):
                 ensure_org=ensure_org,
                 cookie=cookie or None,
                 referer=referer,
+                inns_filter=inns_filter,
             )
         else:
             self._run_from_organizations(
@@ -161,14 +185,17 @@ class Command(BaseCommand):
                 sync_certs=sync_certs,
                 cookie=cookie or None,
                 referer=referer,
+                inns_filter=inns_filter,
             )
 
     def _run_from_organizations(
-        self, *, dry, force, delay, only_inn, url, sync_certs, cookie, referer
+        self, *, dry, force, delay, only_inn, url, sync_certs, cookie, referer, inns_filter=None
     ):
         qs = Organization.objects.all().order_by("inn")
         if only_inn:
             qs = qs.filter(inn=only_inn)
+        if inns_filter is not None:
+            qs = qs.filter(inn__in=list(inns_filter))
         if not force:
             qs = qs.filter(Q(kpp__isnull=True) | Q(kpp=""))
 
@@ -232,11 +259,13 @@ class Command(BaseCommand):
         self._summary(ok_n, err_n, skip_n, dry)
 
     def _run_from_certificates(
-        self, *, dry, force, delay, only_inn, url, ensure_org, cookie, referer
+        self, *, dry, force, delay, only_inn, url, ensure_org, cookie, referer, inns_filter=None
     ):
         base = Certificate.objects.exclude(inn__isnull=True).exclude(inn="")
         if only_inn:
             base = base.filter(inn=only_inn)
+        if inns_filter is not None:
+            base = base.filter(inn__in=list(inns_filter))
 
         if not force:
             need_inns = (
@@ -248,6 +277,12 @@ class Command(BaseCommand):
             need_inns = base.values_list("inn", flat=True).distinct()
 
         inns = sorted(set(need_inns))
+        # если ИНН в whitelist есть, но Organization пустая — всё равно обработаем через certs;
+        # дополнительно: ИНН из фильтра без cert.kpp уже в need_inns
+        if inns_filter is not None and not only_inn:
+            # также подтянуть ИНН из фильтра, у которых Organization без КПП (даже если cert уже с КПП — skip)
+            pass
+
         total = len(inns)
         self.stdout.write(
             f"[Certificate] уникальных ИНН к обработке: {total} (dry-run={dry}, force={force})"
