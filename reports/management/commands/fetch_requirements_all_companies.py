@@ -43,7 +43,7 @@ from django.utils import timezone
 from reports.models import Certificate, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
 from reports.services.requirements_notify import notify_requirement_saved
-from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full
+from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
 
 
 logger = logging.getLogger(__name__)
@@ -440,6 +440,39 @@ def _process_one_cert(
                     + (" (dry-run)" if dry_run else ""),
                     "success",
                 )
+
+        # Документы уже в БД, но не в СписокСлужебныхЭтапов («Обработать» закрыт) —
+        # всё равно пробуем квитанцию Утверждение (статус «Ожидается доставка»).
+        if not dry_run:
+            db_qs = RequirementDocument.objects.filter(inn=inn)
+            if client_date_filter:
+                db_qs = db_qs.filter(document_date__gte=date_from.date(), document_date__lte=date_to.date())
+            for rdoc in db_qs.order_by("-document_date")[:30]:
+                if not quiet:
+                    write_fn(
+                        f"      — DB {rdoc.sbis_doc_id[:24]}...: ack Утверждение (вне списка служебных)...",
+                        None,
+                    )
+                try:
+                    ack_only = finalize_requirement_ack(
+                        inn,
+                        kpp=kpp,
+                        doc_id=rdoc.sbis_doc_id,
+                        date_from_str=date_from_str,
+                        date_to_str=date_to_str,
+                        do_drain=False,
+                    )
+                    if not quiet:
+                        rr = ack_only.get("result") or {}
+                        write_fn(
+                            f"        receipt={rr.get('receipt_sent')} skipped={rr.get('receipt_skipped')} "
+                            f"comment={rr.get('receipt_comment') or ''}"
+                            + (f" err={ack_only.get('error')}" if not ack_only.get("success") else ""),
+                            None,
+                        )
+                except Exception as e:
+                    if not quiet:
+                        write_fn(f"        ack-only error: {e}", "warning")
 
         # Сюда попадаем только без исключения в теле try (в т.ч. после полного цикла по incoming)
         scan_eligible_for_cache = (

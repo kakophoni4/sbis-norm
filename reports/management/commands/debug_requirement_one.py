@@ -55,6 +55,11 @@ class Command(BaseCommand):
             action="store_true",
             help="Не вызывать ВыполнитьДействие (только до download/read)",
         )
+        parser.add_argument(
+            "--ack-only",
+            action="store_true",
+            help="Только ПрочитатьДокумент + Утверждение (без prepare/download/execute)",
+        )
 
     def handle(self, *args, **options):
         inn = str(options["inn"]).strip()
@@ -130,108 +135,127 @@ class Command(BaseCommand):
         if stop_after == "list":
             return
 
-        # --- 2. PREPARE ---
-        self.stdout.write(self.style.MIGRATE_HEADING("\n=== 2/6 PREPARE ПодготовитьДействие ==="))
-        try:
-            prep = sbis_prepare_action(
-                inn,
-                kpp=kpp,
-                doc_id=doc_id,
-                stage_id=stage_id,
-                action_name=action_name,
-            )
-        except Exception:
-            self.stdout.write(self.style.ERROR(traceback.format_exc()))
-            return
-        if not prep.get("success"):
-            self.stdout.write(self.style.ERROR(f"PREPARE FAIL: {json.dumps(prep.get('error'), ensure_ascii=False)[:1200]}"))
-            return
-        prepare_raw = (prep.get("result") or {}).get("raw") or {}
-        session_id = (prep.get("result") or {}).get("session_id") or session_id
-        thumb = (prep.get("result") or {}).get("thumbprint") or thumb
-        st_list = prepare_raw.get("Этап") or []
-        if isinstance(st_list, dict):
-            st_list = [st_list]
-        st0 = (st_list[0] if st_list else {}) or {}
-        atts = [a for a in (st0.get("Вложение") or []) if isinstance(a, dict)]
-        self.stdout.write(f"PREPARE OK attachments={len(atts)}")
-        for a in atts:
-            fo = a.get("Файл") or {}
-            href = (fo.get("Ссылка") or "") if isinstance(fo, dict) else ""
-            self.stdout.write(
-                f"  att id={(a.get('Идентификатор') or '')[:20]} "
-                f"name={(fo.get('Имя') if isinstance(fo, dict) else '')} "
-                f"enc={a.get('Зашифрован')} sign={a.get('ТребуетПодписание')} "
-                f"href={'yes' if href else 'no'}"
-            )
-        if stop_after == "prepare":
-            return
-
-        # --- 3. DOWNLOAD + DECRYPT ---
-        self.stdout.write(self.style.MIGRATE_HEADING("\n=== 3/6 DOWNLOAD + DECRYPT ==="))
-        decrypted_by_id: dict[str, bytes] = {}
-        for a in atts:
-            att_id = (a.get("Идентификатор") or "").strip()
-            fo = a.get("Файл") or {}
-            if not isinstance(fo, dict):
-                continue
-            href = (fo.get("Ссылка") or "").strip()
-            if not att_id or not href:
-                self.stdout.write(f"  skip {att_id[:16] if att_id else '?'}: no href")
-                continue
-            try:
-                content, ctype = sbis_download_file_by_link(inn, session_id=session_id, href=href)
-                self.stdout.write(f"  downloaded {att_id[:20]} bytes={len(content)} ctype={ctype}")
-                if str(a.get("Зашифрован") or "").strip() == "Да":
-                    content2, how = _try_decrypt_bytes_with_cert(inn=inn, thumbprint=thumb, content=content)
-                    self.stdout.write(f"  decrypted {att_id[:20]} bytes={len(content2)} how={how}")
-                    content = content2
-                decrypted_by_id[att_id] = content
-                head = content[:8]
-                self.stdout.write(f"  head_hex={head.hex()} head_ascii={content[:40]!r}")
-            except Exception as e:
-                self.stdout.write(self.style.ERROR(f"  DOWNLOAD/DECR FAIL {att_id[:20]}: {e}"))
-                self.stdout.write(traceback.format_exc()[-800:])
-        self.stdout.write(f"decrypted_ok={len(decrypted_by_id)}/{len(atts)}")
-        if stop_after == "download":
-            return
-
-        # --- 4. EXECUTE ---
-        self.stdout.write(self.style.MIGRATE_HEADING("\n=== 4/6 EXECUTE ВыполнитьДействие ==="))
-        if skip_execute:
-            self.stdout.write("SKIPPED (--skip-execute)")
+        if options.get("ack_only"):
+            self.stdout.write(self.style.WARNING("\n--ack-only: skip prepare/download/execute → READ + ACK"))
+            stop_after = "ack"
         else:
+            # --- 2. PREPARE ---
+            self.stdout.write(self.style.MIGRATE_HEADING("\n=== 2/6 PREPARE ПодготовитьДействие ==="))
             try:
-                attachments = _build_execute_attachments_from_prepare(
-                    prepare_raw=prepare_raw,
-                    decrypted_by_id=decrypted_by_id,
-                    thumbprint=thumb,
-                    csptest_name=cert.csptest_name,
-                )
-                self.stdout.write(f"execute attachments prepared: {len(attachments)}")
-                for item in attachments:
-                    keys = list(item.keys())
-                    has_sig = "Подпись" in item
-                    has_file = "Файл" in item
-                    self.stdout.write(f"  {item.get('Идентификатор', '')[:20]} keys={keys} file={has_file} sig={has_sig}")
-                exe = sbis_execute_action(
+                prep = sbis_prepare_action(
                     inn,
-                    session_id=session_id,
+                    kpp=kpp,
                     doc_id=doc_id,
                     stage_id=stage_id,
                     action_name=action_name,
-                    thumbprint=thumb,
-                    fio=fio,
-                    attachments=attachments,
                 )
-                if exe.get("success"):
-                    self.stdout.write(self.style.SUCCESS(f"EXECUTE OK keys={list((exe.get('result') or {}).keys())[:20]}"))
-                else:
-                    self.stdout.write(self.style.ERROR(f"EXECUTE FAIL: {json.dumps(exe.get('error'), ensure_ascii=False)[:1500]}"))
             except Exception:
                 self.stdout.write(self.style.ERROR(traceback.format_exc()))
-        if stop_after == "execute":
-            return
+                return
+            if not prep.get("success"):
+                err_s = json.dumps(prep.get("error"), ensure_ascii=False)
+                self.stdout.write(self.style.ERROR(f"PREPARE FAIL: {err_s[:1200]}"))
+                if "уже обработано" in err_s.lower():
+                    self.stdout.write(self.style.WARNING("Действие уже обработано → переходим к READ + ACK"))
+                else:
+                    return
+            else:
+                prepare_raw = (prep.get("result") or {}).get("raw") or {}
+                session_id = (prep.get("result") or {}).get("session_id") or session_id
+                thumb = (prep.get("result") or {}).get("thumbprint") or thumb
+                st_list = prepare_raw.get("Этап") or []
+                if isinstance(st_list, dict):
+                    st_list = [st_list]
+                st0 = (st_list[0] if st_list else {}) or {}
+                atts = [a for a in (st0.get("Вложение") or []) if isinstance(a, dict)]
+                self.stdout.write(f"PREPARE OK attachments={len(atts)}")
+                for a in atts:
+                    fo = a.get("Файл") or {}
+                    href = (fo.get("Ссылка") or "") if isinstance(fo, dict) else ""
+                    self.stdout.write(
+                        f"  att id={(a.get('Идентификатор') or '')[:20]} "
+                        f"name={(fo.get('Имя') if isinstance(fo, dict) else '')} "
+                        f"enc={a.get('Зашифрован')} sign={a.get('ТребуетПодписание')} "
+                        f"href={'yes' if href else 'no'}"
+                    )
+                if stop_after == "prepare":
+                    return
+
+                # --- 3. DOWNLOAD + DECRYPT ---
+                self.stdout.write(self.style.MIGRATE_HEADING("\n=== 3/6 DOWNLOAD + DECRYPT ==="))
+                decrypted_by_id: dict[str, bytes] = {}
+                for a in atts:
+                    att_id = (a.get("Идентификатор") or "").strip()
+                    fo = a.get("Файл") or {}
+                    if not isinstance(fo, dict):
+                        continue
+                    href = (fo.get("Ссылка") or "").strip()
+                    if not att_id or not href:
+                        self.stdout.write(f"  skip {att_id[:16] if att_id else '?'}: no href")
+                        continue
+                    try:
+                        content, ctype = sbis_download_file_by_link(inn, session_id=session_id, href=href)
+                        self.stdout.write(f"  downloaded {att_id[:20]} bytes={len(content)} ctype={ctype}")
+                        if str(a.get("Зашифрован") or "").strip() == "Да":
+                            content2, how = _try_decrypt_bytes_with_cert(inn=inn, thumbprint=thumb, content=content)
+                            self.stdout.write(f"  decrypted {att_id[:20]} bytes={len(content2)} how={how}")
+                            content = content2
+                        decrypted_by_id[att_id] = content
+                        head = content[:8]
+                        self.stdout.write(f"  head_hex={head.hex()} head_ascii={content[:40]!r}")
+                    except Exception as e:
+                        self.stdout.write(self.style.ERROR(f"  DOWNLOAD/DECR FAIL {att_id[:20]}: {e}"))
+                        self.stdout.write(traceback.format_exc()[-800:])
+                self.stdout.write(f"decrypted_ok={len(decrypted_by_id)}/{len(atts)}")
+                if stop_after == "download":
+                    return
+
+                # --- 4. EXECUTE ---
+                self.stdout.write(self.style.MIGRATE_HEADING("\n=== 4/6 EXECUTE ВыполнитьДействие ==="))
+                if skip_execute:
+                    self.stdout.write("SKIPPED (--skip-execute)")
+                else:
+                    try:
+                        attachments = _build_execute_attachments_from_prepare(
+                            prepare_raw=prepare_raw,
+                            decrypted_by_id=decrypted_by_id,
+                            thumbprint=thumb,
+                            csptest_name=cert.csptest_name,
+                        )
+                        self.stdout.write(f"execute attachments prepared: {len(attachments)}")
+                        for item in attachments:
+                            keys = list(item.keys())
+                            has_sig = "Подпись" in item
+                            has_file = "Файл" in item
+                            self.stdout.write(
+                                f"  {item.get('Идентификатор', '')[:20]} keys={keys} file={has_file} sig={has_sig}"
+                            )
+                        exe = sbis_execute_action(
+                            inn,
+                            session_id=session_id,
+                            doc_id=doc_id,
+                            stage_id=stage_id,
+                            action_name=action_name,
+                            thumbprint=thumb,
+                            fio=fio,
+                            attachments=attachments,
+                        )
+                        if exe.get("success"):
+                            self.stdout.write(
+                                self.style.SUCCESS(
+                                    f"EXECUTE OK keys={list((exe.get('result') or {}).keys())[:20]}"
+                                )
+                            )
+                        else:
+                            self.stdout.write(
+                                self.style.ERROR(
+                                    f"EXECUTE FAIL: {json.dumps(exe.get('error'), ensure_ascii=False)[:1500]}"
+                                )
+                            )
+                    except Exception:
+                        self.stdout.write(self.style.ERROR(traceback.format_exc()))
+                if stop_after == "execute":
+                    return
 
         # --- 5. READ ---
         self.stdout.write(self.style.MIGRATE_HEADING("\n=== 5/6 READ ПрочитатьДокумент ==="))
@@ -246,8 +270,25 @@ class Command(BaseCommand):
         result = read.get("result") or {}
         state = result.get("Состояние") or {}
         self.stdout.write(f"Состояние: {state.get('Код')} {state.get('Название')} | {state.get('Описание')}")
+        stages = result.get("Этап") or []
+        self.stdout.write(f"Этап count={len(stages) if isinstance(stages, list) else type(stages)}")
+        # полный дамп этапов (без огромных ДвоичныеДанные)
+        try:
+            dump = json.loads(json.dumps(stages, ensure_ascii=False, default=str))
+            def _strip(o):
+                if isinstance(o, dict):
+                    return {
+                        k: (f"<b64 {len(v)}>" if k == "ДвоичныеДанные" and isinstance(v, str) and len(v) > 80 else _strip(v))
+                        for k, v in o.items()
+                    }
+                if isinstance(o, list):
+                    return [_strip(x) for x in o]
+                return o
+            self.stdout.write(json.dumps(_strip(dump), ensure_ascii=False, indent=2)[:4000])
+        except Exception as e:
+            self.stdout.write(f"(dump stages failed: {e})")
         has_utv = False
-        for st in result.get("Этап") or []:
+        for st in stages if isinstance(stages, list) else []:
             if not isinstance(st, dict):
                 continue
             actions = st.get("Действие") or []
@@ -269,7 +310,7 @@ class Command(BaseCommand):
 
         # --- 6. ACK ---
         self.stdout.write(self.style.MIGRATE_HEADING("\n=== 6/6 ACK Утверждение (квитанция) ==="))
-        if skip_execute:
+        if skip_execute and not options.get("ack_only"):
             self.stdout.write("SKIPPED (because --skip-execute)")
             return
         try:
@@ -287,6 +328,8 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.SUCCESS("ACK receipt_sent=True"))
             elif ack.get("skipped"):
                 self.stdout.write(self.style.WARNING(f"ACK skipped: {ack.get('comment')}"))
+                st = ack.get("state") or {}
+                self.stdout.write(f"  state={st.get('Код')} {st.get('Название')} | {st.get('Описание')}")
             else:
                 self.stdout.write(self.style.ERROR(f"ACK FAIL: {ack.get('error')}"))
         except Exception:

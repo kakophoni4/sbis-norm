@@ -610,16 +610,41 @@ def sbis_prepare_action(
 
     try:
         resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=req_json, timeout=45)
-        if resp.status_code != 200:
-            body_head = (resp.text or "").strip()[:400]
+        body_text = (resp.text or "").strip()
+        body_head = body_text[:400]
+        data = None
+        try:
+            data = resp.json() if body_text else None
+        except Exception:
+            data = None
+
+        # СБИС часто отдаёт бизнес-ошибку как HTTP 500 + jsonrpc.error
+        if isinstance(data, dict) and data.get("error"):
+            err = data["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            details = (err.get("details") if isinstance(err, dict) else "") or ""
+            combined = f"{msg} {details}".strip()
+            already = "уже обработано" in combined.lower()
             return {
                 "success": False,
-                "error": {"message": f"HTTP {resp.status_code} при ПодготовитьДействие. Ответ: {body_head or '(пусто)'}", "inn": inn, "raw_head": body_head},
+                "already_done": already,
+                "error": {
+                    "message": f"СБИС error: {err}",
+                    "inn": inn,
+                    "http_status": resp.status_code,
+                    "raw_head": body_head,
+                },
             }
 
-        data = resp.json()
-        if data.get("error"):
-            return {"success": False, "error": {"message": f"СБИС error: {data['error']}", "inn": inn}}
+        if resp.status_code != 200:
+            return {
+                "success": False,
+                "error": {
+                    "message": f"HTTP {resp.status_code} при ПодготовитьДействие. Ответ: {body_head or '(пусто)'}",
+                    "inn": inn,
+                    "raw_head": body_head,
+                },
+            }
 
         return {
             "success": True,
@@ -628,7 +653,7 @@ def sbis_prepare_action(
                 "kpp_used": kpp,
                 "session_id": session_id,
                 "thumbprint": thumb,
-                "raw": data.get("result"),
+                "raw": (data or {}).get("result") if isinstance(data, dict) else None,
             },
         }
 
@@ -1653,10 +1678,11 @@ def finalize_requirement_ack(
     org_name: str = "",
     date_from_str: str | None = None,
     date_to_str: str | None = None,
+    do_drain: bool = False,
 ) -> dict:
     """
-    Drain служебных этапов + квитанция «Утверждение» без повторного скачивания файла.
-    Для документов, уже сохранённых в БД.
+    Квитанция «Утверждение» без повторного скачивания файла.
+    Для документов, у которых «Обработать служебное» уже закрыто.
     """
     cert = _resolve_requirement_cert(inn)
     if not cert or not cert.csptest_name:
@@ -1676,17 +1702,20 @@ def finalize_requirement_ack(
         date_to_str = today.strftime("%d.%m.%Y")
         date_from_str = (today - timedelta(days=10)).strftime("%d.%m.%Y")
 
-    drained = drain_service_stages(
-        inn,
-        kpp=kpp,
-        session_id=session_id,
-        thumbprint=thumbprint,
-        fio=fio,
-        csptest_name=cert.csptest_name,
-        org_name=org_name,
-        date_from_str=date_from_str,
-        date_to_str=date_to_str,
-    )
+    drained = {"service_stages_done": 0, "errors": []}
+    if do_drain:
+        drained = drain_service_stages(
+            inn,
+            kpp=kpp,
+            session_id=session_id,
+            thumbprint=thumbprint,
+            fio=fio,
+            csptest_name=cert.csptest_name,
+            org_name=org_name,
+            date_from_str=date_from_str,
+            date_to_str=date_to_str,
+            only_doc_id=doc_id,
+        )
     ack = acknowledge_requirement_receipt(
         inn,
         session_id=session_id,
@@ -1707,6 +1736,7 @@ def finalize_requirement_ack(
             "receipt_skipped": bool(ack.get("skipped")),
             "receipt_comment": ack.get("comment"),
             "receipt_error": ack.get("error") if not ack.get("success") else None,
+            "state": ack.get("state"),
         },
         "error": ack.get("error") if not ack.get("success") else None,
     }

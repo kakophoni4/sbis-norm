@@ -444,6 +444,24 @@ def _sbis_request(
                         f"Certificate invalid (no retry): status={code} "
                         f"body_head={head}"
                     )
+                # Бизнес-ошибка СБИС («уже обработано» и т.п.) — не крутить прокси
+                low = body_snip.lower()
+                if any(
+                    x in low
+                    for x in (
+                        "уже обработано",
+                        "нет доступных действий",
+                        "действие недоступно",
+                    )
+                ):
+                    logger.warning(
+                        "[SBIS_PROXY] no-retry business error status=%s body_head=%s",
+                        resp.status_code,
+                        _short_body(resp),
+                    )
+                    _close_http_response(last_bad_resp)
+                    last_bad_resp = None
+                    return resp
                 _close_http_response(last_bad_resp)
                 last_bad_resp = resp
                 logger.warning(
