@@ -61,6 +61,15 @@ payload = {
     ],
     "dry_run": False,
 }
-out = Path(sys.argv[1] if len(sys.argv) > 1 else "/tmp/bastion_1c_payload.json")
+out = Path("/tmp/bastion_1c_payload.json")
+dry = False
+args = [a for a in sys.argv[1:] if a]
+for a in args:
+    if a in ("--dry-run", "dry", "dry_run"):
+        dry = True
+    elif not a.startswith("-"):
+        out = Path(a)
+payload["dry_run"] = dry
 out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 print(out)
+print("dry_run", dry)
