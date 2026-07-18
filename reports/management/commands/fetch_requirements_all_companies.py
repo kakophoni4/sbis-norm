@@ -87,16 +87,25 @@ def is_permanent_sbis_auth_error(text: str) -> bool:
         )
     )
 
-# Ключевые слова в названии документа для фильтра «похоже на требование ФНС»
+# Ключевые слова в названии (стем «требован» ловит «требование» / «требования»)
 REQUIREMENT_KEYWORDS = (
-    "требование",
+    "требован",
     "фнс",
+    "сфр",
+    "фсс",
+    "пфр",
     "налоговая",
     "сверка",
     "уведомление",
     "инспекция",
     "ифнс",
     "акт сверки",
+)
+
+# Типы СБИС: ФНС и СФР (бывш. ФСС/ПФР)
+REQUIREMENT_TYPES = (
+    "RequirementFNS",
+    "RequirementFSS",
 )
 
 
@@ -173,10 +182,13 @@ def pick_service_stage_id(doc: dict) -> str | None:
 
 
 def is_requirement_like(doc: dict) -> bool:
-    """Проверить, похож ли документ на требование ФНС (направление + название)."""
+    """Входящее требование ФНС или СФР (по Типу СБИС и/или названию)."""
     direction = (doc.get("Направление") or "").strip()
     if direction != "Входящий":
         return False
+    dtype = (doc.get("Тип") or "").strip()
+    if dtype in REQUIREMENT_TYPES or any(dtype.startswith(t) for t in REQUIREMENT_TYPES):
+        return True
     name = (doc.get("Название") or "").lower()
     return any(kw in name for kw in REQUIREMENT_KEYWORDS)
 
@@ -375,7 +387,7 @@ def _process_one_cert(
                 elif is_requirement_like(d):
                     mark = "пропуск (дата вне окна)"
                 else:
-                    mark = "пропуск (не требование)"
+                    mark = "пропуск (не требование ФНС/СФР)"
                 write_fn(f"      · [{mark}] {direction} | {dtype} | {title}", None)
 
         # Обновить даты у уже существующих записей по данным из этого же ответа СБИС
