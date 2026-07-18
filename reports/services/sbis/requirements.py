@@ -1439,6 +1439,16 @@ def _build_execute_attachments_from_prepare(
         ).strip() == "Да" or action_needs_sign
 
         item: dict = {"Идентификатор": att_id}
+        # СБИС: при наличии Файл.ДвоичныеДанные обязательно Имя, иначе
+        # «Не указано имя файла вложения» (HTTP 500 / jsonrpc).
+        file_name = (
+            (file_obj.get("Имя") or file_obj.get("Название") or att.get("Название") or "")
+            .strip()
+            or f"attachment_{att_id[:8]}.bin"
+        )
+        att_title = (att.get("Название") or "").strip()
+        if att_title:
+            item["Название"] = att_title
         payload = decrypted_by_id.get(att_id)
         source = "decrypted" if payload is not None else ""
 
@@ -1447,7 +1457,10 @@ def _build_execute_attachments_from_prepare(
 
         if payload is not None:
             if include_file_payload:
-                item["Файл"] = {"ДвоичныеДанные": base64.b64encode(payload).decode("ascii")}
+                item["Файл"] = {
+                    "Имя": file_name,
+                    "ДвоичныеДанные": base64.b64encode(payload).decode("ascii"),
+                }
             if needs_sign or prefer_sign_file:
                 try:
                     sig_b64 = _sign_bytes_detached(
