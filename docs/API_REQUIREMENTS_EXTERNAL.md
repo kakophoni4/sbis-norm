@@ -17,7 +17,8 @@ Content-Type: `application/json`
 sbis-norm: RequirementDocument (file_b64 + meta)
     │
     ├─ pull:  GET /api/sbis/requirements/ …
-    ├─ file:  GET /api/sbis/requirements/<id>/
+    ├─ meta:  GET /api/sbis/requirements/<id>/          (без файла)
+    ├─ file:  GET /api/sbis/requirements/<id>/file/     (сырые байты PDF)
     └─ ack:   POST /api/sbis/requirements/mark-synced/
     │
     ▼
@@ -94,26 +95,28 @@ GET /api/sbis/requirements/?unsynced=1&limit=50
       "storage_file_name": "Требование ФНС (9707039440) (2026-07-06).pdf",
       "created_at": "2026-07-10T14:22:01.123456+00:00",
       "external_synced_at": null,
-      "file_size": 184320
+      "file_size": 184320,
+      "file_url": "/api/sbis/requirements/12/file/"
     }
   ]
 }
 ```
 
 `file_size` — оценка размера бинарника в байтах (из длины base64).  
-В list по умолчанию **нет** `file_b64`.
+В list по умолчанию **нет** `file_b64`. Файл — только через `/file/`.
 
 ---
 
-## 2. Один документ (с файлом)
+## 2. Мета одного документа (без файла)
 
 `GET /api/sbis/requirements/<id>/`
 
+По умолчанию **только мета** (лёгкий JSON).  
+`file_b64` опционально: `?include_file=1` (не рекомендуется для CRM — раздувает ответ ~+33%).
+
 ### Ответ 200
 
-Те же поля + `file_b64` (строка base64 содержимого PDF/XML/ZIP).
-
-Имя файла для сохранения: `storage_file_name` (или собрать из `inn` + `document_date` + расширение).
+Те же поля, что в list, плюс `file_url`.
 
 ### Ошибки
 
@@ -121,6 +124,37 @@ GET /api/sbis/requirements/?unsynced=1&limit=50
 |-----|--------|
 | 401 | неверный / отсутствующий API token |
 | 404 | нет записи с таким id |
+
+---
+
+## 2b. Бинарный файл (для CRM)
+
+`GET /api/sbis/requirements/<id>/file/`
+
+Сырые байты файла, **не** base64.
+
+| Заголовок | Значение |
+|-----------|----------|
+| `Content-Type` | `application/pdf` (или реальный mime: xml / pkcs7-mime / …) |
+| `Content-Length` | размер в байтах |
+| `Content-Disposition` | `attachment; filename="…"` |
+| `X-Content-Sha256` | sha256 содержимого (если есть в БД) |
+
+### Пример
+
+```bash
+curl -sS -m 60 -w "%{http_code} %{size_download} %{time_total}\n" \
+  -o /tmp/r5.pdf \
+  "http://127.0.0.1:8000/api/sbis/requirements/5/file/"
+file /tmp/r5.pdf
+```
+
+### Ошибки
+
+| Код | Когда |
+|-----|--------|
+| 401 | неверный / отсутствующий API token |
+| 404 | нет записи / пустой файл |
 
 ---
 
@@ -151,11 +185,12 @@ GET /api/sbis/requirements/?unsynced=1&limit=50
 
 ```
 1. GET /api/sbis/requirements/?unsynced=1&limit=50
-2. для каждого item:
-     GET /api/sbis/requirements/{id}/
-     сохранить file_b64 → диск / БД / очередь
-3. POST /api/sbis/requirements/mark-synced/  {"ids": [...успешно сохранённые...]}
-4. если count == limit — повторить с шага 1
+2. оставить только storage_file_name.endswith(".pdf")
+3. для каждого id:
+     GET /api/sbis/requirements/{id}/       # мета (опционально)
+     GET /api/sbis/requirements/{id}/file/  # бинарный PDF → диск / БД
+4. POST /api/sbis/requirements/mark-synced/  {"ids": [...успешно сохранённые...]}
+5. если count == limit — повторить с шага 1
 ```
 
 Альтернатива курсором (если не используете unsynced):
@@ -222,7 +257,17 @@ X-API-Key: <REQUIREMENTS_WEBHOOK_TOKEN>
 | `created_at` | когда сохранили у нас |
 | `external_synced_at` | когда забрал внешний сервис |
 
-Сканер: whitelist `docs/requirements_scan_inns.txt` (лавки + новые), окно **10 дней**, расписание **17:00 Europe/Moscow**.
+Сканер: whitelist `docs/requirements_scan_inns.txt` (актуальный белый список без «Удалено»), окно **10 дней**, расписание **17:00 Europe/Moscow**.
+
+Первый прогон (бэкфилл с 01.04.2026), один раз:
+
+```bash
+# дней от 01.04.2026 до сегодня (пример на 10.07.2026 → 100)
+docker compose exec -T web python manage.py fetch_requirements_all_companies \
+  --days 100 --workers 1 --retry-workers 1 --max-rounds 10 --round-sleep 120 --pressure-sleep 90
+```
+
+Дальше ежедневно beat сам гоняет `--days 10`.
 
 ---
 

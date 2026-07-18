@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 import logging
+import mimetypes
 from datetime import datetime
+from urllib.parse import quote
 
 from django.conf import settings
+from django.http import HttpResponse
 from django.utils import timezone
 from django.utils.dateparse import parse_date, parse_datetime
 from rest_framework import status
@@ -11,6 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from reports.models import RequirementDocument
+from reports.requirement_file_sniff import guess_requirement_extension
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +35,45 @@ def _check_requirements_api_token(request) -> Response | None:
     return None
 
 
+def _decode_file_bytes(doc: RequirementDocument) -> bytes:
+    raw = (doc.file_b64 or "").strip()
+    if not raw:
+        return b""
+    try:
+        return base64.b64decode(raw, validate=False)
+    except Exception:
+        logger.exception("requirement id=%s: invalid file_b64", doc.id)
+        return b""
+
+
+def _content_type_for_bytes(data: bytes, storage_name: str | None) -> str:
+    name = (storage_name or "").strip().lower()
+    if name.endswith(".pdf") or data.startswith(b"%PDF"):
+        return "application/pdf"
+    if name.endswith(".p7m") or name.endswith(".p7s"):
+        return "application/pkcs7-mime"
+    if name.endswith(".xml") or (data.lstrip()[:5] in (b"<?xml", b"<") or data.lstrip()[:1] == b"<"):
+        return "application/xml"
+    if name.endswith(".zip") or data.startswith(b"PK\x03\x04"):
+        return "application/zip"
+    guessed, _ = mimetypes.guess_type(storage_name or "")
+    return guessed or "application/octet-stream"
+
+
+def _content_disposition(filename: str) -> str:
+    """ASCII fallback + RFC 5987 filename* for non-ASCII names."""
+    safe = (filename or "requirement.bin").replace('"', "").replace("\r", "").replace("\n", "")
+    try:
+        safe.encode("latin-1")
+        return f'attachment; filename="{safe}"'
+    except UnicodeEncodeError:
+        ascii_fb = "requirement" + guess_requirement_extension(b"")
+        # keep extension from original if possible
+        if "." in safe:
+            ascii_fb = "requirement." + safe.rsplit(".", 1)[-1]
+        return f"attachment; filename=\"{ascii_fb}\"; filename*=UTF-8''{quote(safe)}"
+
+
 def _serialize_requirement(doc: RequirementDocument, *, include_file: bool = False) -> dict:
     data = {
         "id": doc.id,
@@ -43,6 +87,7 @@ def _serialize_requirement(doc: RequirementDocument, *, include_file: bool = Fal
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "external_synced_at": doc.external_synced_at.isoformat() if doc.external_synced_at else None,
         "file_size": len(doc.file_b64 or "") * 3 // 4 if doc.file_b64 else 0,
+        "file_url": f"/api/sbis/requirements/{doc.id}/file/",
     }
     if include_file:
         data["file_b64"] = doc.file_b64 or ""
@@ -117,7 +162,10 @@ class RequirementsListView(APIView):
 
 
 class RequirementDetailView(APIView):
-    """GET /api/sbis/requirements/<id>/ — мета + file_b64."""
+    """
+    GET /api/sbis/requirements/<id>/ — мета (без файла).
+    ?include_file=1 — временно вернуть file_b64 (тяжёлый JSON, для CRM не рекомендуется).
+    """
 
     permission_classes = []
 
@@ -128,7 +176,36 @@ class RequirementDetailView(APIView):
         doc = RequirementDocument.objects.filter(pk=pk).first()
         if not doc:
             return Response({"detail": "not found"}, status=status.HTTP_404_NOT_FOUND)
-        return Response(_serialize_requirement(doc, include_file=True))
+        include_file = str(request.query_params.get("include_file") or "").strip().lower() in ("1", "true", "yes")
+        return Response(_serialize_requirement(doc, include_file=include_file))
+
+
+class RequirementFileView(APIView):
+    """
+    GET /api/sbis/requirements/<id>/file/ — сырые байты файла (PDF и т.д.), не base64.
+    """
+
+    permission_classes = []
+
+    def get(self, request, pk: int, *args, **kwargs):
+        denied = _check_requirements_api_token(request)
+        if denied:
+            return denied
+        doc = RequirementDocument.objects.filter(pk=pk).first()
+        if not doc:
+            return Response({"detail": "not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        data = _decode_file_bytes(doc)
+        if not data:
+            return Response({"detail": "empty file"}, status=status.HTTP_404_NOT_FOUND)
+
+        filename = (doc.storage_file_name or "").strip() or f"requirement_{doc.id}{guess_requirement_extension(data)}"
+        content_type = _content_type_for_bytes(data, filename)
+        resp = HttpResponse(data, content_type=content_type, status=200)
+        resp["Content-Length"] = str(len(data))
+        resp["Content-Disposition"] = _content_disposition(filename)
+        resp["X-Content-Sha256"] = (doc.content_sha256 or "")[:128]
+        return resp
 
 
 class RequirementsMarkSyncedView(APIView):
