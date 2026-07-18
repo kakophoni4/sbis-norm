@@ -175,11 +175,14 @@ def periodic_mail_check_task(self, inn: str, days_back: int = 7):
         raise self.retry(exc=exc)
 
 
-@shared_task(bind=True, max_retries=1, soft_time_limit=6 * 3600, time_limit=6 * 3600 + 300)
+@shared_task(bind=True, max_retries=0, soft_time_limit=12 * 3600, time_limit=12 * 3600 + 600)
 def fetch_requirements_daily_task(self, days: int = 10):
     """
     Ежедневный сканер требований ФНС (полный цикл Saby: prepare→decrypt→execute→ack).
-    По умолчанию все ИНН с has_private_key=True, окно --days 10.
+    Whitelist: docs/requirements_scan_inns.txt. Окно по умолчанию --days 10.
+
+    Важно: workers>1, мало раундов ретрая — иначе 172 ИНН не укладываются в лимит Celery
+    (раньше soft 6h + max_rounds=10 → TimeLimitExceeded / SIGKILL).
     """
     from django.core.management import call_command
 
@@ -189,10 +192,15 @@ def fetch_requirements_daily_task(self, days: int = 10):
         call_command(
             "fetch_requirements_all_companies",
             days=days,
+            workers=2,
+            retry_workers=1,
+            max_rounds=3,
+            round_sleep=45,
+            pressure_sleep=60,
             verbosity=1,
         )
         logger.info("[fetch_requirements_daily_task] done days=%s", days)
         return {"ok": True, "days": days}
-    except Exception as exc:
+    except Exception:
         logger.exception("[fetch_requirements_daily_task] failed")
-        raise self.retry(exc=exc)
+        raise

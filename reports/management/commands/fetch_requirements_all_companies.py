@@ -71,6 +71,22 @@ def is_resource_pressure_error(text: str) -> bool:
         )
     )
 
+
+def is_permanent_sbis_auth_error(text: str) -> bool:
+    """Ошибки, которые бессмысленно ретраить в том же прогоне (серт/регистрация)."""
+    t = (text or "").lower()
+    return any(
+        x in t
+        for x in (
+            "certificate invalid",
+            "no retry",
+            "регистрация клиента еще не завершилась",
+            "регистрация клиента ещё не завершилась",
+            "нет валидной подписи",
+            "нет сертификата",
+        )
+    )
+
 # Ключевые слова в названии документа для фильтра «похоже на требование ФНС»
 REQUIREMENT_KEYWORDS = (
     "требование",
@@ -258,6 +274,7 @@ def _process_one_cert(
     stats = {
         "skipped_no_kpp": 0,
         "list_error": 0,
+        "permanent_fail": 0,
         "docs_found": 0,
         "skipped_outside_window": 0,
         "skipped_no_stage": 0,
@@ -295,8 +312,13 @@ def _process_one_cert(
             stats["list_error"] = 1
             err = result.get("error") or {}
             msg = (err.get("message", str(result)) or "")[:120]
-            if is_resource_pressure_error(str(err) + " " + msg):
+            full_err = str(err) + " " + msg
+            if is_resource_pressure_error(full_err):
                 stats["resource_pressure"] = 1
+            elif is_permanent_sbis_auth_error(full_err):
+                # Не гоняем 10 раундов по мёртвому серту — помечаем день как «просмотрен»
+                stats["permanent_fail"] = 1
+                scan_eligible_for_cache = True
             if not quiet:
                 write_fn(f"      Ошибка СписокСлужебныхЭтапов: {msg}", "error")
             return stats
@@ -335,6 +357,26 @@ def _process_one_cert(
                 ),
                 None,
             )
+            # Показать все служебные этапы из ответа СБИС: что это и почему берём / нет
+            incoming_ids = {
+                (d.get("Идентификатор") or "").strip()
+                for d in incoming
+                if (d.get("Идентификатор") or "").strip()
+            }
+            for d in docs:
+                did = (d.get("Идентификатор") or "").strip()
+                title = (d.get("Название") or "").strip() or "(без названия)"
+                dtype = (d.get("Тип") or "").strip() or "—"
+                direction = (d.get("Направление") or "").strip() or "—"
+                if len(title) > 70:
+                    title = title[:70] + "..."
+                if did in incoming_ids:
+                    mark = "скачаем"
+                elif is_requirement_like(d):
+                    mark = "пропуск (дата вне окна)"
+                else:
+                    mark = "пропуск (не требование)"
+                write_fn(f"      · [{mark}] {direction} | {dtype} | {title}", None)
 
         # Обновить даты у уже существующих записей по данным из этого же ответа СБИС
         doc_id_to_date = {}
@@ -794,6 +836,7 @@ class Command(BaseCommand):
         stats = {
             "skipped_no_kpp": 0,
             "list_error": 0,
+            "permanent_fail": 0,
             "docs_found": 0,
             "skipped_outside_window": 0,
             "skipped_no_stage": 0,
@@ -880,7 +923,7 @@ class Command(BaseCommand):
                             if k in ("resource_pressure_hits", "skipped_cached"):
                                 continue
                             stats[k] += s.get(k, 0)
-                        if s.get("list_error") or s.get("fetch_error"):
+                        if (s.get("list_error") or s.get("fetch_error")) and not s.get("permanent_fail"):
                             round_failed_inns.add(inn)
                         if s.get("resource_pressure"):
                             handle_pressure(f"inn={inn}")
@@ -889,8 +932,11 @@ class Command(BaseCommand):
                     except Exception as e:
                         write_fn(f"  ИНН {inn}: исключение — {e}", "error")
                         stats["list_error"] += 1
-                        round_failed_inns.add(inn)
                         es = str(e)
+                        if is_permanent_sbis_auth_error(es):
+                            stats["permanent_fail"] = stats.get("permanent_fail", 0) + 1
+                        else:
+                            round_failed_inns.add(inn)
                         if is_resource_pressure_error(es):
                             handle_pressure(es[:80])
                     finally:
@@ -951,7 +997,7 @@ class Command(BaseCommand):
                                 if k in ("resource_pressure_hits", "skipped_cached"):
                                     continue
                                 stats[k] += s.get(k, 0)
-                            if s.get("list_error") or s.get("fetch_error"):
+                            if (s.get("list_error") or s.get("fetch_error")) and not s.get("permanent_fail"):
                                 round_failed_inns.add(inn)
                             if s.get("resource_pressure"):
                                 handle_pressure(f"inn={inn}")
@@ -962,8 +1008,11 @@ class Command(BaseCommand):
                         except Exception as e:
                             write_fn(f"  ИНН {inn}: исключение — {e}", "error")
                             stats["list_error"] += 1
-                            round_failed_inns.add(inn)
                             es = str(e)
+                            if is_permanent_sbis_auth_error(es):
+                                stats["permanent_fail"] = stats.get("permanent_fail", 0) + 1
+                            else:
+                                round_failed_inns.add(inn)
                             if is_resource_pressure_error(es):
                                 handle_pressure(es[:80])
                                 for fut, c2 in futures.items():
@@ -988,7 +1037,8 @@ class Command(BaseCommand):
         self.stdout.write(
             f"Готово. Пропущено по кэшу «уже сканировали сегодня»: {stats['skipped_cached']}, "
             f"пропущено (нет КПП): {stats['skipped_no_kpp']}, "
-            f"ошибки списка: {stats['list_error']}, "
+            f"ошибки списка: {stats['list_error']} "
+            f"(из них permanent/cert: {stats.get('permanent_fail', 0)}), "
             f"документов по ключевым словам: {stats['docs_found']}, "
             f"пропущено (дата док. вне окна --days): {stats['skipped_outside_window']}, "
             f"пропущено (нет этапа для скачивания): {stats['skipped_no_stage']}, "
