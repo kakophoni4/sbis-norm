@@ -63,7 +63,14 @@ def extract_our_org_from_nds_xml(xml_path: str) -> dict | None:
     except Exception:
         return None
 
-def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str, str]:
+def build_svedenia_from_xml(
+    xml_path: str,
+    *,
+    form_name: str | None = None,
+) -> tuple[dict, dict, str, str, str, str]:
+    """
+    form_name=None — поведение как раньше (имя формы НДС для send-nds-extra-1c).
+    """
     tree = ET.parse(xml_path)
     root = tree.getroot()
 
@@ -108,7 +115,7 @@ def build_svedenia_from_xml(xml_path: str) -> tuple[dict, dict, str, str, str, s
         "Ссылка": "",
         "Номер": "1",
         "Описание": {
-            "ИмяФормы": "Декларация по налогу на добавленную стоимость",
+            "ИмяФормы": form_name or "Декларация по налогу на добавленную стоимость",
             "КНДФормы": knd,
             "ВидДокумента": "Первичный",
             "НомерКорректировки": nom_korr,
@@ -187,7 +194,15 @@ def send_nds_extra(
     xml_path: str,
     sign_path: str | None = None,
     book_paths: list[str] | None = None,
+    *,
+    form_name: str | None = None,
+    doc_title_prefix: str | None = None,
 ) -> dict:
+    """
+    Боевой путь отправки ОтчетФНС (используется send-nds-extra-1c).
+    Опциональные form_name / doc_title_prefix — для send-report-1c;
+    при None поведение 1С-эндпоинта не меняется.
+    """
     if not os.path.exists(xml_path):
         return {"success": False, "error": {"message": f"Файл сведений не найден: {xml_path}"}}
 
@@ -220,7 +235,9 @@ def send_nds_extra(
         return {"success": False, "error": {"message": f"Ошибка аутентификации в СБИС: {e}"}}
 
     try:
-        sved, our_org, kod_no, po_mestu, guid, format_version = build_svedenia_from_xml(xml_path)
+        sved, our_org, kod_no, po_mestu, guid, format_version = build_svedenia_from_xml(
+            xml_path, form_name=form_name
+        )
     except Exception as e:
         return {"success": False, "error": {"message": f"Ошибка разбора XML: {e}"}}
 
@@ -268,8 +285,9 @@ def send_nds_extra(
         )
 
     file_name = os.path.basename(xml_path)
+    title_prefix = doc_title_prefix or "Доп.листы книги продаж"
     doc = {
-        "Название": f"Доп.листы книги продаж ({file_name})",
+        "Название": f"{title_prefix} ({file_name})",
         "Идентификатор": guid.lower() or uuid.uuid4().hex,
         "Тип": "ОтчетФНС",
         "ПодТип": subtype_nds,
@@ -308,41 +326,51 @@ def send_nds_extra(
     if not isinstance(data, dict) or not data.get("result") or not isinstance(data["result"], list) or not data["result"]:
         return {"success": False, "error": {"message": "Не удалось получить документ из ответа"}}
 
-    today_str = datetime.now().strftime("%d.%m.%Y")
-    list_body = {
-        "jsonrpc": "2.0",
-        "method": "СБИС.СписокДокументов",
-        "params": {
-            "Фильтр": {"Тип": "ОтчетФНС", "Направление": "Исходящий", "ДатаС": today_str, "ДатаПо": today_str}
-        },
-        "id": 1,
-    }
-
-    list_resp = _sbis_request(
-        "POST",
-        REPORTING_URL,
-        inn=inn,
-        headers=headers,
-        data=json.dumps(list_body, ensure_ascii=False),
-        timeout=30,
-    )
-
+    # Сначала ID из ответа ЗаписатьКомплект (надёжнее, чем искать в списке за день)
+    sbis_doc_id = None
     try:
-        list_data = list_resp.json()
-    except Exception as e:
-        return {"success": False, "error": {"message": f"Ошибка парсинга JSON: {e}", "raw": list_resp.text}}
+        sbis_doc_id = (data["result"][0].get("Идентификатор") or "").strip() or None
+    except Exception:
+        sbis_doc_id = None
 
-    if not list_data.get("result") or not list_data["result"].get("Документ"):
-        return {"success": False, "error": {"message": "Не удалось получить документ из исходящей почты"}}
+    if not sbis_doc_id:
+        today_str = datetime.now().strftime("%d.%m.%Y")
+        list_body = {
+            "jsonrpc": "2.0",
+            "method": "СБИС.СписокДокументов",
+            "params": {
+                "Фильтр": {"Тип": "ОтчетФНС", "Направление": "Исходящий", "ДатаС": today_str, "ДатаПо": today_str}
+            },
+            "id": 1,
+        }
 
-    logger.info(f"Найденные документы: {list_data['result']['Документ']}")
-    for d in list_data["result"]["Документ"]:
-        logger.info(f"Документ: {d.get('Идентификатор')}, Статус: {d.get('Статус', 'N/A')}")
+        list_resp = _sbis_request(
+            "POST",
+            REPORTING_URL,
+            inn=inn,
+            headers=headers,
+            data=json.dumps(list_body, ensure_ascii=False),
+            timeout=30,
+        )
 
-    docs = [d for d in list_data["result"]["Документ"] if d.get("Статус") not in ["Отправлен", "Обработан"]]
-    if not docs:
-        return {"success": False, "error": {"message": "Нет подходящих документов для отправки"}}
-    sbis_doc_id = docs[0]["Идентификатор"]
+        try:
+            list_data = list_resp.json()
+        except Exception as e:
+            return {"success": False, "error": {"message": f"Ошибка парсинга JSON: {e}", "raw": list_resp.text}}
+
+        if not list_data.get("result") or not list_data["result"].get("Документ"):
+            return {"success": False, "error": {"message": "Не удалось получить документ из исходящей почты"}}
+
+        logger.info(f"Найденные документы: {list_data['result']['Документ']}")
+        for d in list_data["result"]["Документ"]:
+            logger.info(f"Документ: {d.get('Идентификатор')}, Статус: {d.get('Статус', 'N/A')}")
+
+        docs = [d for d in list_data["result"]["Документ"] if d.get("Статус") not in ["Отправлен", "Обработан"]]
+        if not docs:
+            return {"success": False, "error": {"message": "Нет подходящих документов для отправки"}}
+        sbis_doc_id = docs[0]["Идентификатор"]
+    else:
+        logger.info("Используем Идентификатор из ЗаписатьКомплект: %s", sbis_doc_id)
 
     prep_body = {
         "jsonrpc": "2.0",
