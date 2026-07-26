@@ -178,7 +178,24 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.SUCCESS("  dry_run OK"))
                 continue
 
-            result = send_report(inn=inn, xml_path=str(xml_path), report_type=rtype)
+            try:
+                result = send_report(inn=inn, xml_path=str(xml_path), report_type=rtype)
+            except Exception as e:
+                msg = str(e)
+                # Частые бизнес-ошибки СБИС (биллинг) — не traceback
+                if any(
+                    x in msg
+                    for x in (
+                        "нет лицензии",
+                        "отправляете отчеты в долг",
+                        "в долг",
+                    )
+                ):
+                    result = {"success": False, "error": {"message": msg}}
+                else:
+                    result = {"success": False, "error": {"message": msg}}
+                self.stdout.write(self.style.ERROR(f"  FAIL exception: {msg[:300]}"))
+
             ok = bool(isinstance(result, dict) and result.get("success"))
             send_meta = {}
             if ok:
@@ -186,6 +203,7 @@ class Command(BaseCommand):
 
                 send_meta = _extract_send_meta_from_exec(result.get("result") or {})
 
+            err = None if ok else (result.get("error") if isinstance(result, dict) else str(result))
             row = {
                 "file": str(xml_path),
                 "org_folder": org,
@@ -194,7 +212,7 @@ class Command(BaseCommand):
                 "knd": meta["knd"],
                 "ok": ok,
                 "send_meta": send_meta,
-                "error": None if ok else (result.get("error") if isinstance(result, dict) else str(result)),
+                "error": err,
             }
             results.append(row)
             if ok:
