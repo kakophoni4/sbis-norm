@@ -7,6 +7,7 @@ from reports.api.views.nds import (
     SendNdsExtra1CView,
     SendNdsExtraView,
 )
+from reports.api.views.reports import SendReport1CView
 from reports.api.views.requirements import (
     RequirementDetailView,
     RequirementFileView,
@@ -19,6 +20,7 @@ urlpatterns = [
     path("sbis/mail", sbis_mail_view, name="sbis_mail"),
     path("sbis/send-nds-extra/", SendNdsExtraView.as_view(), name="send_nds_extra"),
     path("sbis/send-nds-extra-1c/", SendNdsExtra1CView.as_view(), name="send_nds_extra_1c"),
+    path("sbis/send-report-1c/", SendReport1CView.as_view(), name="send_report_1c"),
     path("sbis/get-receipt-pdf-1c/", GetReceiptPdfFromArchive1CView.as_view(), name="get_receipt_pdf_1c"),
     path("sbis/get-sales-book-extract/", GetSalesBookExtractView.as_view(), name="get_sales_book_extract"),
     path("sbis/requirements/", RequirementsListView.as_view(), name="requirements_list"),
