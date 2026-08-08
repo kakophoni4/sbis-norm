@@ -31,9 +31,18 @@ class MailCacheAdmin(admin.ModelAdmin):
 
 @admin.register(RequirementDocument)
 class RequirementDocumentAdmin(admin.ModelAdmin):
-    list_display = ("inn", "document_date", "sbis_doc_id", "doc_title", "created_at", "external_synced_at")
-    search_fields = ("inn", "sbis_doc_id", "doc_title")
-    list_filter = ("document_date",)
+    list_display = (
+        "inn",
+        "document_date",
+        "response_due_date",
+        "reply_status",
+        "sbis_doc_id",
+        "doc_title",
+        "created_at",
+        "external_synced_at",
+    )
+    search_fields = ("inn", "sbis_doc_id", "doc_title", "knd")
+    list_filter = ("document_date", "reply_status", "response_due_date")
 
 
 @admin.register(RequirementFetchScanState)

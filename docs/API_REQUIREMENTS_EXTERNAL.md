@@ -3,8 +3,8 @@
 Базовый URL: `http://<host>:8000/api/`  
 Content-Type: `application/json`
 
-Этот сервис **сам** забирает требования из СБИС (сканер 17:00 МСК), сохраняет в БД и отдаёт наружу по HTTP.  
-Внешняя система только **читает** и помечает «забрано».
+Этот сервис **сам** забирает требования из СБИС (сканер 17:00 МСК), сохраняет в БД (в т.ч. сроки ответа) и отдаёт наружу по HTTP.  
+Внешняя система **читает**, помечает «забрано» и может **отправить ответ** (комплект документов) обратно в СБИС.
 
 ---
 
@@ -14,12 +14,13 @@ Content-Type: `application/json`
 СБИС / ФНС
     │
     ▼  Celery 17:00 МСК (whitelist лавки+новые, окно 10 дней)
-sbis-norm: RequirementDocument (file_b64 + meta)
+sbis-norm: RequirementDocument (file_b64 + meta + due dates)
     │
-    ├─ pull:  GET /api/sbis/requirements/ …
-    ├─ meta:  GET /api/sbis/requirements/<id>/          (без файла)
-    ├─ file:  GET /api/sbis/requirements/<id>/file/     (сырые байты PDF)
-    └─ ack:   POST /api/sbis/requirements/mark-synced/
+    ├─ pull:   GET /api/sbis/requirements/ …
+    ├─ meta:   GET /api/sbis/requirements/<id>/          (без файла)
+    ├─ file:   GET /api/sbis/requirements/<id>/file/     (сырые байты PDF)
+    ├─ reply:  POST /api/sbis/requirements/<id>/reply/   (ответ в СБИС)
+    └─ ack:    POST /api/sbis/requirements/mark-synced/
     │
     ▼
 ваш сервис (CRM / архив / 1С / …)
@@ -95,12 +96,28 @@ GET /api/sbis/requirements/?unsynced=1&limit=50
       "storage_file_name": "Требование ФНС (9707039440) (2026-07-06).pdf",
       "created_at": "2026-07-10T14:22:01.123456+00:00",
       "external_synced_at": null,
+      "response_due_date": "2026-07-20",
+      "receipt_due_date": "2026-07-14",
+      "knd": "1165013",
+      "reply_status": "none",
+      "reply_sbis_doc_id": null,
+      "replied_at": null,
+      "reply_error": null,
       "file_size": 184320,
-      "file_url": "/api/sbis/requirements/12/file/"
+      "file_url": "/api/sbis/requirements/12/file/",
+      "reply_url": "/api/sbis/requirements/12/reply/"
     }
   ]
 }
 ```
+
+| Поле | Описание |
+|------|----------|
+| `response_due_date` | крайний срок ответа по существу (из XML требования; может быть `null` если только PDF) |
+| `receipt_due_date` | срок квитанции о приёме (`document_date` + 6 рабочих дней) |
+| `knd` | КНД из XML, если удалось вытащить |
+| `reply_status` | `none` / `sent` / `error` |
+| `reply_sbis_doc_id` | ID исходящего ответа в СБИС после успешного reply |
 
 `file_size` — оценка размера бинарника в байтах (из длины base64).  
 В list по умолчанию **нет** `file_b64`. Файл — только через `/file/`.
@@ -178,6 +195,67 @@ file /tmp/r5.pdf
 После этого эти id **не** попадут в `?unsynced=1`.
 
 Идемпотентность: повторный mark на тех же id просто обновит `external_synced_at`.
+
+---
+
+## 4. Ответ на требование (комплект документов в СБИС)
+
+`POST /api/sbis/requirements/<id>/reply/`
+
+Отправляет вложения как `ПредставлениеФНС` с `Расширение.ИдентификаторКомплекта = sbis_doc_id` требования  
+(ЗаписатьКомплект → ПодготовитьДействие → подпись → ВыполнитьДействие).
+
+### Тело
+
+```json
+{
+  "attachments": [
+    { "filename": "invoice.pdf", "content_b64": "<base64>" },
+    { "filename": "act.pdf", "content_b64": "<base64>" }
+  ],
+  "dry_run": false
+}
+```
+
+| Поле | Обязательно | Описание |
+|------|-------------|----------|
+| `attachments` | да | массив `{filename, content_b64}` (алиасы: `files`, `b64` / `file_b64`) |
+| `dry_run` | нет | `true` — только проверка вложений, без отправки в СБИС |
+
+### Успех 200
+
+```json
+{
+  "success": true,
+  "send_meta": {
+    "reply_sbis_doc_id": "...",
+    "requirement_sbis_doc_id": "...",
+    "sent_at": "2026-08-08T12:00:00",
+    "sent_date": "2026-08-08",
+    "filenames": ["invoice.pdf", "act.pdf"]
+  }
+}
+```
+
+В БД: `reply_status=sent`, `reply_sbis_doc_id`, `replied_at`.
+
+### Ошибки
+
+| HTTP | Смысл |
+|------|--------|
+| 400 | нет вложений / ошибка СБИС |
+| 401 | нет валидной подписи (csptest) |
+| 403 | нет сертификата по ИНН |
+| 404 | нет записи требования |
+
+### Пример curl (dry_run)
+
+```bash
+curl -sS -X POST "http://127.0.0.1:8000/api/sbis/requirements/12/reply/" \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $REQUIREMENTS_API_TOKEN" \
+  -d '{"attachments":[{"filename":"doc.pdf","content_b64":"'"$B64"'"}],"dry_run":true}'
+```
 
 ---
 

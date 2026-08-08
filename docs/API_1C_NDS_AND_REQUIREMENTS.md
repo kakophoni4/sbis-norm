@@ -107,6 +107,51 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 }
 ```
 
+Строки раздела 9 из XML архива. Для **PDF подписанной книги** — следующий метод.
+
+---
+
+## 3b. PDF подписанной книги продаж
+
+`POST /api/sbis/get-sales-book-pdf/`
+
+Скачивает архив исходящего `ОтчетФНС` и достаёт PDF книги продаж из папки `PDF/` (обычно `NO_NDS.9*`).
+
+```json
+{
+  "inn": "9707039440",
+  "date_from": "01.01.2025",
+  "date_to": "31.12.2025",
+  "sbis_doc_id": "",
+  "only_accepted": true
+}
+```
+
+| Поле | Обязательно | Описание |
+|------|-------------|----------|
+| `inn` | да | ИНН организации (ЭЦП/сессия СБИС) |
+| `date_from` / `date_to` | нет | период (`DD.MM.YYYY` или `YYYY-MM-DD`) |
+| `sbis_doc_id` | нет | конкретный отчёт; иначе поиск по периоду |
+| `only_accepted` | нет | `true` — только документы со статусом «принят/сдан/доставлен» |
+
+### Успех (один документ)
+
+```json
+{
+  "success": true,
+  "result": {
+    "inn": "9707039440",
+    "sbis_doc_id": "...",
+    "doc_name": "...",
+    "state": {"code": "...", "name": "..."},
+    "pdf_filename": "NO_NDS.9_....pdf",
+    "pdf_b64": "..."
+  }
+}
+```
+
+Если без `sbis_doc_id` найдено несколько — в `result.documents[]` список с `pdf_b64` у каждого.
+
 ---
 
 ## 4. Загрузка организаций в 1С (обратный поток: мы → mole 1С)
@@ -138,7 +183,8 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 
 ### Хранение
 
-Таблица `RequirementDocument`: ИНН, дата, `sbis_doc_id`, title, sha256, **`file_b64`** (PDF/XML), `storage_file_name`, `created_at`, `external_synced_at` (когда забрал внешний сервис).
+Таблица `RequirementDocument`: ИНН, дата, `sbis_doc_id`, title, sha256, **`file_b64`** (PDF/XML), `storage_file_name`, `created_at`, `external_synced_at`,  
+плюс `response_due_date` / `receipt_due_date` / `knd` / `reply_status` / `reply_sbis_doc_id`.
 
 ### REST для внешнего сервиса
 
@@ -149,13 +195,15 @@ curl -sS -X POST "http://127.0.0.1:8000/api/sbis/send-nds-extra-1c/" \
 GET /api/sbis/requirements/?unsynced=1&limit=50
 GET /api/sbis/requirements/?inn=9707039440&date_from=2026-06-01&include_file=0
 GET /api/sbis/requirements/123/
+GET /api/sbis/requirements/123/file/
+POST /api/sbis/requirements/123/reply/
 POST /api/sbis/requirements/mark-synced/
 Content-Type: application/json
 
 {"ids": [123, 124]}
 ```
 
-Ответ list (без файла по умолчанию):
+Ответ list (без файла по умолчанию) включает сроки и статус ответа:
 
 ```json
 {
@@ -164,15 +212,27 @@ Content-Type: application/json
     "id": 123,
     "inn": "9707039440",
     "document_date": "2026-07-06",
+    "response_due_date": "2026-07-20",
+    "receipt_due_date": "2026-07-14",
+    "knd": "1165013",
+    "reply_status": "none",
     "sbis_doc_id": "...",
     "doc_title": "Требование ФНС",
     "content_sha256": "...",
     "storage_file_name": "Требование ФНС (9707039440) (2026-07-06).pdf",
     "created_at": "...",
     "external_synced_at": null,
-    "file_size": 12345
+    "file_size": 12345,
+    "reply_url": "/api/sbis/requirements/123/reply/"
   }]
 }
+```
+
+Ответ на требование:
+
+```http
+POST /api/sbis/requirements/123/reply/
+{"attachments":[{"filename":"doc.pdf","content_b64":"..."}],"dry_run":false}
 ```
 
 Detail (`GET .../123/`) добавляет `file_b64`.

@@ -4,6 +4,7 @@ from reports.api.views.mail import MailLookupView, sbis_mail_view
 from reports.api.views.nds import (
     GetReceiptPdfFromArchive1CView,
     GetSalesBookExtractView,
+    GetSalesBookPdfView,
     SendNdsExtra1CView,
     SendNdsExtraView,
 )
@@ -11,6 +12,7 @@ from reports.api.views.reports import SendReport1CView
 from reports.api.views.requirements import (
     RequirementDetailView,
     RequirementFileView,
+    RequirementReplyView,
     RequirementsListView,
     RequirementsMarkSyncedView,
 )
@@ -23,8 +25,10 @@ urlpatterns = [
     path("sbis/send-report-1c/", SendReport1CView.as_view(), name="send_report_1c"),
     path("sbis/get-receipt-pdf-1c/", GetReceiptPdfFromArchive1CView.as_view(), name="get_receipt_pdf_1c"),
     path("sbis/get-sales-book-extract/", GetSalesBookExtractView.as_view(), name="get_sales_book_extract"),
+    path("sbis/get-sales-book-pdf/", GetSalesBookPdfView.as_view(), name="get_sales_book_pdf"),
     path("sbis/requirements/", RequirementsListView.as_view(), name="requirements_list"),
     path("sbis/requirements/mark-synced/", RequirementsMarkSyncedView.as_view(), name="requirements_mark_synced"),
     path("sbis/requirements/<int:pk>/file/", RequirementFileView.as_view(), name="requirements_file"),
+    path("sbis/requirements/<int:pk>/reply/", RequirementReplyView.as_view(), name="requirements_reply"),
     path("sbis/requirements/<int:pk>/", RequirementDetailView.as_view(), name="requirements_detail"),
 ]

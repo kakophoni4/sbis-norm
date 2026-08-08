@@ -146,3 +146,44 @@ app.env
 secrets.txt
 *.pem
 *.key
+
+# --- Ops / local scratch (не в git) ---
+# одноразовые скрипты и дампы в корне
+_*.py
+_*.json
+_*.txt
+_*.tsv
+_*.xlsx
+full_picture.py
+full_picture_result.json
+dl_*.py
+send_030826.py
+check_030826.py
+inspect_030826.py
+extract_crm_inns.py
+*.save
+der
+
+# архивы / выгрузки / Excel рядом с кодом
+*.zip
+*.xlsx
+*.tgz
+*.tar.gz
+03.08.26.zip
+signatures_valid_latest.zip
+linux-amd64_deb.tgz
+linux-amd64_deb/
+kplast_all_pdfs/
+kv_iv_*/
+123/
+media/
+
+# временные папки отчётов / CRM
+КОМПАНИИ В СРМ.xlsx
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db

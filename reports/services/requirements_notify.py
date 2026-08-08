@@ -21,11 +21,16 @@ def _serialize_for_webhook(doc) -> dict:
         "doc_title": getattr(doc, "doc_title", None),
         "content_sha256": getattr(doc, "content_sha256", None),
         "storage_file_name": getattr(doc, "storage_file_name", None),
+        "response_due_date": str(getattr(doc, "response_due_date", "") or "") or None,
+        "receipt_due_date": str(getattr(doc, "receipt_due_date", "") or "") or None,
+        "knd": getattr(doc, "knd", None),
+        "reply_status": getattr(doc, "reply_status", None),
         "created_at": getattr(doc, "created_at", None).isoformat()
         if getattr(doc, "created_at", None)
         else None,
         # файл не шлём в webhook по умолчанию — внешний сервис тянет GET /requirements/<id>/
         "file_url_hint": f"/api/sbis/requirements/{getattr(doc, 'id', '')}/",
+        "reply_url_hint": f"/api/sbis/requirements/{getattr(doc, 'id', '')}/reply/",
     }
 
 

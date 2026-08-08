@@ -42,6 +42,7 @@ from django.utils import timezone
 
 from reports.models import Certificate, Organization, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
+from reports.services.requirement_deadline import extract_deadlines_from_content
 from reports.services.requirements_notify import notify_requirement_saved
 from reports.services.requirements_scan_scope import get_requirements_scan_inns
 from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
@@ -502,10 +503,26 @@ def _process_one_cert(
                 continue
 
             raw_bytes = base64.b64decode(b64)
+            packed_for_deadline = raw_bytes
             raw_bytes, ext = unpack_zip_and_pick_file(raw_bytes)
             b64 = base64.b64encode(raw_bytes).decode("ascii")
             content_sha256 = hashlib.sha256(raw_bytes).hexdigest()
             storage_file_name = f"Требование ФНС ({inn}) ({document_date}){ext}"
+
+            extra_xml: list[bytes] = []
+            for att in ((fetch.get("result") or {}).get("attachments_all") or []):
+                ab64 = (att.get("b64") or "").strip()
+                if not ab64:
+                    continue
+                try:
+                    extra_xml.append(base64.b64decode(ab64))
+                except Exception:
+                    continue
+            deadlines = extract_deadlines_from_content(
+                packed_for_deadline,
+                document_date=document_date,
+                extra_xml_list=extra_xml + [raw_bytes],
+            )
 
             if RequirementDocument.objects.filter(
                 inn=inn,
@@ -528,6 +545,9 @@ def _process_one_cert(
                         content_sha256=content_sha256,
                         file_b64=b64,
                         storage_file_name=storage_file_name,
+                        response_due_date=deadlines.get("response_due_date"),
+                        receipt_due_date=deadlines.get("receipt_due_date"),
+                        knd=deadlines.get("knd"),
                     )
                 try:
                     notify_requirement_saved(obj)

@@ -77,6 +77,15 @@ class CertificateAuditLog(models.Model):
 
 
 class RequirementDocument(models.Model):
+    REPLY_STATUS_NONE = "none"
+    REPLY_STATUS_SENT = "sent"
+    REPLY_STATUS_ERROR = "error"
+    REPLY_STATUS_CHOICES = (
+        (REPLY_STATUS_NONE, "Нет ответа"),
+        (REPLY_STATUS_SENT, "Отправлен"),
+        (REPLY_STATUS_ERROR, "Ошибка"),
+    )
+
     inn = models.CharField(max_length=12, db_index=True, verbose_name="ИНН")
     document_date = models.DateField(verbose_name="Дата документа")
     sbis_doc_id = models.CharField(max_length=255, db_index=True, verbose_name="Идентификатор документа в СБИС")
@@ -92,6 +101,33 @@ class RequirementDocument(models.Model):
         db_index=True,
         verbose_name="Забрано внешним сервисом",
     )
+    response_due_date = models.DateField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Крайний срок ответа",
+    )
+    receipt_due_date = models.DateField(
+        null=True,
+        blank=True,
+        verbose_name="Срок квитанции о приёме",
+    )
+    knd = models.CharField(max_length=20, blank=True, null=True, verbose_name="КНД")
+    reply_status = models.CharField(
+        max_length=16,
+        choices=REPLY_STATUS_CHOICES,
+        default=REPLY_STATUS_NONE,
+        db_index=True,
+        verbose_name="Статус ответа",
+    )
+    reply_sbis_doc_id = models.CharField(
+        max_length=255,
+        blank=True,
+        null=True,
+        verbose_name="ID ответа в СБИС",
+    )
+    replied_at = models.DateTimeField(null=True, blank=True, verbose_name="Ответ отправлен")
+    reply_error = models.TextField(blank=True, null=True, verbose_name="Ошибка ответа")
 
     class Meta:
         verbose_name = "Требование (документ ФНС)"

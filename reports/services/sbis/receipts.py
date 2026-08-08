@@ -474,3 +474,267 @@ def fetch_sales_book_extract_by_counterparty(
             "documents": matched_docs,
         },
     }
+
+
+def _normalize_sbis_date(value: str | None) -> str | None:
+    """YYYY-MM-DD или DD.MM.YYYY → DD.MM.YYYY для фильтра СБИС."""
+    s = (value or "").strip()
+    if not s:
+        return None
+    if re.match(r"^\d{2}\.\d{2}\.\d{4}$", s):
+        return s
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").strftime("%d.%m.%Y")
+        except ValueError:
+            return s
+    return s
+
+
+def _doc_state_info(doc: dict) -> dict:
+    state = doc.get("Состояние") if isinstance(doc.get("Состояние"), dict) else {}
+    return {
+        "code": str(state.get("Код") or "").strip(),
+        "name": str(state.get("Название") or "").strip(),
+        "description": str(state.get("Описание") or "").strip(),
+    }
+
+
+def _is_accepted_fns_state(state: dict) -> bool:
+    """Эвристика: документ принят/сдан/доставлен в ФНС."""
+    blob = " ".join(
+        [
+            str(state.get("code") or ""),
+            str(state.get("name") or ""),
+            str(state.get("description") or ""),
+        ]
+    ).lower()
+    if not blob.strip():
+        return False
+    reject_hints = ("отказ", "ошибк", "аннулир", "не принят", "отклон")
+    if any(h in blob for h in reject_hints):
+        return False
+    accept_hints = ("принят", "сдан", "доставлен", "заверш", "выполнен", "обработан", "успеш")
+    return any(h in blob for h in accept_hints)
+
+
+def _extract_sales_book_pdf_from_zip(zip_bytes: bytes) -> tuple[bytes, str]:
+    """
+    PDF книги продаж из папки PDF/ архива СБИС.
+    Предпочтение: NO_NDS.9* → имя с «продаж»/КнПрод → единственный кандидат.
+    """
+    zf = zipfile.ZipFile(io.BytesIO(zip_bytes))
+    names = [n for n in zf.namelist() if n.lower().endswith(".pdf")]
+    pdf_dir = [n for n in names if n.replace("\\", "/").startswith("PDF/") or "/PDF/" in n.replace("\\", "/")]
+    pool = pdf_dir or names
+    if not pool:
+        raise RuntimeError(f"В архиве нет PDF. files={zf.namelist()[:40]}")
+
+    def score(name: str) -> int:
+        base = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        if "no_nds.9" in base or base.startswith("no_nds.9"):
+            return 100
+        if ".9_" in base or base.startswith("no_nds.9"):
+            return 90
+        if "продаж" in base or "knprod" in base or "кнпрод" in base:
+            return 80
+        if "разд9" in base or "razd9" in base:
+            return 70
+        return 0
+
+    ranked = sorted(pool, key=lambda n: (-score(n), n.lower()))
+    best = ranked[0]
+    best_score = score(best)
+    if best_score == 0:
+        # несколько PDF без явных признаков — не угадываем
+        if len(pool) != 1:
+            raise RuntimeError(
+                "Не удалось однозначно выбрать PDF книги продаж. "
+                f"candidates={pool[:20]}"
+            )
+    ties = [n for n in ranked if score(n) == best_score and best_score > 0]
+    if len(ties) > 1 and best_score < 100:
+        # несколько «продаж» без NO_NDS.9 — ошибка
+        nine = [n for n in ties if "no_nds.9" in n.replace("\\", "/").rsplit("/", 1)[-1].lower()]
+        if len(nine) == 1:
+            best = nine[0]
+        elif len(nine) > 1:
+            raise RuntimeError(f"Несколько PDF NO_NDS.9: {nine[:10]}")
+        else:
+            raise RuntimeError(f"Несколько кандидатов книги продаж: {ties[:10]}")
+
+    return zf.read(best), best.replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def fetch_sales_book_pdf(
+    inn: str,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    sbis_doc_id: str | None = None,
+    only_accepted: bool = False,
+    max_docs: int = 30,
+    rpc_timeout_sec: int = 25,
+    rpc_budget_sec: int = 30,
+    archive_timeout_sec: int = 20,
+    archive_budget_sec: int = 25,
+    auth_timeout_sec: int = 14,
+    auth_budget_sec: int = 20,
+    proxy_prewarm_count: int = 6,
+) -> dict:
+    """
+    Скачать подписанный PDF книги продаж из архива исходящего ОтчетФНС.
+    """
+    inn = (inn or "").strip()
+    sbis_doc_id = (sbis_doc_id or "").strip() or None
+    if not inn:
+        return {"success": False, "error": {"message": "inn обязателен"}}
+
+    today = datetime.now()
+    date_to = _normalize_sbis_date(date_to) or today.strftime("%d.%m.%Y")
+    date_from = _normalize_sbis_date(date_from) or (today - timedelta(days=120)).strftime("%d.%m.%Y")
+
+    auth = sbis_auth_session_for_inn(
+        inn,
+        prewarm_proxies=True,
+        proxy_want=max(2, int(proxy_prewarm_count)),
+        proxy_warmup_budget_sec=max(8, int(auth_budget_sec)),
+        auth_timeout_sec=max(8, int(auth_timeout_sec)),
+        auth_budget_sec=max(12, int(auth_budget_sec)),
+    )
+    if not auth.get("success"):
+        return auth
+
+    session_id = (((auth.get("result") or {}).get("session_id")) or "").strip()
+    if not session_id:
+        return {"success": False, "error": {"message": "Не удалось получить session_id", "inn": inn}}
+
+    list_filter = {
+        "Тип": "ОтчетФНС",
+        "Направление": "Исходящий",
+        "ДатаС": date_from,
+        "ДатаПо": date_to,
+        "Навигация": {"РазмерСтраницы": str(int(max_docs))},
+    }
+    try:
+        data = sbis_rpc(
+            inn=inn,
+            session_id=session_id,
+            method="СБИС.СписокДокументов",
+            params={"Фильтр": list_filter},
+            timeout=max(8, int(rpc_timeout_sec)),
+            total_budget_sec=max(12, int(rpc_budget_sec)),
+        )
+    except Exception as e:
+        return {"success": False, "error": {"message": f"Ошибка СБИС.СписокДокументов: {e}", "inn": inn}}
+
+    if data.get("error"):
+        return {"success": False, "error": {"message": f"СБИС error: {data['error']}", "inn": inn}}
+
+    docs = (((data.get("result") or {}).get("Документ")) or [])
+    if sbis_doc_id:
+        docs = [d for d in docs if (d.get("Идентификатор") or "").strip() == sbis_doc_id]
+
+    found: list[dict] = []
+    scanned = 0
+    for doc in docs:
+        if scanned >= max_docs:
+            break
+        scanned += 1
+        doc_id = (doc.get("Идентификатор") or "").strip()
+        state = _doc_state_info(doc)
+        if only_accepted and not _is_accepted_fns_state(state):
+            logger.info(
+                "sales_book_pdf skip non-accepted inn=%s doc=%s state=%s",
+                inn,
+                doc_id[:36],
+                state,
+            )
+            continue
+        archive_url = (doc.get("СсылкаНаАрхив") or "").strip()
+        if not archive_url:
+            continue
+        try:
+            zip_bytes = _download_archive_zip(
+                inn=inn,
+                session_id=session_id,
+                archive_url=archive_url,
+                timeout=max(8, int(archive_timeout_sec)),
+                total_budget_sec=max(12, int(archive_budget_sec)),
+            )
+            pdf_bytes, pdf_name = _extract_sales_book_pdf_from_zip(zip_bytes)
+        except Exception as e:
+            found.append(
+                {
+                    "sbis_doc_id": doc_id,
+                    "doc_name": doc.get("Название"),
+                    "state": state,
+                    "ok": False,
+                    "error": str(e),
+                }
+            )
+            continue
+        found.append(
+            {
+                "sbis_doc_id": doc_id,
+                "doc_name": doc.get("Название"),
+                "state": state,
+                "ok": True,
+                "pdf_filename": pdf_name,
+                "pdf_b64": base64.b64encode(pdf_bytes).decode("ascii"),
+                "archive_url": archive_url,
+            }
+        )
+
+    ok_docs = [x for x in found if x.get("ok")]
+    if not ok_docs:
+        return {
+            "success": False,
+            "error": {
+                "message": "PDF книги продаж не найден",
+                "inn": inn,
+                "period": {"from": date_from, "to": date_to},
+                "only_accepted": bool(only_accepted),
+                "scanned_docs": scanned,
+                "attempts": found,
+            },
+        }
+
+    # один конкретный doc_id или единственный успешный — плоский result; иначе список
+    if sbis_doc_id or len(ok_docs) == 1:
+        one = ok_docs[0]
+        return {
+            "success": True,
+            "result": {
+                "inn": inn,
+                "period": {"from": date_from, "to": date_to},
+                "only_accepted": bool(only_accepted),
+                "sbis_doc_id": one["sbis_doc_id"],
+                "doc_name": one.get("doc_name"),
+                "state": one.get("state"),
+                "pdf_filename": one.get("pdf_filename"),
+                "pdf_b64": one.get("pdf_b64"),
+                "archive_url": one.get("archive_url"),
+                "matched_count": len(ok_docs),
+            },
+        }
+
+    return {
+        "success": True,
+        "result": {
+            "inn": inn,
+            "period": {"from": date_from, "to": date_to},
+            "only_accepted": bool(only_accepted),
+            "matched_count": len(ok_docs),
+            "documents": [
+                {
+                    "sbis_doc_id": x["sbis_doc_id"],
+                    "doc_name": x.get("doc_name"),
+                    "state": x.get("state"),
+                    "pdf_filename": x.get("pdf_filename"),
+                    "pdf_b64": x.get("pdf_b64"),
+                }
+                for x in ok_docs
+            ],
+        },
+    }

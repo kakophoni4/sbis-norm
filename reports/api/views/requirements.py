@@ -16,6 +16,7 @@ from rest_framework.views import APIView
 
 from reports.models import RequirementDocument
 from reports.requirement_file_sniff import guess_requirement_extension
+from reports.services.sbis import send_requirement_reply
 
 logger = logging.getLogger(__name__)
 
@@ -86,8 +87,16 @@ def _serialize_requirement(doc: RequirementDocument, *, include_file: bool = Fal
         "storage_file_name": doc.storage_file_name,
         "created_at": doc.created_at.isoformat() if doc.created_at else None,
         "external_synced_at": doc.external_synced_at.isoformat() if doc.external_synced_at else None,
+        "response_due_date": doc.response_due_date.isoformat() if doc.response_due_date else None,
+        "receipt_due_date": doc.receipt_due_date.isoformat() if doc.receipt_due_date else None,
+        "knd": doc.knd,
+        "reply_status": doc.reply_status or RequirementDocument.REPLY_STATUS_NONE,
+        "reply_sbis_doc_id": doc.reply_sbis_doc_id,
+        "replied_at": doc.replied_at.isoformat() if doc.replied_at else None,
+        "reply_error": doc.reply_error,
         "file_size": len(doc.file_b64 or "") * 3 // 4 if doc.file_b64 else 0,
         "file_url": f"/api/sbis/requirements/{doc.id}/file/",
+        "reply_url": f"/api/sbis/requirements/{doc.id}/reply/",
     }
     if include_file:
         data["file_b64"] = doc.file_b64 or ""
@@ -234,3 +243,78 @@ class RequirementsMarkSyncedView(APIView):
         now = timezone.now()
         updated = RequirementDocument.objects.filter(id__in=clean_ids).update(external_synced_at=now)
         return Response({"updated": updated, "synced_at": now.isoformat()})
+
+
+class RequirementReplyView(APIView):
+    """
+    POST /api/sbis/requirements/<id>/reply/
+    body: {"attachments": [{"filename": "...", "content_b64": "..."}], "dry_run": false}
+    """
+
+    permission_classes = []
+
+    def post(self, request, pk: int, *args, **kwargs):
+        denied = _check_requirements_api_token(request)
+        if denied:
+            return denied
+
+        doc = RequirementDocument.objects.filter(pk=pk).first()
+        if not doc:
+            return Response({"detail": "not found"}, status=status.HTTP_404_NOT_FOUND)
+
+        attachments = request.data.get("attachments") or request.data.get("files") or []
+        if not isinstance(attachments, list):
+            return Response(
+                {"success": False, "error": {"message": "attachments должен быть массивом"}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        dry_run_raw = request.data.get("dry_run", False)
+        if isinstance(dry_run_raw, str):
+            dry_run = dry_run_raw.strip().lower() in ("1", "true", "yes")
+        else:
+            dry_run = bool(dry_run_raw)
+
+        result = send_requirement_reply(
+            inn=doc.inn,
+            requirement_sbis_doc_id=doc.sbis_doc_id,
+            attachments=attachments,
+            dry_run=dry_run,
+        )
+
+        if dry_run:
+            code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+            return Response(result, status=code)
+
+        now = timezone.now()
+        if result.get("success"):
+            send_meta = result.get("send_meta") or {}
+            doc.reply_status = RequirementDocument.REPLY_STATUS_SENT
+            doc.reply_sbis_doc_id = send_meta.get("reply_sbis_doc_id") or result.get("reply_sbis_doc_id")
+            doc.replied_at = now
+            doc.reply_error = None
+            doc.save(
+                update_fields=[
+                    "reply_status",
+                    "reply_sbis_doc_id",
+                    "replied_at",
+                    "reply_error",
+                ]
+            )
+            return Response(result, status=status.HTTP_200_OK)
+
+        err = result.get("error") or {}
+        err_msg = str(err.get("message") or err)[:2000]
+        doc.reply_status = RequirementDocument.REPLY_STATUS_ERROR
+        doc.reply_error = err_msg
+        if result.get("reply_sbis_doc_id"):
+            doc.reply_sbis_doc_id = result.get("reply_sbis_doc_id")
+        doc.save(update_fields=["reply_status", "reply_error", "reply_sbis_doc_id"])
+
+        hint = result.get("http_hint")
+        if hint == 401:
+            code = status.HTTP_401_UNAUTHORIZED
+        elif hint == 403:
+            code = status.HTTP_403_FORBIDDEN
+        else:
+            code = status.HTTP_400_BAD_REQUEST
+        return Response(result, status=code)

@@ -12,6 +12,7 @@ from rest_framework.views import APIView
 from reports.services.sbis import (
     fetch_receipt_pdf_b64_from_archive,
     fetch_sales_book_extract_by_counterparty,
+    fetch_sales_book_pdf,
     send_nds_extra,
     send_nds_extra_1c,
 )
@@ -149,6 +150,57 @@ class GetSalesBookExtractView(APIView):
             date_to=str(request.data.get("date_to", "")).strip() or None,
             sbis_doc_id=str(request.data.get("sbis_doc_id", "")).strip() or None,
             nds_subtype=str(request.data.get("nds_subtype", "")).strip() or None,
+            max_docs=max_docs,
+            rpc_timeout_sec=rpc_timeout_sec,
+            rpc_budget_sec=rpc_budget_sec,
+            archive_timeout_sec=archive_timeout_sec,
+            archive_budget_sec=archive_budget_sec,
+            auth_timeout_sec=auth_timeout_sec,
+            auth_budget_sec=auth_budget_sec,
+            proxy_prewarm_count=proxy_prewarm_count,
+        )
+        code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
+        return Response(result, status=code)
+
+
+class GetSalesBookPdfView(APIView):
+    """POST /api/sbis/get-sales-book-pdf/ — PDF книги продаж из архива ОтчетФНС."""
+
+    permission_classes = []
+
+    def post(self, request, *args, **kwargs):
+        inn = str(request.data.get("inn", "")).strip()
+        if not inn:
+            return Response(
+                {"success": False, "comment": "Ошибка входных данных", "error": {"message": "Поле inn обязательно"}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        only_accepted_raw = request.data.get("only_accepted", False)
+        if isinstance(only_accepted_raw, str):
+            only_accepted = only_accepted_raw.strip().lower() in ("1", "true", "yes")
+        else:
+            only_accepted = bool(only_accepted_raw)
+        try:
+            max_docs = max(1, min(50, int(request.data.get("max_docs", 30))))
+            rpc_timeout_sec = max(8, min(60, int(request.data.get("rpc_timeout_sec", 25))))
+            rpc_budget_sec = max(12, min(90, int(request.data.get("rpc_budget_sec", 30))))
+            archive_timeout_sec = max(8, min(60, int(request.data.get("archive_timeout_sec", 20))))
+            archive_budget_sec = max(12, min(90, int(request.data.get("archive_budget_sec", 25))))
+            auth_timeout_sec = max(8, min(45, int(request.data.get("auth_timeout_sec", 14))))
+            auth_budget_sec = max(12, min(90, int(request.data.get("auth_budget_sec", 20))))
+            proxy_prewarm_count = max(1, min(10, int(request.data.get("proxy_prewarm_count", 6))))
+        except Exception:
+            return Response(
+                {"success": False, "comment": "Ошибка входных данных", "error": {"message": "Числовые поля некорректны"}},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        result = fetch_sales_book_pdf(
+            inn=inn,
+            date_from=str(request.data.get("date_from", "")).strip() or None,
+            date_to=str(request.data.get("date_to", "")).strip() or None,
+            sbis_doc_id=str(request.data.get("sbis_doc_id", "")).strip() or None,
+            only_accepted=only_accepted,
             max_docs=max_docs,
             rpc_timeout_sec=rpc_timeout_sec,
             rpc_budget_sec=rpc_budget_sec,
