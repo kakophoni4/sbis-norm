@@ -7,18 +7,21 @@ Whitelist — docs/requirements_scan_inns.txt (или REQUIREMENTS_SCAN_INNS*).
 Пример:
   python manage.py split_sales_books_whitelist \\
     --date-from 2026-04-01 --date-to 2026-06-30 \\
-    --out-dir /data/sales_books --sleep 1.5
+    --out-dir /data/sales_books --workers 10
 """
 from __future__ import annotations
 
 import base64
 import csv
 import logging
+import threading
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import close_old_connections
 
 from reports.models import Certificate, Organization
 from reports.services.requirements_scan_scope import get_requirements_scan_inns
@@ -70,10 +73,16 @@ class Command(BaseCommand):
             help="Каталог вывода (по умолчанию /data/sales_books)",
         )
         parser.add_argument(
+            "--workers",
+            type=int,
+            default=10,
+            help="Параллельных компаний (по умолчанию 10)",
+        )
+        parser.add_argument(
             "--sleep",
             type=float,
-            default=1.5,
-            help="Пауза между компаниями, сек (по умолчанию 1.5)",
+            default=0.0,
+            help="Пауза между запуском задач при workers=1, сек (по умолчанию 0)",
         )
         parser.add_argument("--limit", type=int, default=0, help="Ограничить число компаний (0 = все)")
         parser.add_argument("--inn", action="append", default=[], help="Только эти ИНН (можно несколько)")
@@ -95,27 +104,28 @@ class Command(BaseCommand):
         parser.add_argument(
             "--pdf-ready-attempts",
             type=int,
-            default=12,
-            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 12)",
+            default=5,
+            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 5)",
         )
         parser.add_argument(
             "--pdf-ready-sleep",
             type=float,
-            default=20.0,
-            help="Пауза между ожиданиями PDF, сек (по умолчанию 20)",
+            default=8.0,
+            help="Пауза между ожиданиями PDF, сек (по умолчанию 8)",
         )
 
     def handle(self, *args, **options):
         date_from = (options["date_from"] or "").strip()
         date_to = (options["date_to"] or "").strip()
         out_dir = Path(options["out_dir"])
+        workers = max(1, int(options["workers"] or 10))
         sleep_sec = max(0.0, float(options["sleep"] or 0))
         limit = int(options["limit"] or 0)
         force = bool(options["force"])
         skip_full = bool(options["skip_full_book"])
         dry_run = bool(options["dry_run"])
-        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 12))
-        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 20))
+        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 5))
+        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 8))
         only_inns = [str(x).strip() for x in (options["inn"] or []) if str(x).strip()]
 
         if only_inns:
@@ -141,9 +151,11 @@ class Command(BaseCommand):
         if limit > 0:
             ready = ready[:limit]
 
+        max_wait = (pdf_ready_attempts - 1) * pdf_ready_sleep
         self.stdout.write(
             f"Период {date_from} … {date_to}; whitelist={len(inns)}; "
-            f"с сертификатом={len(ready)}; без ключа={len(skipped_no_cert)}; out={out_dir}"
+            f"с сертификатом={len(ready)}; без ключа={len(skipped_no_cert)}; "
+            f"workers={workers}; pdf_wait≈{max_wait:.0f}s; out={out_dir}"
         )
         if skipped_no_cert[:10]:
             self.stdout.write(
@@ -161,17 +173,18 @@ class Command(BaseCommand):
         out_dir.mkdir(parents=True, exist_ok=True)
         summary_path = out_dir / "_summary.tsv"
         summary_rows: list[dict] = []
+        print_lock = threading.Lock()
 
         ok_shops = 0
         err_shops = 0
         total_extracts = 0
+        done = 0
+        total = len(ready)
 
-        for i, inn in enumerate(ready, start=1):
+        def _run_one(inn: str) -> dict:
+            close_old_connections()
             shop_dir = out_dir / inn
             shop_dir.mkdir(parents=True, exist_ok=True)
-            self.stdout.write(f"[{i}/{len(ready)}] {inn} …")
-            self.stdout.flush()
-
             try:
                 n_extracts, note = self._process_shop(
                     inn=inn,
@@ -183,36 +196,81 @@ class Command(BaseCommand):
                     pdf_ready_attempts=pdf_ready_attempts,
                     pdf_ready_sleep=pdf_ready_sleep,
                 )
-                ok_shops += 1
-                total_extracts += n_extracts
-                self.stdout.write(self.style.SUCCESS(f"  OK extracts={n_extracts} {note}"))
-                summary_rows.append(
-                    {
-                        "inn": inn,
-                        "status": "ok",
-                        "extracts": str(n_extracts),
-                        "note": note,
-                    }
-                )
+                return {
+                    "inn": inn,
+                    "status": "ok",
+                    "extracts": str(n_extracts),
+                    "note": note,
+                    "n": n_extracts,
+                }
             except Exception as e:
-                err_shops += 1
-                msg = str(e)[:300]
-                self.stdout.write(self.style.ERROR(f"  FAIL: {msg}"))
                 logger.exception("split_sales_books_whitelist fail inn=%s", inn)
-                summary_rows.append(
-                    {
-                        "inn": inn,
-                        "status": "error",
-                        "extracts": "0",
-                        "note": msg,
-                    }
-                )
+                return {
+                    "inn": inn,
+                    "status": "error",
+                    "extracts": "0",
+                    "note": str(e)[:300],
+                    "n": 0,
+                }
             finally:
                 close_thread_local_sbis_session()
+                close_old_connections()
 
-            if sleep_sec and i < len(ready):
-                time.sleep(sleep_sec)
+        if workers == 1:
+            for i, inn in enumerate(ready, start=1):
+                with print_lock:
+                    self.stdout.write(f"[{i}/{total}] {inn} …")
+                    self.stdout.flush()
+                row = _run_one(inn)
+                summary_rows.append({k: row[k] for k in ("inn", "status", "extracts", "note")})
+                if row["status"] == "ok":
+                    ok_shops += 1
+                    total_extracts += int(row["n"] or 0)
+                    with print_lock:
+                        self.stdout.write(
+                            self.style.SUCCESS(f"  OK {inn} extracts={row['extracts']} {row['note']}")
+                        )
+                else:
+                    err_shops += 1
+                    with print_lock:
+                        self.stdout.write(self.style.ERROR(f"  FAIL {inn}: {row['note']}"))
+                if sleep_sec and i < total:
+                    time.sleep(sleep_sec)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(_run_one, inn): inn for inn in ready}
+                for fut in as_completed(futures):
+                    inn = futures[fut]
+                    done += 1
+                    try:
+                        row = fut.result()
+                    except Exception as e:
+                        row = {
+                            "inn": inn,
+                            "status": "error",
+                            "extracts": "0",
+                            "note": str(e)[:300],
+                            "n": 0,
+                        }
+                    summary_rows.append({k: row[k] for k in ("inn", "status", "extracts", "note")})
+                    if row["status"] == "ok":
+                        ok_shops += 1
+                        total_extracts += int(row["n"] or 0)
+                        with print_lock:
+                            self.stdout.write(
+                                self.style.SUCCESS(
+                                    f"[{done}/{total}] OK {inn} extracts={row['extracts']} {row['note']}"
+                                )
+                            )
+                    else:
+                        err_shops += 1
+                        with print_lock:
+                            self.stdout.write(
+                                self.style.ERROR(f"[{done}/{total}] FAIL {inn}: {row['note']}")
+                            )
+                    self.stdout.flush()
 
+        summary_rows.sort(key=lambda r: r.get("inn") or "")
         with summary_path.open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["inn", "status", "extracts", "note"], delimiter="\t")
             w.writeheader()
@@ -234,8 +292,8 @@ class Command(BaseCommand):
         shop_dir: Path,
         force: bool,
         skip_full: bool,
-        pdf_ready_attempts: int = 12,
-        pdf_ready_sleep: float = 20.0,
+        pdf_ready_attempts: int = 5,
+        pdf_ready_sleep: float = 8.0,
     ) -> tuple[int, str]:
         resp = fetch_sales_book_pdf(
             inn,
@@ -324,7 +382,7 @@ class Command(BaseCommand):
                 status = "written"
                 made += 1
             else:
-                made += 1  # уже есть — считаем готовой выпиской
+                made += 1
             index_rows.append(
                 {
                     "buyer_inn": buyer_inn,

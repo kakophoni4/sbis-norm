@@ -65,8 +65,8 @@ def _download_archive_zip(
     *,
     timeout: int = 30,
     total_budget_sec: int = 35,
-    pdf_ready_attempts: int = 12,
-    pdf_ready_sleep_sec: float = 20.0,
+    pdf_ready_attempts: int = 5,
+    pdf_ready_sleep_sec: float = 8.0,
 ) -> bytes:
     """
     Скачать ZIP по СсылкаНаАрхив.
@@ -858,8 +858,8 @@ def fetch_sales_book_pdf(
     auth_timeout_sec: int = 14,
     auth_budget_sec: int = 20,
     proxy_prewarm_count: int = 6,
-    pdf_ready_attempts: int = 12,
-    pdf_ready_sleep_sec: float = 20.0,
+    pdf_ready_attempts: int = 5,
+    pdf_ready_sleep_sec: float = 8.0,
 ) -> dict:
     """
     Скачать подписанный PDF книги продаж из архива исходящего ОтчетФНС.
