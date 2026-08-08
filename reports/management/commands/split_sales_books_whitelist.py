@@ -37,6 +37,26 @@ from reports.services.sbis.sales_book_extract_pdf import (
 logger = logging.getLogger(__name__)
 
 
+def _is_retryable_failure(note: str) -> bool:
+    low = (note or "").lower()
+    return any(
+        x in low
+        for x in (
+            "формир",
+            "не найден",
+            "proxy",
+            "503",
+            "429",
+            "tunnel",
+            "timeout",
+            "timed out",
+            "max retries",
+            "connection",
+            "временно",
+        )
+    )
+
+
 def _pick_source_doc(result: dict) -> dict | None:
     """Один документ с pdf_b64: плоский result или лучший из documents."""
     if result.get("pdf_b64"):
@@ -113,6 +133,18 @@ class Command(BaseCommand):
             default=8.0,
             help="Пауза между ожиданиями PDF, сек (по умолчанию 8)",
         )
+        parser.add_argument(
+            "--retry-rounds",
+            type=int,
+            default=2,
+            help="Доп. проходы по упавшим ИНН (по умолчанию 2)",
+        )
+        parser.add_argument(
+            "--retry-sleep",
+            type=float,
+            default=15.0,
+            help="Пауза перед повторным проходом, сек (по умолчанию 15)",
+        )
 
     def handle(self, *args, **options):
         date_from = (options["date_from"] or "").strip()
@@ -126,6 +158,8 @@ class Command(BaseCommand):
         dry_run = bool(options["dry_run"])
         pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 5))
         pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 8))
+        retry_rounds = max(0, int(options["retry_rounds"] or 0))
+        retry_sleep = max(0.0, float(options["retry_sleep"] or 0))
         only_inns = [str(x).strip() for x in (options["inn"] or []) if str(x).strip()]
 
         if only_inns:
@@ -155,7 +189,8 @@ class Command(BaseCommand):
         self.stdout.write(
             f"Период {date_from} … {date_to}; whitelist={len(inns)}; "
             f"с сертификатом={len(ready)}; без ключа={len(skipped_no_cert)}; "
-            f"workers={workers}; pdf_wait≈{max_wait:.0f}s; out={out_dir}"
+            f"workers={workers}; pdf_wait≈{max_wait:.0f}s; "
+            f"retry_rounds={retry_rounds}; out={out_dir}"
         )
         if skipped_no_cert[:10]:
             self.stdout.write(
@@ -172,14 +207,8 @@ class Command(BaseCommand):
 
         out_dir.mkdir(parents=True, exist_ok=True)
         summary_path = out_dir / "_summary.tsv"
-        summary_rows: list[dict] = []
+        by_inn: dict[str, dict] = {}
         print_lock = threading.Lock()
-
-        ok_shops = 0
-        err_shops = 0
-        total_extracts = 0
-        done = 0
-        total = len(ready)
 
         def _run_one(inn: str) -> dict:
             close_old_connections()
@@ -204,41 +233,52 @@ class Command(BaseCommand):
                     "n": n_extracts,
                 }
             except Exception as e:
-                logger.exception("split_sales_books_whitelist fail inn=%s", inn)
+                msg = str(e)[:300]
+                if _is_retryable_failure(msg):
+                    logger.warning("split_sales_books_whitelist fail inn=%s: %s", inn, msg)
+                else:
+                    logger.exception("split_sales_books_whitelist fail inn=%s", inn)
                 return {
                     "inn": inn,
                     "status": "error",
                     "extracts": "0",
-                    "note": str(e)[:300],
+                    "note": msg,
                     "n": 0,
                 }
             finally:
                 close_thread_local_sbis_session()
                 close_old_connections()
 
-        if workers == 1:
-            for i, inn in enumerate(ready, start=1):
-                with print_lock:
-                    self.stdout.write(f"[{i}/{total}] {inn} …")
-                    self.stdout.flush()
-                row = _run_one(inn)
-                summary_rows.append({k: row[k] for k in ("inn", "status", "extracts", "note")})
-                if row["status"] == "ok":
-                    ok_shops += 1
-                    total_extracts += int(row["n"] or 0)
+        def _run_batch(batch: list[str], *, round_label: str) -> None:
+            total = len(batch)
+            if not total:
+                return
+            self.stdout.write(f"— {round_label}: {total} ИНН, workers={workers}")
+            self.stdout.flush()
+            done = 0
+
+            if workers == 1:
+                for i, inn in enumerate(batch, start=1):
                     with print_lock:
-                        self.stdout.write(
-                            self.style.SUCCESS(f"  OK {inn} extracts={row['extracts']} {row['note']}")
-                        )
-                else:
-                    err_shops += 1
+                        self.stdout.write(f"[{round_label} {i}/{total}] {inn} …")
+                        self.stdout.flush()
+                    row = _run_one(inn)
+                    by_inn[inn] = {k: row[k] for k in ("inn", "status", "extracts", "note", "n")}
                     with print_lock:
-                        self.stdout.write(self.style.ERROR(f"  FAIL {inn}: {row['note']}"))
-                if sleep_sec and i < total:
-                    time.sleep(sleep_sec)
-        else:
+                        if row["status"] == "ok":
+                            self.stdout.write(
+                                self.style.SUCCESS(
+                                    f"  OK {inn} extracts={row['extracts']} {row['note']}"
+                                )
+                            )
+                        else:
+                            self.stdout.write(self.style.ERROR(f"  FAIL {inn}: {row['note']}"))
+                    if sleep_sec and i < total:
+                        time.sleep(sleep_sec)
+                return
+
             with ThreadPoolExecutor(max_workers=workers) as pool:
-                futures = {pool.submit(_run_one, inn): inn for inn in ready}
+                futures = {pool.submit(_run_one, inn): inn for inn in batch}
                 for fut in as_completed(futures):
                     inn = futures[fut]
                     done += 1
@@ -252,25 +292,56 @@ class Command(BaseCommand):
                             "note": str(e)[:300],
                             "n": 0,
                         }
-                    summary_rows.append({k: row[k] for k in ("inn", "status", "extracts", "note")})
-                    if row["status"] == "ok":
-                        ok_shops += 1
-                        total_extracts += int(row["n"] or 0)
-                        with print_lock:
+                    by_inn[inn] = {k: row[k] for k in ("inn", "status", "extracts", "note", "n")}
+                    with print_lock:
+                        if row["status"] == "ok":
                             self.stdout.write(
                                 self.style.SUCCESS(
-                                    f"[{done}/{total}] OK {inn} extracts={row['extracts']} {row['note']}"
+                                    f"[{round_label} {done}/{total}] OK {inn} "
+                                    f"extracts={row['extracts']} {row['note']}"
                                 )
                             )
-                    else:
-                        err_shops += 1
-                        with print_lock:
+                        else:
                             self.stdout.write(
-                                self.style.ERROR(f"[{done}/{total}] FAIL {inn}: {row['note']}")
+                                self.style.ERROR(
+                                    f"[{round_label} {done}/{total}] FAIL {inn}: {row['note']}"
+                                )
                             )
-                    self.stdout.flush()
+                        self.stdout.flush()
 
-        summary_rows.sort(key=lambda r: r.get("inn") or "")
+        _run_batch(ready, round_label="pass1")
+
+        for r_i in range(1, retry_rounds + 1):
+            failed = [
+                inn
+                for inn in ready
+                if (by_inn.get(inn) or {}).get("status") != "ok"
+                and _is_retryable_failure((by_inn.get(inn) or {}).get("note") or "")
+            ]
+            if not failed:
+                break
+            if retry_sleep:
+                self.stdout.write(f"— пауза {retry_sleep:.0f}s перед retry#{r_i} ({len(failed)} ИНН)")
+                self.stdout.flush()
+                time.sleep(retry_sleep)
+            _run_batch(failed, round_label=f"retry{r_i}")
+
+        summary_rows = [
+            {k: (by_inn.get(inn) or {}).get(k, "") for k in ("inn", "status", "extracts", "note")}
+            for inn in sorted(ready)
+        ]
+        # заполнить inn если вдруг пусто
+        for inn, row in zip(sorted(ready), summary_rows):
+            row["inn"] = inn
+            if not row.get("status"):
+                row["status"] = "error"
+                row["extracts"] = "0"
+                row["note"] = "не обработан"
+
+        ok_shops = sum(1 for r in summary_rows if r.get("status") == "ok")
+        err_shops = len(summary_rows) - ok_shops
+        total_extracts = sum(int((by_inn.get(r["inn"]) or {}).get("n") or 0) for r in summary_rows if r.get("status") == "ok")
+
         with summary_path.open("w", encoding="utf-8", newline="") as f:
             w = csv.DictWriter(f, fieldnames=["inn", "status", "extracts", "note"], delimiter="\t")
             w.writeheader()

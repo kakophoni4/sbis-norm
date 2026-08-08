@@ -969,10 +969,20 @@ def fetch_sales_book_pdf(
 
     ok_docs = [x for x in found if x.get("ok")]
     if not ok_docs:
+        errs = [str(x.get("error") or "") for x in found if x.get("error")]
+        forming = any("формир" in e.lower() for e in errs)
+        if forming:
+            msg = "PDF книги продаж ещё формируется в СБИС (архив не готов)"
+        elif not found and scanned == 0:
+            msg = "В периоде нет исходящих ОтчетФНС с архивом"
+        elif errs:
+            msg = f"PDF книги продаж не найден: {errs[0][:180]}"
+        else:
+            msg = "PDF книги продаж не найден"
         return {
             "success": False,
             "error": {
-                "message": "PDF книги продаж не найден",
+                "message": msg,
                 "inn": inn,
                 "period": {"from": date_from, "to": date_to},
                 "only_accepted": bool(only_accepted),
