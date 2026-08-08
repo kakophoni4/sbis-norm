@@ -113,7 +113,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--force",
             action="store_true",
-            help="Перекачать книгу из СБИС даже если уже есть _full.pdf",
+            help="Перезаписывать уже существующие PDF выписок покупателей",
         )
         parser.add_argument(
             "--skip-full-book",
@@ -123,14 +123,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--reuse-full",
             action="store_true",
-            default=True,
-            help="Если есть _full.pdf — не дергать СБИС, только нарезать (по умолчанию вкл)",
-        )
-        parser.add_argument(
-            "--no-reuse-full",
-            action="store_false",
-            dest="reuse_full",
-            help="Всегда качать архив из СБИС заново",
+            default=False,
+            help="Опционально: если есть валидный _full.pdf — только нарезать, без СБИС",
         )
         parser.add_argument(
             "--dry-run",
@@ -171,7 +165,7 @@ class Command(BaseCommand):
         limit = int(options["limit"] or 0)
         force = bool(options["force"])
         skip_full = bool(options["skip_full_book"])
-        reuse_full = bool(options.get("reuse_full", True)) and not force
+        reuse_full = bool(options.get("reuse_full", False))
         dry_run = bool(options["dry_run"])
         pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 5))
         pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 8))
@@ -406,12 +400,10 @@ class Command(BaseCommand):
                 from_cache = True
                 sbis_doc_id = "local_cache"
                 pdf_filename = full_path.name
-            else:
-                # старый прогон положил чужой/пустой PDF — перекачиваем
-                self.stdout.write(
-                    self.style.WARNING(f"  {inn}: кэш _full.pdf пустой/не книга — качаем заново")
-                )
+
         if pdf_bytes is None:
+            self.stdout.write(f"  {inn}: скачиваю НД по НДС / NO_NDS.9 из СБИС…")
+            self.stdout.flush()
             resp = fetch_sales_book_pdf(
                 inn,
                 date_from=date_from,
@@ -436,6 +428,11 @@ class Command(BaseCommand):
             period = result.get("period") or {}
             period_from = period.get("from") or date_from
             period_to = period.get("to") or date_to
+            self.stdout.write(
+                f"  {inn}: pdf={pdf_filename} doc={sbis_doc_id[:36]} "
+                f"rows={result.get('sales_rows')}"
+            )
+            self.stdout.flush()
 
             if not skip_full:
                 full_path.write_bytes(pdf_bytes)
