@@ -93,8 +93,8 @@ class Command(BaseCommand):
         parser.add_argument("--date-to", required=True, help="Конец периода YYYY-MM-DD")
         parser.add_argument(
             "--out-dir",
-            default="/data/sales_books",
-            help="Каталог вывода (по умолчанию /data/sales_books)",
+            default="/app/data/sales_books",
+            help="Каталог вывода внутри контейнера (по умолчанию /app/data/sales_books = ./data/sales_books на хосте)",
         )
         parser.add_argument(
             "--workers",
