@@ -43,6 +43,10 @@ from django.utils import timezone
 from reports.models import Certificate, Organization, RequirementDocument, RequirementFetchScanState
 from reports.requirement_file_sniff import guess_requirement_extension
 from reports.services.requirement_deadline import extract_deadlines_from_content
+from reports.services.requirement_sbis_meta import (
+    apply_sbis_meta_to_requirement,
+    fetch_requirement_sbis_meta,
+)
 from reports.services.requirements_notify import notify_requirement_saved
 from reports.services.requirements_scan_scope import get_requirements_scan_inns
 from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
@@ -549,6 +553,31 @@ def _process_one_cert(
                         receipt_due_date=deadlines.get("receipt_due_date"),
                         knd=deadlines.get("knd"),
                     )
+                # Срок / статус ответа из карточки СБИС.ПрочитатьДокумент
+                try:
+                    meta_res = fetch_requirement_sbis_meta(
+                        inn,
+                        sbis_doc_id=doc_id,
+                        document_date=document_date,
+                    )
+                    if meta_res.get("success"):
+                        changed = apply_sbis_meta_to_requirement(obj, meta_res.get("meta") or {})
+                        if changed and not quiet:
+                            write_fn(
+                                f"        SBIS meta: srok={meta_res['meta'].get('srok_raw')!r} "
+                                f"due={obj.response_due_date} answered={meta_res['meta'].get('is_answered')} "
+                                f"fields={changed}",
+                                None,
+                            )
+                    elif not quiet:
+                        write_fn(
+                            f"        SBIS meta skip: {(meta_res.get('error') or {})}",
+                            "warning",
+                        )
+                except Exception as e:
+                    logger.warning("sbis meta after save inn=%s: %s", inn, e)
+                    if not quiet:
+                        write_fn(f"        SBIS meta error: {e}", "warning")
                 try:
                     notify_requirement_saved(obj)
                 except Exception:

@@ -52,10 +52,14 @@ def _local_tag(tag: str) -> str:
     return tag
 
 
-def _parse_date_value(raw: str) -> date | None:
+def parse_date_value(raw: str) -> date | None:
+    """Парсит дату из строки СБИС/XML: DD.MM.YYYY, YYYY-MM-DD, …"""
     s = (raw or "").strip()
     if not s:
         return None
+    # иногда "30.07.2026 17.35.44"
+    if " " in s:
+        s = s.split(" ", 1)[0].strip()
     for fmt in ("%d.%m.%Y", "%Y-%m-%d", "%d/%m/%Y", "%Y%m%d"):
         try:
             return datetime.strptime(s[:10] if fmt != "%Y%m%d" else s[:8], fmt).date()
@@ -68,6 +72,10 @@ def _parse_date_value(raw: str) -> date | None:
         except ValueError:
             return None
     return None
+
+
+# backward-compatible alias
+_parse_date_value = parse_date_value
 
 
 def _attr_key_norm(key: str) -> str:

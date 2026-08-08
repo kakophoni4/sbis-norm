@@ -79,10 +79,12 @@ class CertificateAuditLog(models.Model):
 class RequirementDocument(models.Model):
     REPLY_STATUS_NONE = "none"
     REPLY_STATUS_SENT = "sent"
+    REPLY_STATUS_ANSWERED = "answered"
     REPLY_STATUS_ERROR = "error"
     REPLY_STATUS_CHOICES = (
         (REPLY_STATUS_NONE, "Нет ответа"),
-        (REPLY_STATUS_SENT, "Отправлен"),
+        (REPLY_STATUS_SENT, "Отправлен нами"),
+        (REPLY_STATUS_ANSWERED, "Отвечено (СБИС)"),
         (REPLY_STATUS_ERROR, "Ошибка"),
     )
 

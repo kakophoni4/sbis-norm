@@ -113,10 +113,10 @@ GET /api/sbis/requirements/?unsynced=1&limit=50
 
 | Поле | Описание |
 |------|----------|
-| `response_due_date` | крайний срок ответа по существу (из XML требования; может быть `null` если только PDF) |
+| `response_due_date` | крайний срок из СБИС (`ПрочитатьДокумент` → поле `Срок`; может быть `null` если СБИС отдал пусто) |
 | `receipt_due_date` | срок квитанции о приёме (`document_date` + 6 рабочих дней) |
-| `knd` | КНД из XML, если удалось вытащить |
-| `reply_status` | `none` / `sent` / `error` |
+| `knd` | КНД / подтип, если удалось вытащить |
+| `reply_status` | `none` / `sent` (наш `/reply/`) / `answered` (в СБИС уже есть ответ) / `error` |
 | `reply_sbis_doc_id` | ID исходящего ответа в СБИС после успешного reply |
 
 `file_size` — оценка размера бинарника в байтах (из длины base64).  
