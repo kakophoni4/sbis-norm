@@ -92,6 +92,18 @@ class Command(BaseCommand):
             action="store_true",
             help="Только список компаний с сертификатом, без скачивания",
         )
+        parser.add_argument(
+            "--pdf-ready-attempts",
+            type=int,
+            default=12,
+            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 12)",
+        )
+        parser.add_argument(
+            "--pdf-ready-sleep",
+            type=float,
+            default=20.0,
+            help="Пауза между ожиданиями PDF, сек (по умолчанию 20)",
+        )
 
     def handle(self, *args, **options):
         date_from = (options["date_from"] or "").strip()
@@ -102,6 +114,8 @@ class Command(BaseCommand):
         force = bool(options["force"])
         skip_full = bool(options["skip_full_book"])
         dry_run = bool(options["dry_run"])
+        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 12))
+        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 20))
         only_inns = [str(x).strip() for x in (options["inn"] or []) if str(x).strip()]
 
         if only_inns:
@@ -166,6 +180,8 @@ class Command(BaseCommand):
                     shop_dir=shop_dir,
                     force=force,
                     skip_full=skip_full,
+                    pdf_ready_attempts=pdf_ready_attempts,
+                    pdf_ready_sleep=pdf_ready_sleep,
                 )
                 ok_shops += 1
                 total_extracts += n_extracts
@@ -218,6 +234,8 @@ class Command(BaseCommand):
         shop_dir: Path,
         force: bool,
         skip_full: bool,
+        pdf_ready_attempts: int = 12,
+        pdf_ready_sleep: float = 20.0,
     ) -> tuple[int, str]:
         resp = fetch_sales_book_pdf(
             inn,
@@ -225,6 +243,8 @@ class Command(BaseCommand):
             date_to=date_to,
             only_accepted=False,
             max_docs=30,
+            pdf_ready_attempts=pdf_ready_attempts,
+            pdf_ready_sleep_sec=pdf_ready_sleep,
         )
         if not resp.get("success"):
             err = resp.get("error") or {}

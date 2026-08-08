@@ -41,6 +41,23 @@ from .sales_book_extract_pdf import (
 logger = logging.getLogger(__name__)
 
 
+def _is_pdf_still_forming_response(status_code: int, body: str) -> bool:
+    """СБИС отдаёт HTTP 500, пока визуальные PDF в архиве ещё не собраны."""
+    if int(status_code or 0) not in (500, 503, 409):
+        return False
+    low = (body or "").lower()
+    return any(
+        x in low
+        for x in (
+            "pdf-файлы ещё формируются",
+            "pdf-файлы еще формируются",
+            "ещё формируются",
+            "еще формируются",
+            "преобразовать файлы в pdf",
+        )
+    )
+
+
 def _download_archive_zip(
     inn: str,
     session_id: str,
@@ -48,27 +65,76 @@ def _download_archive_zip(
     *,
     timeout: int = 30,
     total_budget_sec: int = 35,
+    pdf_ready_attempts: int = 12,
+    pdf_ready_sleep_sec: float = 20.0,
 ) -> bytes:
-    r = _sbis_get(
-        archive_url,
-        headers={"X-SBISSessionID": session_id},
-        timeout=timeout,
-        inn=inn,
-        total_budget_sec=total_budget_sec,
-    )
-    if r.status_code != 200:
-        raise RuntimeError(f"Не удалось скачать архив: HTTP {r.status_code}, body_head={r.text[:200]}")
-    content = r.content or b""
-    content_type = (r.headers.get("Content-Type") or "").strip()
-    payload_kind = _detect_archive_payload_kind(content=content, content_type=content_type)
-    if payload_kind != "zip":
-        head_hex = (content[:16] or b"").hex() or "empty"
-        raise RuntimeError(
-            "Ответ по СсылкаНаАрхив не ZIP "
-            f"(detected={payload_kind}, content_type={content_type or 'n/a'}, "
-            f"content_length={len(content)}, head16_hex={head_hex})"
+    """
+    Скачать ZIP по СсылкаНаАрхив.
+
+    При первой выгрузке СБИС часто отвечает «PDF-файлы ещё формируются» —
+    тогда ждём и повторяем ту же ссылку (смена прокси тут бесполезна).
+    """
+    attempts = max(1, int(pdf_ready_attempts))
+    sleep_sec = max(1.0, float(pdf_ready_sleep_sec))
+    last_head = ""
+
+    for attempt in range(1, attempts + 1):
+        r = _sbis_get(
+            archive_url,
+            headers={"X-SBISSessionID": session_id},
+            timeout=timeout,
+            inn=inn,
+            total_budget_sec=total_budget_sec,
         )
-    return content
+        body_text = r.text or ""
+        last_head = body_text[:240]
+
+        if _is_pdf_still_forming_response(r.status_code, body_text):
+            logger.warning(
+                "archive PDF still forming inn=%s attempt=%s/%s sleep=%.0fs",
+                inn,
+                attempt,
+                attempts,
+                sleep_sec,
+            )
+            if attempt >= attempts:
+                break
+            time.sleep(sleep_sec)
+            continue
+
+        if r.status_code != 200:
+            raise RuntimeError(
+                f"Не удалось скачать архив: HTTP {r.status_code}, body_head={last_head}"
+            )
+
+        content = r.content or b""
+        content_type = (r.headers.get("Content-Type") or "").strip()
+        payload_kind = _detect_archive_payload_kind(content=content, content_type=content_type)
+        if payload_kind == "json" and _is_pdf_still_forming_response(500, body_text or content.decode("utf-8", "ignore")):
+            logger.warning(
+                "archive PDF still forming (json body) inn=%s attempt=%s/%s sleep=%.0fs",
+                inn,
+                attempt,
+                attempts,
+                sleep_sec,
+            )
+            if attempt >= attempts:
+                break
+            time.sleep(sleep_sec)
+            continue
+        if payload_kind != "zip":
+            head_hex = (content[:16] or b"").hex() or "empty"
+            raise RuntimeError(
+                "Ответ по СсылкаНаАрхив не ZIP "
+                f"(detected={payload_kind}, content_type={content_type or 'n/a'}, "
+                f"content_length={len(content)}, head16_hex={head_hex})"
+            )
+        return content
+
+    raise RuntimeError(
+        "PDF в архиве СБИС так и не сформировался "
+        f"(attempts={attempts}, sleep={sleep_sec}s). body_head={last_head}"
+    )
 
 def _detect_archive_payload_kind(content: bytes, content_type: str | None = None) -> str:
     """Определяет формат ответа по сигнатуре байтов + Content-Type."""
@@ -792,6 +858,8 @@ def fetch_sales_book_pdf(
     auth_timeout_sec: int = 14,
     auth_budget_sec: int = 20,
     proxy_prewarm_count: int = 6,
+    pdf_ready_attempts: int = 12,
+    pdf_ready_sleep_sec: float = 20.0,
 ) -> dict:
     """
     Скачать подписанный PDF книги продаж из архива исходящего ОтчетФНС.
@@ -872,6 +940,8 @@ def fetch_sales_book_pdf(
                 archive_url=archive_url,
                 timeout=max(8, int(archive_timeout_sec)),
                 total_budget_sec=max(12, int(archive_budget_sec)),
+                pdf_ready_attempts=max(1, int(pdf_ready_attempts)),
+                pdf_ready_sleep_sec=max(1.0, float(pdf_ready_sleep_sec)),
             )
             pdf_bytes, pdf_name = _extract_sales_book_pdf_from_zip(zip_bytes)
         except Exception as e:
