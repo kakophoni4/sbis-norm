@@ -5,6 +5,7 @@ import base64
 import json
 import logging
 import os
+import re
 import tempfile
 import uuid
 from datetime import datetime
@@ -20,6 +21,9 @@ from .crypto import export_cert_der, get_fio_from_cert_file, get_thumbprint_from
 logger = logging.getLogger(__name__)
 
 _SBIS_USER_AGENT = "sbis-norm/1.0 (requirement-reply; Django)"
+# Формализованный ответ: «Представление документов (сведений)»
+_REPLY_KND = "1184002"
+_REPLY_FORM_NAME = "Представление документов (сведений)"
 
 
 def _norm_error(err) -> dict:
@@ -62,7 +66,85 @@ def _our_org(inn: str, cert: Certificate) -> dict:
     org = Organization.objects.filter(inn=inn).first()
     kpp = ((cert.kpp or "") or (org.kpp if org else "") or "").strip()
     name = ((org.name if org else "") or f"ИНН {inn}").strip()
-    return {"СвЮЛ": {"ИНН": inn, "КПП": kpp, "Название": name}}
+    return {
+        "СвЮЛ": {
+            "ИНН": inn,
+            "КПП": kpp,
+            "Название": name,
+            "НазваниеПолное": name,
+        }
+    }
+
+
+def _extract_kod_no(read_result: dict, kpp: str) -> str:
+    """Код НО из карточки требования или из КПП (первые 4 цифры)."""
+    result = read_result if isinstance(read_result, dict) else {}
+
+    def walk(obj, depth=0):
+        if depth > 6:
+            return None
+        if isinstance(obj, dict):
+            for key in ("КодНО", "Код", "Идентификатор"):
+                val = str(obj.get(key) or "").strip()
+                if key == "КодНО" and re.fullmatch(r"\d{4}", val):
+                    return val
+            # Гос. инспекция часто: {"ГосударственнаяИнспекция": "7707"}
+            gi = obj.get("ГосударственнаяИнспекция")
+            if isinstance(gi, str) and re.fullmatch(r"\d{4}", gi.strip()):
+                return gi.strip()
+            if isinstance(gi, dict):
+                for k in ("Код", "Идентификатор", "КодНО"):
+                    val = str(gi.get(k) or "").strip()
+                    if re.fullmatch(r"\d{4}", val):
+                        return val
+            for v in obj.values():
+                found = walk(v, depth + 1)
+                if found:
+                    return found
+        elif isinstance(obj, list):
+            for v in obj:
+                found = walk(v, depth + 1)
+                if found:
+                    return found
+        return None
+
+    for key in ("Контрагент", "Участники", "Получатель", "Расширение"):
+        if key in result:
+            found = walk(result.get(key))
+            if found:
+                return found
+    kpp = (kpp or "").strip()
+    if len(kpp) >= 4 and kpp[:4].isdigit():
+        return kpp[:4]
+    return "0000"
+
+
+def _build_svedenia(*, kod_no: str, main_attachment_id: str, year: str) -> dict:
+    return {
+        "Ссылка": "",
+        "Номер": "1",
+        "Описание": {
+            "ИмяФормы": _REPLY_FORM_NAME,
+            "КНДФормы": _REPLY_KND,
+            "ВидДокумента": "Первичный",
+            "НомерКорректировки": "0",
+            "НОПоМестуУчета": kod_no,
+            "НОПоМестуНахождения": kod_no,
+            "Период": [
+                {
+                    "Год": year,
+                    "Код": "0",
+                    "ИдентификаторВложения": main_attachment_id,
+                }
+            ],
+        },
+        "Пакет": {
+            "ВерсПрог": "sbis-norm/1.0",
+            "СКЗИ": "КриптоПро CSP 5.0",
+        },
+        "НатуральныйИдентификатор": "",
+        "ПрограммаФормированияОтчета": "sbis-norm",
+    }
 
 
 def _normalize_attachments(attachments: list) -> list[dict]:
@@ -156,11 +238,23 @@ def send_requirement_reply(
         logger.exception("requirement_reply auth/cert inn=%s", inn)
         return {"success": False, "error": {"message": f"Ошибка сертификата/auth в СБИС: {e}"}}
 
+    # Код НО из карточки требования (для Сведения / Участники)
+    from .requirements import sbis_read_document
+
+    kod_no = _extract_kod_no({}, kpp)
+    try:
+        read = sbis_read_document(inn, session_id=session_id, doc_id=requirement_sbis_doc_id)
+        if read.get("success"):
+            kod_no = _extract_kod_no(read.get("result") or {}, kpp) or kod_no
+    except Exception:
+        logger.exception("requirement_reply: ПрочитатьДокумент for kod_no failed inn=%s", inn)
+
+    year = str(datetime.now().year)
     tmp_dir = tempfile.mkdtemp(prefix=f"req_reply_{inn}_")
     enclosures: list[dict] = []
     file_id_map: dict[str, str] = {}
     try:
-        for f in files:
+        for i, f in enumerate(files):
             path = os.path.join(tmp_dir, f["filename"])
             Path(path).write_bytes(f["content"])
             ident = str(uuid.uuid4())
@@ -175,9 +269,13 @@ def send_requirement_reply(
                 sign_b64 = base64.b64encode(fh.read()).decode("ascii")
             enclosures.append(
                 {
+                    "Подтип": _REPLY_KND,
+                    "Направление": "Исходящий",
                     "Идентификатор": ident,
-                    "Название": f["filename"],
-                    "Категория": "Приложение",
+                    "ВерсияФормата": "5.03",
+                    "ПодВерсияФормата": "",
+                    "Название": f["filename"] if i else _REPLY_FORM_NAME,
+                    "Категория": "Основное" if i == 0 else "Приложение",
                     "Файл": {
                         "Имя": f["filename"],
                         "ДвоичныеДанные": content_b64,
@@ -186,17 +284,28 @@ def send_requirement_reply(
                 }
             )
 
+        main_ident = enclosures[0]["Идентификатор"] if enclosures else str(uuid.uuid4())
+        sved = _build_svedenia(kod_no=kod_no, main_attachment_id=main_ident, year=year)
         reply_doc_id = str(uuid.uuid4())
         doc = {
-            "Название": f"Ответ на требование ({requirement_sbis_doc_id[:8]})",
+            "Название": f"{_REPLY_FORM_NAME} ({requirement_sbis_doc_id[:8]})",
             "Идентификатор": reply_doc_id,
             "Тип": "ПредставлениеФНС",
+            "ПодТип": _REPLY_KND,
             "ДатаВремяСоздания": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "Расширение": {"ИдентификаторКомплекта": requirement_sbis_doc_id},
             "НашаОрганизация": our_org,
+            "Участники": {
+                "Отправитель": our_org,
+                "Получатель": {"ГосударственнаяИнспекция": kod_no},
+                "КонечныйПолучатель": {"ГосударственнаяИнспекция": kod_no},
+            },
+            "Сведения": sved,
             "Вложение": enclosures,
             "Сертификат": {"Отпечаток": thumbprint, "Ключ": {"Тип": "Клиентский"}},
         }
+        parsed["kod_no"] = kod_no
+        parsed["knd"] = _REPLY_KND
 
         headers = {
             "Content-Type": "application/json-rpc;charset=utf-8",
