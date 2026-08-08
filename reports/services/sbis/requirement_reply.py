@@ -119,6 +119,69 @@ def _extract_kod_no(read_result: dict, kpp: str) -> str:
     return "0000"
 
 
+def _pick_stage_action(doc_like: dict) -> tuple[str, str, str | None]:
+    """
+    Из Документ/result с Этап[] выбрать (stage_name, action_name, stage_id).
+    Предпочитаем действия отправки.
+    """
+    preferred = (
+        "отправить",
+        "подписать и отправить",
+        "утвердить",
+        "подтвердить",
+        "завершить",
+    )
+    stages = (doc_like or {}).get("Этап") or []
+    if isinstance(stages, dict):
+        stages = [stages]
+    best = None  # (prio, stage_name, action_name, stage_id)
+    for st in stages:
+        if not isinstance(st, dict):
+            continue
+        st_name = str(st.get("Название") or "").strip() or "Отправка"
+        st_id = str(st.get("Идентификатор") or "").strip() or None
+        actions = st.get("Действие") or []
+        if isinstance(actions, dict):
+            actions = [actions]
+        for a in actions:
+            if not isinstance(a, dict):
+                continue
+            aname = str(a.get("Название") or "").strip()
+            if not aname:
+                continue
+            low = aname.lower()
+            prio = 50
+            for i, pref in enumerate(preferred):
+                if pref in low:
+                    prio = i
+                    break
+            cand = (prio, st_name, aname, st_id)
+            if best is None or cand[0] < best[0]:
+                best = cand
+    if best:
+        return best[1], best[2], best[3]
+    return "Отправка", "Отправить", None
+
+
+def _is_already_done_error(err: dict | str | None) -> bool:
+    msg = ""
+    if isinstance(err, dict):
+        msg = str(err.get("message") or err.get("details") or err)
+    else:
+        msg = str(err or "")
+    low = msg.lower()
+    return any(
+        x in low
+        for x in (
+            "отсутствует или обработано",
+            "уже обработано",
+            "уже выполнен",
+            "нет доступных",
+            "закрыт",
+        )
+    )
+
+
 def _build_svedenia(*, kod_no: str, main_attachment_id: str, year: str) -> dict:
     return {
         "Ссылка": "",
@@ -339,48 +402,57 @@ def send_requirement_reply(
             written = {}
         sbis_doc_id = (written.get("Идентификатор") or reply_doc_id).strip()
 
-        # Этап/действие из ответа или дефолт Отправка/Отправить
-        stage_name = "Отправка"
-        action_name = "Отправить"
-        stages = written.get("Этап") or []
-        if isinstance(stages, dict):
-            stages = [stages]
-        if stages and isinstance(stages[0], dict):
-            st0 = stages[0]
-            if st0.get("Название"):
-                stage_name = str(st0.get("Название")).strip() or stage_name
-            actions = st0.get("Действие") or []
-            if isinstance(actions, dict):
-                actions = [actions]
-            for a in actions:
-                if isinstance(a, dict) and a.get("Название"):
-                    action_name = str(a.get("Название")).strip() or action_name
-                    break
+        stage_name, action_name, stage_id = _pick_stage_action(written)
+        # если в ЗаписатьКомплект нет Этап — читаем документ
+        if stage_name == "Отправка" and action_name == "Отправить":
+            try:
+                read2 = sbis_read_document(inn, session_id=session_id, doc_id=sbis_doc_id)
+                if read2.get("success"):
+                    stage_name, action_name, stage_id = _pick_stage_action(read2.get("result") or {})
+            except Exception:
+                logger.exception("requirement_reply: read after write failed")
+
+        stage_payload: dict = {
+            "Название": stage_name,
+            "Действие": {
+                "Название": action_name,
+                "Сертификат": {"Отпечаток": thumbprint},
+            },
+        }
+        if stage_id:
+            stage_payload["Идентификатор"] = stage_id
 
         prep_body = {
             "jsonrpc": "2.0",
             "method": "СБИС.ПодготовитьДействие",
-            "params": {
-                "Документ": {
-                    "Идентификатор": sbis_doc_id,
-                    "Этап": {
-                        "Название": stage_name,
-                        "Действие": {
-                            "Название": action_name,
-                            "Сертификат": {"Отпечаток": thumbprint},
-                        },
-                    },
-                }
-            },
+            "params": {"Документ": {"Идентификатор": sbis_doc_id, "Этап": stage_payload}},
             "id": 2,
         }
         prep_json = json.dumps(prep_body, ensure_ascii=False)
         prep_resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=prep_json, timeout=60)
         _safe_log_http("REQ_REPLY_PREP", REPORTING_URL, headers, prep_json, prep_resp)
         if prep_resp.status_code != 200:
+            # prepare уже мог «закрыть» этап — проверим текст
+            raw = (prep_resp.text or "")[:800]
+            if _is_already_done_error(raw):
+                sent_at = datetime.now()
+                return {
+                    "success": True,
+                    "result": {"ok": True, "prepare_already_done": True},
+                    "send_meta": {
+                        "reply_sbis_doc_id": sbis_doc_id,
+                        "requirement_sbis_doc_id": requirement_sbis_doc_id,
+                        "stage_name": stage_name,
+                        "action_name": action_name,
+                        "sent_at": sent_at.isoformat(timespec="seconds"),
+                        "sent_date": sent_at.strftime("%Y-%m-%d"),
+                        "filenames": [f["filename"] for f in files],
+                    },
+                    "parsed": parsed,
+                }
             return {
                 "success": False,
-                "error": {"message": f"HTTP {prep_resp.status_code} ПодготовитьДействие", "raw": (prep_resp.text or "")[:800]},
+                "error": {"message": f"HTTP {prep_resp.status_code} ПодготовитьДействие", "raw": raw},
                 "reply_sbis_doc_id": sbis_doc_id,
             }
         try:
@@ -388,7 +460,31 @@ def send_requirement_reply(
         except Exception as e:
             return {"success": False, "error": {"message": f"JSON ПодготовитьДействие: {e}"}, "reply_sbis_doc_id": sbis_doc_id}
         if prep_data.get("error"):
-            return {"success": False, "error": _norm_error(prep_data["error"]), "reply_sbis_doc_id": sbis_doc_id}
+            err = _norm_error(prep_data["error"])
+            if _is_already_done_error(err):
+                sent_at = datetime.now()
+                return {
+                    "success": True,
+                    "result": {"ok": True, "prepare_already_done": True},
+                    "send_meta": {
+                        "reply_sbis_doc_id": sbis_doc_id,
+                        "requirement_sbis_doc_id": requirement_sbis_doc_id,
+                        "stage_name": stage_name,
+                        "action_name": action_name,
+                        "sent_at": sent_at.isoformat(timespec="seconds"),
+                        "sent_date": sent_at.strftime("%Y-%m-%d"),
+                        "filenames": [f["filename"] for f in files],
+                    },
+                    "parsed": parsed,
+                }
+            return {"success": False, "error": err, "reply_sbis_doc_id": sbis_doc_id}
+
+        # этап/действие после prepare (часто точнее)
+        prep_result = prep_data.get("result") or {}
+        if isinstance(prep_result, list) and prep_result:
+            prep_result = prep_result[0] if isinstance(prep_result[0], dict) else {}
+        if isinstance(prep_result, dict) and (prep_result.get("Этап") or prep_result.get("Идентификатор")):
+            stage_name, action_name, stage_id = _pick_stage_action(prep_result)
 
         exec_attachments = []
         for path, ident in file_id_map.items():
@@ -407,31 +503,47 @@ def send_requirement_reply(
                     "reply_sbis_doc_id": sbis_doc_id,
                 }
 
+        exec_stage: dict = {
+            "Название": stage_name,
+            "Действие": {
+                "Название": action_name,
+                "Сертификат": {"Отпечаток": thumbprint, "ИНН": inn, "ФИО": fio},
+            },
+            "Вложение": exec_attachments,
+        }
+        if stage_id:
+            exec_stage["Идентификатор"] = stage_id
+
         exec_body = {
             "jsonrpc": "2.0",
             "method": "СБИС.ВыполнитьДействие",
-            "params": {
-                "Документ": {
-                    "Идентификатор": sbis_doc_id,
-                    "Этап": {
-                        "Название": stage_name,
-                        "Действие": {
-                            "Название": action_name,
-                            "Сертификат": {"Отпечаток": thumbprint, "ИНН": inn, "ФИО": fio},
-                        },
-                        "Вложение": exec_attachments,
-                    },
-                }
-            },
+            "params": {"Документ": {"Идентификатор": sbis_doc_id, "Этап": exec_stage}},
             "id": 3,
         }
         exec_json = json.dumps(exec_body, ensure_ascii=False)
         exec_resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=exec_json, timeout=90)
         _safe_log_http("REQ_REPLY_EXEC", REPORTING_URL, headers, exec_json, exec_resp)
         if exec_resp.status_code != 200:
+            raw = (exec_resp.text or "")[:800]
+            if _is_already_done_error(raw):
+                sent_at = datetime.now()
+                return {
+                    "success": True,
+                    "result": {"ok": True, "execute_already_done": True},
+                    "send_meta": {
+                        "reply_sbis_doc_id": sbis_doc_id,
+                        "requirement_sbis_doc_id": requirement_sbis_doc_id,
+                        "stage_name": stage_name,
+                        "action_name": action_name,
+                        "sent_at": sent_at.isoformat(timespec="seconds"),
+                        "sent_date": sent_at.strftime("%Y-%m-%d"),
+                        "filenames": [f["filename"] for f in files],
+                    },
+                    "parsed": parsed,
+                }
             return {
                 "success": False,
-                "error": {"message": f"HTTP {exec_resp.status_code} ВыполнитьДействие", "raw": (exec_resp.text or "")[:800]},
+                "error": {"message": f"HTTP {exec_resp.status_code} ВыполнитьДействие", "raw": raw},
                 "reply_sbis_doc_id": sbis_doc_id,
             }
         try:
@@ -439,10 +551,27 @@ def send_requirement_reply(
         except Exception as e:
             return {"success": False, "error": {"message": f"JSON ВыполнитьДействие: {e}"}, "reply_sbis_doc_id": sbis_doc_id}
         if exec_data.get("error"):
-            return {"success": False, "error": _norm_error(exec_data["error"]), "reply_sbis_doc_id": sbis_doc_id}
+            err = _norm_error(exec_data["error"])
+            # Запись комплекта уже есть — «действие обработано» считаем успешной отправкой
+            if _is_already_done_error(err):
+                sent_at = datetime.now()
+                return {
+                    "success": True,
+                    "result": {"ok": True, "execute_already_done": True},
+                    "send_meta": {
+                        "reply_sbis_doc_id": sbis_doc_id,
+                        "requirement_sbis_doc_id": requirement_sbis_doc_id,
+                        "stage_name": stage_name,
+                        "action_name": action_name,
+                        "sent_at": sent_at.isoformat(timespec="seconds"),
+                        "sent_date": sent_at.strftime("%Y-%m-%d"),
+                        "filenames": [f["filename"] for f in files],
+                    },
+                    "parsed": parsed,
+                }
+            return {"success": False, "error": err, "reply_sbis_doc_id": sbis_doc_id}
 
         sent_at = datetime.now()
-        # result может быть огромным — в API отдаём компактно
         return {
             "success": True,
             "result": {"ok": True},
