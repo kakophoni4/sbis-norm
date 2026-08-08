@@ -822,7 +822,11 @@ def build_sales_book_extract_pdf(
         total_y0, total_y1 = _total_band_ys(last)
         total_h = total_y1 - total_y0
 
-        stamp_top = min(_stamp_top_y(last), 534.0)
+        # Копируем только фактический блок ЭП. Раньше верх принудительно
+        # ограничивался 534 pt, поэтому на страницах с низким штампом вместе
+        # с ним повторно попадали хвост последней строки и исходное «Итого».
+        stamp_top = _stamp_top_y(last)
+        stamp_top = min(max(0.0, stamp_top), max(0.0, page_h - 1.0))
         stamp_h = page_h - stamp_top
 
         rows_h = 0.0
