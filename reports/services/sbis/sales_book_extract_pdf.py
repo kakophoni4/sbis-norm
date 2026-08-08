@@ -505,17 +505,45 @@ def _total_band_ys(page) -> tuple[float, float]:
     return 198.05, 207.08
 
 
-def _stamp_top_y(page) -> float:
-    top = float(page.rect.height) - 80.0
+def _stamp_clip_rect(page):
+    """Фактическая область синего штампа ЭП без хвоста таблицы слева."""
+    import pymupdf as fitz
+
+    page_w = float(page.rect.width)
+    page_h = float(page.rect.height)
+    blue_rects = []
+    for drawing in page.get_drawings():
+        rect = drawing.get("rect")
+        color = drawing.get("color") or drawing.get("fill")
+        if not rect or not color or len(color) < 3:
+            continue
+        r, g, b = (float(color[0]), float(color[1]), float(color[2]))
+        if b > 0.65 and r < 0.35 and g < 0.35 and float(rect.y0) > page_h * 0.55:
+            blue_rects.append(fitz.Rect(rect))
+
+    if blue_rects:
+        x0 = max(0.0, min(float(r.x0) for r in blue_rects) - 0.5)
+        y0 = max(0.0, min(float(r.y0) for r in blue_rects) - 0.5)
+        x1 = min(page_w, max(float(r.x1) for r in blue_rects) + 0.5)
+        return fitz.Rect(x0, y0, x1, page_h)
+
+    signed_top: float | None = None
     for block in page.get_text("dict").get("blocks", []):
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             text = "".join(span.get("text", "") for span in line.get("spans", []))
-            if "ПОДПИСАН" in text.upper() or "Оператор ЭДО" in text or "Тензор" in text:
-                top = min(top, float(line["bbox"][1]) - 14.0)
-    # синий блок штампа чуть выше текста
-    return max(0.0, top)
+            if "ПОДПИСАН" in text.upper():
+                y = float(line["bbox"][1]) - 6.0
+                signed_top = y if signed_top is None else min(signed_top, y)
+
+    top = signed_top if signed_top is not None else (page_h - 65.0)
+    return fitz.Rect(0.0, max(0.0, top), page_w, page_h)
+
+
+def _stamp_top_y(page) -> float:
+    """Совместимость для диагностического кода."""
+    return float(_stamp_clip_rect(page).y0)
 
 
 # Толщина горизонтальной линии сетки Saby (filled-rect).
@@ -732,6 +760,123 @@ def _draw_total_row(
     return y1
 
 
+def _replace_total_values(
+    page,
+    source_page,
+    *,
+    source_y0: float,
+    source_y1: float,
+    dest_y0: float,
+    fontname: str,
+    sum_base: float,
+    sum_vat: float,
+) -> None:
+    """
+    Заменяет суммы в скопированной строке «Итого», сохраняя родную сетку.
+
+    Позиции денежных колонок берутся из самого PDF, потому что у шаблонов
+    СБИС различается ширина первых колонок. Сумму с НДС отдельно не печатаем:
+    в форме раздела 9 эта ячейка объединена с надписью «Итого».
+    """
+    import pymupdf as fitz
+
+    money_words = []
+    for word in source_page.get_text("words"):
+        x0, y0, x1, y1, text = word[:5]
+        if float(y0) < source_y0 - 1.0 or float(y1) > source_y1 + 1.5:
+            continue
+        value = str(text).strip().replace(",", ".")
+        if re.fullmatch(r"-?\d+\.\d{2}", value):
+            money_words.append((float(x0), float(y0), float(x1), float(y1)))
+
+    money_words.sort(key=lambda item: item[0])
+    if len(money_words) < 2:
+        logger.warning("Не найдены позиции сумм в строке Итого")
+        return
+
+    offset_y = dest_y0 - source_y0
+    for x0, y0, x1, y1 in money_words:
+        page.draw_rect(
+            fitz.Rect(x0 - 0.5, y0 + offset_y - 0.4, x1 + 0.5, y1 + offset_y + 0.4),
+            color=(1, 1, 1),
+            fill=(1, 1, 1),
+            width=0,
+            overlay=True,
+        )
+
+    base_pos = money_words[0]
+    vat_pos = money_words[-1]
+    baseline_offset = 6.7
+    _right_align_text(
+        page,
+        f"{sum_base:.2f}",
+        right_x=base_pos[2],
+        baseline_y=dest_y0 + baseline_offset,
+        fontname=fontname,
+    )
+    _right_align_text(
+        page,
+        f"{sum_vat:.2f}",
+        right_x=vat_pos[2],
+        baseline_y=dest_y0 + baseline_offset,
+        fontname=fontname,
+    )
+
+
+def _sum_selected_pdf_amounts(
+    src,
+    row_clips: list[tuple],
+    *,
+    total_page,
+    total_y0: float,
+    total_y1: float,
+) -> tuple[float, float] | None:
+    """Суммирует базу и НДС непосредственно из выбранных полос PDF."""
+    total_money = []
+    for word in total_page.get_text("words"):
+        x0, y0, x1, y1, text = word[:5]
+        if float(y0) < total_y0 - 1.0 or float(y1) > total_y1 + 1.5:
+            continue
+        value = str(text).strip().replace(",", ".")
+        if re.fullmatch(r"-?\d+\.\d{2}", value):
+            total_money.append((float(x0), float(x1)))
+    total_money.sort()
+    if len(total_money) < 2:
+        return None
+
+    base_right = total_money[0][1]
+    vat_right = total_money[-1][1]
+    base_sum = 0.0
+    vat_sum = 0.0
+    base_hits = 0
+    vat_hits = 0
+
+    for item in row_clips:
+        if item[0] == "split":
+            bands = [(item[3], item[4])]
+        else:
+            bands = [(item[1], item[2])]
+        for page_index, clip in bands:
+            for word in src[page_index].get_text("words"):
+                _x0, y0, x1, y1, text = word[:5]
+                if float(y0) < float(clip.y0) - 1.0 or float(y1) > float(clip.y1) + 1.5:
+                    continue
+                value = str(text).strip().replace(",", ".")
+                if not re.fullmatch(r"-?\d+\.\d{2}", value):
+                    continue
+                amount = _parse_money(value)
+                if abs(float(x1) - base_right) <= 5.0:
+                    base_sum += amount
+                    base_hits += 1
+                elif abs(float(x1) - vat_right) <= 5.0:
+                    vat_sum += amount
+                    vat_hits += 1
+
+    if not base_hits and not vat_hits:
+        return None
+    return base_sum, vat_sum
+
+
 def build_sales_book_extract_pdf(
     *,
     seller_inn: str,
@@ -822,12 +967,18 @@ def build_sales_book_extract_pdf(
         total_y0, total_y1 = _total_band_ys(last)
         total_h = total_y1 - total_y0
 
-        # Копируем только фактический блок ЭП. Раньше верх принудительно
-        # ограничивался 534 pt, поэтому на страницах с низким штампом вместе
-        # с ним повторно попадали хвост последней строки и исходное «Итого».
-        stamp_top = _stamp_top_y(last)
-        stamp_top = min(max(0.0, stamp_top), max(0.0, page_h - 1.0))
-        stamp_h = page_h - stamp_top
+        pdf_totals = _sum_selected_pdf_amounts(
+            src,
+            row_clips,
+            total_page=last,
+            total_y0=total_y0,
+            total_y1=total_y1,
+        )
+        if pdf_totals is not None:
+            sum_base, sum_vat = pdf_totals
+
+        stamp_clip = _stamp_clip_rect(last)
+        stamp_h = float(stamp_clip.height)
 
         rows_h = 0.0
         for item in row_clips:
@@ -853,15 +1004,16 @@ def build_sales_book_extract_pdf(
             0,
             clip=fitz.Rect(0, 0, page_w, header_end + _SABY_LINE_H),
         )
-        # 2) строки — pixmap 3× (внутри строки сетка = оригинал 1:1)
-        zoom = 3.0
-        mat = fitz.Matrix(zoom, zoom)
+        # 2) строки — снимки 3× исходных фрагментов. Геометрию не меняем:
+        # прежнее стирание правой части и повторная сетка по фиксированным X
+        # были причиной смещённого текста и двойных линий.
         y = header_end + _SABY_LINE_H
-        detail_bands: list[tuple[float, float]] = []
 
-        def _place_pixmap(pi: int, clip, *, skip_top: bool, whole_is_detail: bool = False) -> None:
+        zoom = 3.0
+        matrix = fitz.Matrix(zoom, zoom)
+
+        def _place_pixmap(pi: int, clip, *, skip_top: bool) -> None:
             nonlocal y
-            # clip.y1 — y0 линии; включаем толщину линии
             c = fitz.Rect(
                 clip.x0,
                 clip.y0,
@@ -870,97 +1022,78 @@ def build_sales_book_extract_pdf(
             )
             if skip_top:
                 c.y0 = min(c.y1 - 1.0, c.y0 + _SABY_LINE_H)
-            y0 = y
-            pix = src[pi].get_pixmap(matrix=mat, clip=c, alpha=False)
-            x_cut = int(690 * zoom)
-            if x_cut < pix.width:
-                pix.set_rect(fitz.IRect(x_cut, 0, pix.width, pix.height), (255, 255, 255))
-            h = float(c.height)
-            new.insert_image(fitz.Rect(0, y, page_w, y + h), pixmap=pix, keep_proportion=False)
-            y += h
-            if whole_is_detail:
-                detail_bands.append((y0, y))
-            else:
-                rel = _detail_band_on_page(src[pi], clip)
-                if rel is not None:
-                    d0 = y0 + (rel[0] - float(c.y0))
-                    d1 = y0 + (min(rel[1], float(clip.y1)) - float(c.y0)) + _SABY_LINE_H
-                    detail_bands.append((max(y0, d0), min(y, d1)))
+            pix = src[pi].get_pixmap(matrix=matrix, clip=c, alpha=False)
+
+            # Убираем только технический COMPARE_ROW, не затрагивая таблицу.
+            sx = float(pix.width) / max(1.0, float(c.width))
+            sy = float(pix.height) / max(1.0, float(c.height))
+            for marker in src[pi].search_for("COMPARE_ROW"):
+                hit = fitz.Rect(marker) & c
+                if hit.is_empty:
+                    continue
+                marker_rect = fitz.IRect(
+                    max(0, int((hit.x0 - c.x0 - 1.0) * sx)),
+                    max(0, int((hit.y0 - c.y0 - 0.5) * sy)),
+                    min(pix.width, int((hit.x1 - c.x0 + 1.0) * sx) + 1),
+                    min(pix.height, int((hit.y1 - c.y0 + 0.5) * sy) + 1),
+                )
+                pix.set_rect(marker_rect, (255, 255, 255))
+
+            height = float(c.height)
+            new.insert_image(
+                fitz.Rect(0, y, page_w, y + height),
+                pixmap=pix,
+                keep_proportion=False,
+            )
+            y += height
 
         for item in row_clips:
             if item[0] == "split":
                 _, pi_name, name_clip, pi_amt, amt_clip = item
-                _place_pixmap(pi_name, name_clip, skip_top=True, whole_is_detail=False)
-                _place_pixmap(pi_amt, amt_clip, skip_top=False, whole_is_detail=True)
+                _place_pixmap(pi_name, name_clip, skip_top=True)
+                _place_pixmap(pi_amt, amt_clip, skip_top=False)
             else:
                 _, pi, clip = item
-                _place_pixmap(pi, clip, skip_top=True, whole_is_detail=False)
+                _place_pixmap(pi, clip, skip_top=True)
 
-        # 3) место под «Итого» (текст/линии — после оверлея вертикалей)
+        # 3) родная строка «Итого»: сохраняем сетку текущего шаблона и
+        # заменяем только суммы выбранного контрагента.
         total_y0_dest = y
-        detail_bands.append((total_y0_dest, total_y0_dest + total_h))
-        fontname = _ensure_font(new, font_path)
-        y = total_y0_dest + total_h + 10.0
-
-        # 4) штамп
-        stamp_clip = fitz.Rect(0, stamp_top, page_w, page_h)
-        stamp_dest = fitz.Rect(0, y, page_w, y + stamp_h)
-        new.show_pdf_page(stamp_dest, src, last_i, clip=stamp_clip)
-
-        # 5) ровные вертикали в зонах сумм; горизонтали поверх (закрывают дырки wipe)
-        pad = 0.30
-        h_ys: list[float] = []
-        for gy0, gy1 in detail_bands:
-            if gy1 - gy0 < 2:
-                continue
-            for x in _SABY_GRID_VERT_X:
-                new.draw_rect(
-                    fitz.Rect(x - pad, gy0, x + _SABY_LINE_H + pad, gy1),
-                    color=(1, 1, 1),
-                    fill=(1, 1, 1),
-                    width=0,
-                )
-            for x in _SABY_GRID_VERT_X:
-                new.draw_rect(
-                    fitz.Rect(x, gy0, x + _SABY_LINE_H, gy1),
-                    color=(0, 0, 0),
-                    fill=(0, 0, 0),
-                    width=0,
-                )
-            h_ys.extend((gy0, gy1 - _SABY_LINE_H))
-
-        h_uniq: list[float] = []
-        for hy in sorted(set(round(v, 2) for v in h_ys)):
-            if not h_uniq or abs(hy - h_uniq[-1]) > 1.0:
-                h_uniq.append(hy)
-        for hy in h_uniq:
-            new.draw_rect(
-                fitz.Rect(_SABY_TABLE_X0, hy, _SABY_TABLE_X1, hy + _SABY_LINE_H),
-                color=(0, 0, 0),
-                fill=(0, 0, 0),
-                width=0,
-            )
-        # вертикали ещё раз поверх горизонталей — непрерывные столбцы
-        for gy0, gy1 in detail_bands:
-            if gy1 - gy0 < 2:
-                continue
-            for x in _SABY_GRID_VERT_X:
-                new.draw_rect(
-                    fitz.Rect(x, gy0, x + _SABY_LINE_H, gy1),
-                    color=(0, 0, 0),
-                    fill=(0, 0, 0),
-                    width=0,
-                )
-
-        _draw_total_row(
+        total_clip = fitz.Rect(
+            0,
+            total_y0,
+            page_w,
+            min(page_h, total_y1 + _SABY_LINE_H),
+        )
+        y = _show_band(
             new,
-            y0=total_y0_dest,
-            height=total_h,
+            src,
+            last_i,
+            total_clip,
+            y,
+            skip_top_line=True,
+        )
+        fontname = _ensure_font(new, font_path)
+        _replace_total_values(
+            new,
+            last,
+            source_y0=total_y0 + _SABY_LINE_H,
+            source_y1=total_y1 + _SABY_LINE_H,
+            dest_y0=total_y0_dest,
             fontname=fontname,
-            sum_with=sum_with,
             sum_base=sum_base,
             sum_vat=sum_vat,
         )
+        y += 10.0
+
+        # 4) штамп
+        stamp_dest = fitz.Rect(
+            float(stamp_clip.x0),
+            y,
+            float(stamp_clip.x1),
+            y + stamp_h,
+        )
+        new.show_pdf_page(stamp_dest, src, last_i, clip=stamp_clip)
 
         buf = io.BytesIO()
         out.save(buf, garbage=4, deflate=True)
