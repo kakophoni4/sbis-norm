@@ -1,5 +1,7 @@
 # API: выгрузка требований ФНС во внешний сервис
 
+> **Для команды CRM:** полная интеграционная документация — [`API_REQUIREMENTS_CRM.md`](API_REQUIREMENTS_CRM.md).
+
 Базовый URL: `http://<host>:8000/api/`  
 Content-Type: `application/json`
 
