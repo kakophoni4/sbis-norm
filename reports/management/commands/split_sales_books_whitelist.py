@@ -44,6 +44,10 @@ def _is_retryable_failure(note: str) -> bool:
         for x in (
             "формир",
             "не найден",
+            "не книга",
+            "пустая книга",
+            "0 buyers",
+            "buyers=0",
             "proxy",
             "503",
             "429",
@@ -390,11 +394,24 @@ class Command(BaseCommand):
         from_cache = False
 
         if reuse_full and full_path.is_file() and full_path.stat().st_size > 1000:
-            pdf_bytes = full_path.read_bytes()
-            from_cache = True
-            sbis_doc_id = "local_cache"
-            pdf_filename = full_path.name
-        else:
+            cached = full_path.read_bytes()
+            cached_rows = parse_sales_rows_from_saby_pdf(cached, counterparty_id=None)
+            cached_buyers = {
+                (getattr(r, "buyer_inn", None) or "").strip()
+                for r in cached_rows
+                if (getattr(r, "buyer_inn", None) or "").strip().isdigit()
+            }
+            if cached_buyers:
+                pdf_bytes = cached
+                from_cache = True
+                sbis_doc_id = "local_cache"
+                pdf_filename = full_path.name
+            else:
+                # старый прогон положил чужой/пустой PDF — перекачиваем
+                self.stdout.write(
+                    self.style.WARNING(f"  {inn}: кэш _full.pdf пустой/не книга — качаем заново")
+                )
+        if pdf_bytes is None:
             resp = fetch_sales_book_pdf(
                 inn,
                 date_from=date_from,
@@ -433,15 +450,16 @@ class Command(BaseCommand):
                 by_buyer[buyer].append(row)
 
         if not by_buyer:
-            index_path = shop_dir / "_index.tsv"
-            with index_path.open("w", encoding="utf-8", newline="") as f:
-                w = csv.DictWriter(
-                    f,
-                    fieldnames=["buyer_inn", "buyer_name", "rows", "pdf", "status"],
-                    delimiter="\t",
-                )
-                w.writeheader()
-            return 0, f"doc={sbis_doc_id[:12]} rows=0 buyers=0"
+            # не считаем успехом: часто скачали чужой ОтчетФНС без раздела 9
+            if full_path.is_file() and not from_cache:
+                try:
+                    full_path.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError(
+                f"пустая книга / не тот документ: doc={sbis_doc_id[:36]} "
+                f"pdf={pdf_filename} rows={len(rows)} buyers=0"
+            )
 
         stamp = extract_stamp_meta_from_pdf(pdf_bytes)
         title_meta = extract_title_meta_from_pdf(pdf_bytes)

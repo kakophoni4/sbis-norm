@@ -795,29 +795,33 @@ def _is_accepted_fns_state(state: dict) -> bool:
     return any(h in blob for h in accept_hints)
 
 
-def _sales_book_doc_score(doc: dict) -> int:
-    """Приоритет ОтчетФНС, где с большей вероятностью лежит книга продаж (НД по НДС)."""
-    name = str(doc.get("Название") or "")
-    subtype = str(doc.get("Подтип") or "")
-    blob = f"{name} {subtype}".lower()
-    score = 0
-    if "1151001" in blob:
-        score += 120
-    if "ндс" in blob:
-        score += 100
-    if "декларац" in blob:
-        score += 60
-    if "продаж" in blob or "книга" in blob:
-        score += 40
-    if "прибыл" in blob or "усн" in blob or "имуществ" in blob:
-        score -= 80
-    if _is_accepted_fns_state(_doc_state_info(doc)):
-        score += 25
-    # свежие чуть выше
-    created = str(doc.get("ДатаВремяСоздания") or doc.get("Дата") or "")
-    if created:
-        score += 1
-    return score
+def _sales_book_doc_sort_key(doc: dict) -> tuple:
+    """Приоритет документов: НД по НДС / декларация выше «Отчеты ФНС» без книги."""
+    name = str(doc.get("Название") or "").lower()
+    if "нд по ндс" in name or ("декларац" in name and "ндс" in name):
+        return (0, name)
+    if "ндс" in name and "отчеты фнс" not in name:
+        return (1, name)
+    if "книга" in name and "продаж" in name:
+        return (2, name)
+    return (9, name)
+
+
+def _count_sales_book_pdf_rows(pdf_bytes: bytes) -> int:
+    try:
+        return len(parse_sales_rows_from_saby_pdf(pdf_bytes, counterparty_id=None))
+    except Exception:
+        return 0
+
+
+def _looks_like_sales_book_pdf(pdf_name: str, row_n: int) -> bool:
+    """NO_NDS.9* — книга продаж разд.9; иначе требуем строки COMPARE_ROW."""
+    base = (pdf_name or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if "no_nds.9" in base:
+        return True
+    if "продаж" in base or "knprod" in base or "кнпрод" in base or "разд9" in base:
+        return True
+    return int(row_n or 0) > 0
 
 
 def _extract_sales_book_pdf_from_zip(zip_bytes: bytes) -> tuple[bytes, str]:
@@ -939,16 +943,15 @@ def fetch_sales_book_pdf(
     if sbis_doc_id:
         docs = [d for d in docs if (d.get("Идентификатор") or "").strip() == sbis_doc_id]
     else:
-        # Не долбим все ОтчетФНС подряд: сначала НД НДС, иначе СБИС гоняет SR2D по мусору.
-        docs = sorted(docs, key=_sales_book_doc_score, reverse=True)
+        # Сначала «НД по НДС» / декларации — иначе успеваем скачать чужой ОтчетФНС без книги
+        docs = sorted(docs, key=_sales_book_doc_sort_key)
 
     found: list[dict] = []
     scanned = 0
-    # На один ИНН достаточно нескольких лучших кандидатов — книга либо в топе, либо её нет.
-    try_limit = min(int(max_docs), 5 if not sbis_doc_id else int(max_docs))
     for doc in docs:
-        if scanned >= try_limit:
+        if scanned >= max_docs:
             break
+        scanned += 1
         doc_id = (doc.get("Идентификатор") or "").strip()
         state = _doc_state_info(doc)
         if only_accepted and not _is_accepted_fns_state(state):
@@ -962,15 +965,6 @@ def fetch_sales_book_pdf(
         archive_url = (doc.get("СсылкаНаАрхив") or "").strip()
         if not archive_url:
             continue
-        scanned += 1
-        score = _sales_book_doc_score(doc)
-        logger.info(
-            "sales_book_pdf try inn=%s doc=%s score=%s name=%s",
-            inn,
-            doc_id[:36],
-            score,
-            (doc.get("Название") or "")[:80],
-        )
         try:
             zip_bytes = _download_archive_zip(
                 inn=inn,
@@ -982,13 +976,26 @@ def fetch_sales_book_pdf(
                 pdf_ready_sleep_sec=max(1.0, float(pdf_ready_sleep_sec)),
             )
             pdf_bytes, pdf_name = _extract_sales_book_pdf_from_zip(zip_bytes)
+            row_n = _count_sales_book_pdf_rows(pdf_bytes)
+            if not _looks_like_sales_book_pdf(pdf_name, row_n):
+                found.append(
+                    {
+                        "sbis_doc_id": doc_id,
+                        "doc_name": doc.get("Название"),
+                        "state": state,
+                        "ok": False,
+                        "error": f"не книга продаж (pdf={pdf_name}, rows={row_n})",
+                        "pdf_filename": pdf_name,
+                        "sales_rows": row_n,
+                    }
+                )
+                continue
         except Exception as e:
             found.append(
                 {
                     "sbis_doc_id": doc_id,
                     "doc_name": doc.get("Название"),
                     "state": state,
-                    "score": score,
                     "ok": False,
                     "error": str(e),
                 }
@@ -999,15 +1006,16 @@ def fetch_sales_book_pdf(
                 "sbis_doc_id": doc_id,
                 "doc_name": doc.get("Название"),
                 "state": state,
-                "score": score,
                 "ok": True,
                 "pdf_filename": pdf_name,
                 "pdf_b64": base64.b64encode(pdf_bytes).decode("ascii"),
                 "archive_url": archive_url,
+                "sales_rows": row_n,
             }
         )
-        # Книга нашлась — дальше другие ОтчетФНС не трогаем (меньше SR2D/прокси).
-        break
+        # нашли нормальную книгу — дальше не перебираем чужие отчёты
+        if not sbis_doc_id and row_n > 0:
+            break
 
     ok_docs = [x for x in found if x.get("ok")]
     if not ok_docs:
@@ -1033,31 +1041,28 @@ def fetch_sales_book_pdf(
             },
         }
 
-    # один конкретный doc_id или единственный успешный — плоский result; иначе список
-    if sbis_doc_id or len(ok_docs) == 1:
-        one = ok_docs[0]
-        return {
-            "success": True,
-            "result": {
-                "inn": inn,
-                "period": {"from": date_from, "to": date_to},
-                "only_accepted": bool(only_accepted),
-                "sbis_doc_id": one["sbis_doc_id"],
-                "doc_name": one.get("doc_name"),
-                "state": one.get("state"),
-                "pdf_filename": one.get("pdf_filename"),
-                "pdf_b64": one.get("pdf_b64"),
-                "archive_url": one.get("archive_url"),
-                "matched_count": len(ok_docs),
-            },
-        }
-
+    # лучший по NO_NDS.9 / числу строк (не первый попавшийся чужой отчёт)
+    ok_docs = sorted(
+        ok_docs,
+        key=lambda x: (
+            0 if "no_nds.9" in str(x.get("pdf_filename") or "").lower() else 1,
+            -int(x.get("sales_rows") or 0),
+        ),
+    )
+    one = ok_docs[0]
     return {
         "success": True,
         "result": {
             "inn": inn,
             "period": {"from": date_from, "to": date_to},
             "only_accepted": bool(only_accepted),
+            "sbis_doc_id": one["sbis_doc_id"],
+            "doc_name": one.get("doc_name"),
+            "state": one.get("state"),
+            "pdf_filename": one.get("pdf_filename"),
+            "pdf_b64": one.get("pdf_b64"),
+            "archive_url": one.get("archive_url"),
+            "sales_rows": one.get("sales_rows"),
             "matched_count": len(ok_docs),
             "documents": [
                 {
@@ -1065,9 +1070,12 @@ def fetch_sales_book_pdf(
                     "doc_name": x.get("doc_name"),
                     "state": x.get("state"),
                     "pdf_filename": x.get("pdf_filename"),
+                    "sales_rows": x.get("sales_rows"),
                     "pdf_b64": x.get("pdf_b64"),
                 }
                 for x in ok_docs
-            ],
+            ]
+            if len(ok_docs) > 1
+            else None,
         },
     }
