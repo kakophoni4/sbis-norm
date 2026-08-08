@@ -22,6 +22,21 @@ logger = logging.getLogger(__name__)
 _SBIS_USER_AGENT = "sbis-norm/1.0 (requirement-reply; Django)"
 
 
+def _norm_error(err) -> dict:
+    if isinstance(err, dict):
+        if "message" in err:
+            return err
+        return {"message": json.dumps(err, ensure_ascii=False)[:1500]}
+    return {"message": str(err)[:1500]}
+
+
+def _safe_log_http(prefix: str, url: str, headers: dict, body: str, resp) -> None:
+    try:
+        log_http_exchange(prefix, url, headers, body, resp)
+    except Exception:
+        logger.exception("log_http_exchange failed prefix=%s", prefix)
+
+
 def _clean_b64(s: str) -> str:
     s = (s or "").strip()
     if "," in s and "base64" in s[:100].lower():
@@ -132,14 +147,14 @@ def send_requirement_reply(
         }
 
     cert_path = f"/tmp/sbis_req_reply_{inn}.cer"
-    export_cert_der(cert.csptest_name, cert_path)
-    thumbprint = get_thumbprint_from_cert(cert_path)
-    fio = (get_fio_from_cert_file(cert_path) or "—").strip() or "—"
-
     try:
+        export_cert_der(cert.csptest_name, cert_path)
+        thumbprint = get_thumbprint_from_cert(cert_path)
+        fio = (get_fio_from_cert_file(cert_path) or "—").strip() or "—"
         session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn)
     except Exception as e:
-        return {"success": False, "error": {"message": f"Ошибка аутентификации в СБИС: {e}"}}
+        logger.exception("requirement_reply auth/cert inn=%s", inn)
+        return {"success": False, "error": {"message": f"Ошибка сертификата/auth в СБИС: {e}"}}
 
     tmp_dir = tempfile.mkdtemp(prefix=f"req_reply_{inn}_")
     enclosures: list[dict] = []
@@ -192,7 +207,7 @@ def send_requirement_reply(
         body = {"jsonrpc": "2.0", "method": "СБИС.ЗаписатьКомплект", "params": {"Документ": [doc]}, "id": 1}
         body_json = json.dumps(body, ensure_ascii=False)
         resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=body_json, timeout=60)
-        log_http_exchange("REQ_REPLY_WRITE", REPORTING_URL, headers, body_json, resp)
+        _safe_log_http("REQ_REPLY_WRITE", REPORTING_URL, headers, body_json, resp)
 
         if resp.status_code != 200:
             return {
@@ -204,7 +219,7 @@ def send_requirement_reply(
         except Exception as e:
             return {"success": False, "error": {"message": f"JSON ЗаписатьКомплект: {e}", "raw": (resp.text or "")[:400]}}
         if data.get("error"):
-            return {"success": False, "error": data["error"]}
+            return {"success": False, "error": _norm_error(data["error"])}
 
         result_list = data.get("result")
         if isinstance(result_list, list) and result_list:
@@ -252,7 +267,7 @@ def send_requirement_reply(
         }
         prep_json = json.dumps(prep_body, ensure_ascii=False)
         prep_resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=prep_json, timeout=60)
-        log_http_exchange("REQ_REPLY_PREP", REPORTING_URL, headers, prep_json, prep_resp)
+        _safe_log_http("REQ_REPLY_PREP", REPORTING_URL, headers, prep_json, prep_resp)
         if prep_resp.status_code != 200:
             return {
                 "success": False,
@@ -264,7 +279,7 @@ def send_requirement_reply(
         except Exception as e:
             return {"success": False, "error": {"message": f"JSON ПодготовитьДействие: {e}"}, "reply_sbis_doc_id": sbis_doc_id}
         if prep_data.get("error"):
-            return {"success": False, "error": prep_data["error"], "reply_sbis_doc_id": sbis_doc_id}
+            return {"success": False, "error": _norm_error(prep_data["error"]), "reply_sbis_doc_id": sbis_doc_id}
 
         exec_attachments = []
         for path, ident in file_id_map.items():
@@ -303,7 +318,7 @@ def send_requirement_reply(
         }
         exec_json = json.dumps(exec_body, ensure_ascii=False)
         exec_resp = _sbis_request("POST", REPORTING_URL, inn=inn, headers=headers, data=exec_json, timeout=90)
-        log_http_exchange("REQ_REPLY_EXEC", REPORTING_URL, headers, exec_json, exec_resp)
+        _safe_log_http("REQ_REPLY_EXEC", REPORTING_URL, headers, exec_json, exec_resp)
         if exec_resp.status_code != 200:
             return {
                 "success": False,
@@ -315,12 +330,13 @@ def send_requirement_reply(
         except Exception as e:
             return {"success": False, "error": {"message": f"JSON ВыполнитьДействие: {e}"}, "reply_sbis_doc_id": sbis_doc_id}
         if exec_data.get("error"):
-            return {"success": False, "error": exec_data["error"], "reply_sbis_doc_id": sbis_doc_id}
+            return {"success": False, "error": _norm_error(exec_data["error"]), "reply_sbis_doc_id": sbis_doc_id}
 
         sent_at = datetime.now()
+        # result может быть огромным — в API отдаём компактно
         return {
             "success": True,
-            "result": exec_data.get("result") or exec_data,
+            "result": {"ok": True},
             "send_meta": {
                 "reply_sbis_doc_id": sbis_doc_id,
                 "requirement_sbis_doc_id": requirement_sbis_doc_id,
@@ -332,6 +348,9 @@ def send_requirement_reply(
             },
             "parsed": parsed,
         }
+    except Exception as e:
+        logger.exception("requirement_reply failed inn=%s doc=%s", inn, requirement_sbis_doc_id)
+        return {"success": False, "error": {"message": f"requirement_reply exception: {e}"}}
     finally:
         try:
             for name in os.listdir(tmp_dir):

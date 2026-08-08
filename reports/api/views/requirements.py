@@ -274,12 +274,19 @@ class RequirementReplyView(APIView):
         else:
             dry_run = bool(dry_run_raw)
 
-        result = send_requirement_reply(
-            inn=doc.inn,
-            requirement_sbis_doc_id=doc.sbis_doc_id,
-            attachments=attachments,
-            dry_run=dry_run,
-        )
+        try:
+            result = send_requirement_reply(
+                inn=doc.inn,
+                requirement_sbis_doc_id=doc.sbis_doc_id,
+                attachments=attachments,
+                dry_run=dry_run,
+            )
+        except Exception as e:
+            logger.exception("requirements reply id=%s failed", pk)
+            return Response(
+                {"success": False, "error": {"message": f"unhandled: {e}"}},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
 
         if dry_run:
             code = status.HTTP_200_OK if result.get("success") else status.HTTP_400_BAD_REQUEST
@@ -302,13 +309,18 @@ class RequirementReplyView(APIView):
             )
             return Response(result, status=status.HTTP_200_OK)
 
-        err = result.get("error") or {}
+        err = result.get("error")
+        if not isinstance(err, dict):
+            err = {"message": str(err or "unknown error")}
         err_msg = str(err.get("message") or err)[:2000]
-        doc.reply_status = RequirementDocument.REPLY_STATUS_ERROR
-        doc.reply_error = err_msg
-        if result.get("reply_sbis_doc_id"):
-            doc.reply_sbis_doc_id = result.get("reply_sbis_doc_id")
-        doc.save(update_fields=["reply_status", "reply_error", "reply_sbis_doc_id"])
+        try:
+            doc.reply_status = RequirementDocument.REPLY_STATUS_ERROR
+            doc.reply_error = err_msg
+            if result.get("reply_sbis_doc_id"):
+                doc.reply_sbis_doc_id = result.get("reply_sbis_doc_id")
+            doc.save(update_fields=["reply_status", "reply_error", "reply_sbis_doc_id"])
+        except Exception:
+            logger.exception("failed to persist reply_error id=%s", pk)
 
         hint = result.get("http_hint")
         if hint == 401:
@@ -317,4 +329,4 @@ class RequirementReplyView(APIView):
             code = status.HTTP_403_FORBIDDEN
         else:
             code = status.HTTP_400_BAD_REQUEST
-        return Response(result, status=code)
+        return Response({"success": False, "error": err, "reply_sbis_doc_id": result.get("reply_sbis_doc_id")}, status=code)
