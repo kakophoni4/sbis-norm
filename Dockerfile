@@ -9,6 +9,7 @@ RUN apt-get update && apt-get install -y \
         procps \
         wget \
         lsb-release \
+        fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
 # Установка CryptoPro CSP из архива

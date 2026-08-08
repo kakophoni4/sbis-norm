@@ -23,13 +23,23 @@ from django.conf import settings
 from requests.adapters import HTTPAdapter
 from requests.exceptions import ConnectionError, ProxyError, SSLError, Timeout
 
-from reports.models import Certificate
+from reports.models import Certificate, Organization
 from reports.nodemaven_sdk.nodemaven import NodeMavenClient
 
 from .constants import *
 from .auth import auth_sbis_by_cert, sbis_auth_session_for_inn
 from .client import _sbis_get, _sbis_post, sbis_rpc
 from .crypto import export_cert_der, get_thumbprint_from_cert
+from .sales_book_extract_pdf import (
+    build_sales_book_extract_pdf,
+    extract_stamp_meta_from_pdf,
+    extract_title_meta_from_pdf,
+    normalize_xml_sales_rows,
+    parse_sales_rows_from_saby_pdf,
+)
+
+logger = logging.getLogger(__name__)
+
 
 def _download_archive_zip(
     inn: str,
@@ -219,6 +229,37 @@ def _local_xml_tag(tag: str) -> str:
         return tag.rsplit("}", 1)[-1]
     return tag
 
+def _merge_element_attrs(node: ET.Element, *, depth: int = 3) -> dict[str, str]:
+    """Собирает attrs узла и потомков (для КнПродСтр + СвПокуп)."""
+    out: dict[str, str] = {}
+
+    def walk(el: ET.Element, d: int) -> None:
+        for k, v in (el.attrib or {}).items():
+            ks, vs = str(k), str(v)
+            if ks not in out or not out[ks]:
+                out[ks] = vs
+        if d <= 0:
+            return
+        for ch in list(el):
+            walk(ch, d - 1)
+
+    walk(node, depth)
+    return out
+
+
+def _node_has_counterparty(node: ET.Element, target: str) -> bool:
+    target = (target or "").strip()
+    if not target:
+        return True
+    for k, v in (node.attrib or {}).items():
+        if target == str(v).strip() and any(h in str(k) for h in ("ИНН", "Ид", "Идентификатор", "Покуп")):
+            return True
+    for ch in list(node):
+        if _node_has_counterparty(ch, target):
+            return True
+    return False
+
+
 def _collect_sales_book_rows(
     xml_bytes: bytes,
     *,
@@ -226,9 +267,8 @@ def _collect_sales_book_rows(
     max_rows: int = 500,
 ) -> dict:
     """
-    Возвращает строки/узлы книги продаж (раздел 9).
-    - если counterparty_id передан: фильтр по контрагенту
-    - если counterparty_id пустой: возвращаем все строки раздела 9
+    Возвращает строки книги продаж (раздел 9).
+    Предпочтительно родительские КнПродСтр с смерженными attrs покупателя.
     """
     target = (counterparty_id or "").strip()
 
@@ -239,47 +279,64 @@ def _collect_sales_book_rows(
 
     rows: list[dict] = []
     xml_hits = 0
-
     sales_hints = ("КнигаПрод", "КнПрод", "Разд9", "Продаж")
-    counterparty_attr_hints = ("ИНН", "Ид", "Идентификатор", "Покуп")
+    row_tag_hints = ("КнПродСтр", "КнигаПродСтр", "Стр")
+
+    def is_row_tag(tag: str) -> bool:
+        t = (tag or "").lower()
+        return any(h.lower() in t for h in row_tag_hints) and ("стр" in t or t.endswith("str"))
 
     def walk(node: ET.Element, path: list[str]) -> None:
         nonlocal xml_hits
         current_tag = _local_xml_tag(node.tag)
         current_path = path + [current_tag]
-
-        attrs = {str(k): str(v) for k, v in (node.attrib or {}).items()}
         path_str = "/".join(current_path)
-
         in_sales_section = any(h.lower() in path_str.lower() for h in sales_hints)
-        if in_sales_section:
-            match_by_counterparty = False
-            if target:
-                for k, v in attrs.items():
-                    key_ok = any(h.lower() in k.lower() for h in counterparty_attr_hints)
-                    if key_ok and v.strip() == target:
-                        match_by_counterparty = True
-                        break
-            else:
-                # Когда контрагент не задан, возвращаем узлы раздела 9,
-                # где есть полезные атрибуты (обычно строки/записи книги продаж).
-                match_by_counterparty = bool(attrs)
 
-            if match_by_counterparty:
-                xml_hits += 1
-                if len(rows) < max_rows:
-                    rows.append(
-                        {
-                            "tag": current_tag,
-                            "path": path_str,
-                            "attrs": attrs,
-                        }
-                    )
+        if in_sales_section and is_row_tag(current_tag):
+            if (not target) or _node_has_counterparty(node, target):
+                # без фильтра — только строки с полезными attrs
+                attrs = _merge_element_attrs(node)
+                if target or attrs:
+                    xml_hits += 1
+                    if len(rows) < max_rows:
+                        rows.append({"tag": current_tag, "path": path_str, "attrs": attrs})
+            # не спускаемся в дочерние «ложные» хиты по СвПокуп
+            return
 
         for ch in list(node):
             walk(ch, current_path)
 
     walk(root, [])
+
+    # Фоллбек: старое поведение (лист с ИНН), если row-теги не нашли
+    if not rows:
+        counterparty_attr_hints = ("ИНН", "Ид", "Идентификатор", "Покуп")
+
+        def walk_fallback(node: ET.Element, path: list[str]) -> None:
+            nonlocal xml_hits
+            current_tag = _local_xml_tag(node.tag)
+            current_path = path + [current_tag]
+            attrs = {str(k): str(v) for k, v in (node.attrib or {}).items()}
+            path_str = "/".join(current_path)
+            in_sales_section = any(h.lower() in path_str.lower() for h in sales_hints)
+            if in_sales_section:
+                match = False
+                if target:
+                    for k, v in attrs.items():
+                        if any(h.lower() in k.lower() for h in counterparty_attr_hints) and v.strip() == target:
+                            match = True
+                            break
+                else:
+                    match = bool(attrs)
+                if match:
+                    xml_hits += 1
+                    if len(rows) < max_rows:
+                        rows.append({"tag": current_tag, "path": path_str, "attrs": attrs})
+            for ch in list(node):
+                walk_fallback(ch, current_path)
+
+        walk_fallback(root, [])
 
     return {
         "total_rows": xml_hits,
@@ -295,6 +352,7 @@ def fetch_sales_book_extract_by_counterparty(
     sbis_doc_id: str | None = None,
     nds_subtype: str | None = None,
     max_docs: int = 30,
+    response_format: str = "json",
     rpc_timeout_sec: int = 25,
     rpc_budget_sec: int = 30,
     archive_timeout_sec: int = 20,
@@ -311,19 +369,29 @@ def fetch_sales_book_extract_by_counterparty(
 
     Дальше берём СсылкаНаАрхив у документа, читаем XML и фильтруем раздел 9 (книга продаж)
     по counterparty_id (ИНН/идентификатор контрагента).
+
+    response_format:
+      - json — строки раздела 9
+      - pdf — короткий PDF по контрагенту + визуальный штамп исходной книги
     """
     inn = (inn or "").strip()
     counterparty_id = (counterparty_id or "").strip()
+    response_format = (response_format or "json").strip().lower()
+    if response_format not in ("json", "pdf"):
+        return {"success": False, "error": {"message": "format должен быть json или pdf"}}
 
     if not inn:
         return {"success": False, "error": {"message": "inn обязателен"}}
+    if response_format == "pdf" and not counterparty_id:
+        return {
+            "success": False,
+            "error": {"message": "для format=pdf обязателен counterparty_id"},
+        }
     # Если counterparty_id не задан — вернём все найденные строки книги продаж (раздел 9).
 
     today = datetime.now()
-    if not date_to:
-        date_to = today.strftime("%d.%m.%Y")
-    if not date_from:
-        date_from = (today - timedelta(days=120)).strftime("%d.%m.%Y")
+    date_to = _normalize_sbis_date(date_to) or today.strftime("%d.%m.%Y")
+    date_from = _normalize_sbis_date(date_from) or (today - timedelta(days=120)).strftime("%d.%m.%Y")
 
     auth = sbis_auth_session_for_inn(
         inn,
@@ -438,7 +506,37 @@ def fetch_sales_book_extract_by_counterparty(
                     }
                 )
 
-        if xml_matches:
+        pdf_bytes = b""
+        pdf_name = ""
+        pdf_rows: list = []
+        stamp_meta = None
+        if response_format == "pdf":
+            try:
+                pdf_bytes, pdf_name = _extract_sales_book_pdf_from_zip(zip_bytes)
+                pdf_rows = parse_sales_rows_from_saby_pdf(
+                    pdf_bytes, counterparty_id=counterparty_id
+                )
+                stamp_meta = extract_stamp_meta_from_pdf(pdf_bytes)
+            except Exception as e:
+                logger.info(
+                    "sales_book_extract pdf parse skip inn=%s doc=%s err=%s",
+                    inn,
+                    doc_id[:36],
+                    e,
+                )
+                if not xml_matches:
+                    matched_docs.append(
+                        {
+                            "doc_id": doc_id,
+                            "name": doc.get("Название"),
+                            "archive_url": archive_url,
+                            "ok": False,
+                            "error": f"PDF книги продаж: {e}",
+                        }
+                    )
+                    continue
+
+        if xml_matches or pdf_rows:
             matched_docs.append(
                 {
                     "doc_id": doc_id,
@@ -447,8 +545,120 @@ def fetch_sales_book_extract_by_counterparty(
                     "archive_url": archive_url,
                     "ok": True,
                     "xml_matches": xml_matches,
+                    "pdf_filename": pdf_name or None,
+                    "pdf_rows_count": len(pdf_rows),
+                    "_pdf_bytes": pdf_bytes if response_format == "pdf" else None,
+                    "_pdf_rows": pdf_rows if response_format == "pdf" else None,
+                    "_stamp_meta": stamp_meta if response_format == "pdf" else None,
                 }
             )
+
+    ok_docs = [x for x in matched_docs if x.get("ok")]
+
+    if response_format == "pdf":
+        if not ok_docs:
+            return {
+                "success": False,
+                "error": {
+                    "message": "Выписка PDF: нет строк по контрагенту",
+                    "inn": inn,
+                    "counterparty_id": counterparty_id,
+                    "period": {"from": date_from, "to": date_to},
+                    "scanned_docs": scanned_docs,
+                    "attempts": [
+                        {k: v for k, v in d.items() if not str(k).startswith("_")}
+                        for d in matched_docs
+                    ],
+                },
+            }
+
+        # Берём документ с наибольшим числом строк по контрагенту
+        def _row_score(d: dict) -> int:
+            pdf_n = len(d.get("_pdf_rows") or [])
+            xml_n = sum(int(x.get("total_rows") or 0) for x in (d.get("xml_matches") or []))
+            return max(pdf_n, xml_n)
+
+        best = max(ok_docs, key=_row_score)
+        rows = list(best.get("_pdf_rows") or [])
+        if not rows:
+            raw_xml_rows: list[dict] = []
+            for xm in best.get("xml_matches") or []:
+                raw_xml_rows.extend(xm.get("rows") or [])
+            rows = normalize_xml_sales_rows(raw_xml_rows, counterparty_id=counterparty_id)
+        if not rows:
+            return {
+                "success": False,
+                "error": {
+                    "message": "Выписка PDF: строки контрагента не разобраны",
+                    "inn": inn,
+                    "counterparty_id": counterparty_id,
+                    "sbis_doc_id": best.get("doc_id"),
+                },
+            }
+
+        source_pdf_bytes = best.get("_pdf_bytes") or b""
+        stamp = best.get("_stamp_meta") or extract_stamp_meta_from_pdf(source_pdf_bytes)
+        title_meta = extract_title_meta_from_pdf(source_pdf_bytes) if source_pdf_bytes else None
+        org = Organization.objects.filter(inn=inn).first()
+        cert = Certificate.objects.filter(inn=inn).order_by("-is_active", "-last_used_at").first()
+        seller_name = (title_meta.org_name if title_meta and title_meta.org_name else None) or (
+            org.name if org else None
+        )
+        seller_kpp = (getattr(org, "kpp", None) if org else None) or (
+            getattr(cert, "kpp", None) if cert else None
+        )
+        if stamp and not stamp.certificate and cert and cert.thumbprint:
+            stamp.certificate = str(cert.thumbprint).upper()
+
+        try:
+            out_pdf = build_sales_book_extract_pdf(
+                seller_inn=inn,
+                seller_kpp=seller_kpp,
+                seller_name=seller_name,
+                counterparty_id=counterparty_id,
+                period_from=date_from,
+                period_to=date_to,
+                sbis_doc_id=best.get("doc_id") or "",
+                rows=rows,
+                stamp=stamp,
+                title=title_meta,
+                source_pdf_name=best.get("pdf_filename"),
+                source_pdf_bytes=source_pdf_bytes or None,
+            )
+        except Exception as e:
+            return {"success": False, "error": {"message": f"Ошибка генерации PDF: {e}", "inn": inn}}
+
+        out_name = f"sales_book_extract_{inn}_{counterparty_id}.pdf"
+        return {
+            "success": True,
+            "result": {
+                "inn": inn,
+                "counterparty_id": counterparty_id,
+                "mode": "by_counterparty_pdf",
+                "format": "pdf",
+                "period": {"from": date_from, "to": date_to},
+                "sbis_doc_id": best.get("doc_id"),
+                "doc_name": best.get("name"),
+                "source_pdf_filename": best.get("pdf_filename"),
+                "matched_rows": len(rows),
+                "rows": [r.to_dict() for r in rows],
+                "stamp": {
+                    "document_id": getattr(stamp, "document_id", None),
+                    "sent_line": getattr(stamp, "sent_line", None),
+                    "signed_at": getattr(stamp, "signed_at", None),
+                    "certificate": getattr(stamp, "certificate", None),
+                    "operator": getattr(stamp, "operator", None),
+                },
+                "pdf_filename": out_name,
+                "pdf_b64": base64.b64encode(out_pdf).decode("ascii"),
+                "scanned_docs": scanned_docs,
+            },
+        }
+
+    # json: убираем служебные поля
+    public_docs = []
+    for d in matched_docs:
+        public_docs.append({k: v for k, v in d.items() if not str(k).startswith("_")})
 
     return {
         "success": True,
@@ -456,6 +666,7 @@ def fetch_sales_book_extract_by_counterparty(
             "inn": inn,
             "counterparty_id": counterparty_id,
             "mode": "by_counterparty" if counterparty_id else "all_sales_books",
+            "format": "json",
             "endpoint": REPORTING_URL,
             "method": "СБИС.СписокДокументов",
             "period": {"from": date_from, "to": date_to},
@@ -470,8 +681,8 @@ def fetch_sales_book_extract_by_counterparty(
                 "archive_budget_sec": int(archive_budget_sec),
             },
             "proxy_prewarm_count": int(proxy_prewarm_count),
-            "matched_docs_count": len([x for x in matched_docs if x.get("ok")]),
-            "documents": matched_docs,
+            "matched_docs_count": len(ok_docs),
+            "documents": public_docs,
         },
     }
 

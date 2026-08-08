@@ -119,6 +119,8 @@ class SendNdsExtra1CView(APIView):
 
 
 class GetSalesBookExtractView(APIView):
+    """POST /api/sbis/get-sales-book-extract/ — json-строки или pdf-выписка по контрагенту."""
+
     permission_classes = []
 
     def post(self, request, *args, **kwargs):
@@ -143,6 +145,17 @@ class GetSalesBookExtractView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        response_format = str(request.data.get("format", "json")).strip().lower() or "json"
+        if response_format not in ("json", "pdf"):
+            return Response(
+                {
+                    "success": False,
+                    "comment": "Ошибка входных данных",
+                    "error": {"message": "format должен быть json или pdf"},
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         result = fetch_sales_book_extract_by_counterparty(
             inn=inn,
             counterparty_id=str(request.data.get("counterparty_id", "")).strip() or None,
@@ -151,6 +164,7 @@ class GetSalesBookExtractView(APIView):
             sbis_doc_id=str(request.data.get("sbis_doc_id", "")).strip() or None,
             nds_subtype=str(request.data.get("nds_subtype", "")).strip() or None,
             max_docs=max_docs,
+            response_format=response_format,
             rpc_timeout_sec=rpc_timeout_sec,
             rpc_budget_sec=rpc_budget_sec,
             archive_timeout_sec=archive_timeout_sec,

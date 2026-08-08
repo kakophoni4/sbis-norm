@@ -11,3 +11,6 @@ django-environ
 djangorestframework-simplejwt
 gunicorn
 drf-spectacular
+reportlab
+pypdf
+pymupdf
