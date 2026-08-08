@@ -795,6 +795,31 @@ def _is_accepted_fns_state(state: dict) -> bool:
     return any(h in blob for h in accept_hints)
 
 
+def _sales_book_doc_score(doc: dict) -> int:
+    """Приоритет ОтчетФНС, где с большей вероятностью лежит книга продаж (НД по НДС)."""
+    name = str(doc.get("Название") or "")
+    subtype = str(doc.get("Подтип") or "")
+    blob = f"{name} {subtype}".lower()
+    score = 0
+    if "1151001" in blob:
+        score += 120
+    if "ндс" in blob:
+        score += 100
+    if "декларац" in blob:
+        score += 60
+    if "продаж" in blob or "книга" in blob:
+        score += 40
+    if "прибыл" in blob or "усн" in blob or "имуществ" in blob:
+        score -= 80
+    if _is_accepted_fns_state(_doc_state_info(doc)):
+        score += 25
+    # свежие чуть выше
+    created = str(doc.get("ДатаВремяСоздания") or doc.get("Дата") or "")
+    if created:
+        score += 1
+    return score
+
+
 def _extract_sales_book_pdf_from_zip(zip_bytes: bytes) -> tuple[bytes, str]:
     """
     PDF книги продаж из папки PDF/ архива СБИС.
@@ -913,13 +938,17 @@ def fetch_sales_book_pdf(
     docs = (((data.get("result") or {}).get("Документ")) or [])
     if sbis_doc_id:
         docs = [d for d in docs if (d.get("Идентификатор") or "").strip() == sbis_doc_id]
+    else:
+        # Не долбим все ОтчетФНС подряд: сначала НД НДС, иначе СБИС гоняет SR2D по мусору.
+        docs = sorted(docs, key=_sales_book_doc_score, reverse=True)
 
     found: list[dict] = []
     scanned = 0
+    # На один ИНН достаточно нескольких лучших кандидатов — книга либо в топе, либо её нет.
+    try_limit = min(int(max_docs), 5 if not sbis_doc_id else int(max_docs))
     for doc in docs:
-        if scanned >= max_docs:
+        if scanned >= try_limit:
             break
-        scanned += 1
         doc_id = (doc.get("Идентификатор") or "").strip()
         state = _doc_state_info(doc)
         if only_accepted and not _is_accepted_fns_state(state):
@@ -933,6 +962,15 @@ def fetch_sales_book_pdf(
         archive_url = (doc.get("СсылкаНаАрхив") or "").strip()
         if not archive_url:
             continue
+        scanned += 1
+        score = _sales_book_doc_score(doc)
+        logger.info(
+            "sales_book_pdf try inn=%s doc=%s score=%s name=%s",
+            inn,
+            doc_id[:36],
+            score,
+            (doc.get("Название") or "")[:80],
+        )
         try:
             zip_bytes = _download_archive_zip(
                 inn=inn,
@@ -950,6 +988,7 @@ def fetch_sales_book_pdf(
                     "sbis_doc_id": doc_id,
                     "doc_name": doc.get("Название"),
                     "state": state,
+                    "score": score,
                     "ok": False,
                     "error": str(e),
                 }
@@ -960,12 +999,15 @@ def fetch_sales_book_pdf(
                 "sbis_doc_id": doc_id,
                 "doc_name": doc.get("Название"),
                 "state": state,
+                "score": score,
                 "ok": True,
                 "pdf_filename": pdf_name,
                 "pdf_b64": base64.b64encode(pdf_bytes).decode("ascii"),
                 "archive_url": archive_url,
             }
         )
+        # Книга нашлась — дальше другие ОтчетФНС не трогаем (меньше SR2D/прокси).
+        break
 
     ok_docs = [x for x in found if x.get("ok")]
     if not ok_docs:

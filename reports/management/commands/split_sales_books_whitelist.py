@@ -95,8 +95,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--workers",
             type=int,
-            default=10,
-            help="Параллельных компаний (по умолчанию 10)",
+            default=2,
+            help="Параллельных компаний (по умолчанию 2; 10 убивает NodeMaven/SR2D)",
         )
         parser.add_argument(
             "--sleep",
@@ -124,14 +124,14 @@ class Command(BaseCommand):
         parser.add_argument(
             "--pdf-ready-attempts",
             type=int,
-            default=5,
-            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 5)",
+            default=8,
+            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 8)",
         )
         parser.add_argument(
             "--pdf-ready-sleep",
             type=float,
-            default=8.0,
-            help="Пауза между ожиданиями PDF, сек (по умолчанию 8)",
+            default=10.0,
+            help="Пауза между ожиданиями PDF, сек (по умолчанию 10)",
         )
         parser.add_argument(
             "--retry-rounds",
@@ -150,14 +150,14 @@ class Command(BaseCommand):
         date_from = (options["date_from"] or "").strip()
         date_to = (options["date_to"] or "").strip()
         out_dir = Path(options["out_dir"])
-        workers = max(1, int(options["workers"] or 10))
+        workers = max(1, int(options["workers"] or 2))
         sleep_sec = max(0.0, float(options["sleep"] or 0))
         limit = int(options["limit"] or 0)
         force = bool(options["force"])
         skip_full = bool(options["skip_full_book"])
         dry_run = bool(options["dry_run"])
-        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 5))
-        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 8))
+        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 8))
+        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 10))
         retry_rounds = max(0, int(options["retry_rounds"] or 0))
         retry_sleep = max(0.0, float(options["retry_sleep"] or 0))
         only_inns = [str(x).strip() for x in (options["inn"] or []) if str(x).strip()]
