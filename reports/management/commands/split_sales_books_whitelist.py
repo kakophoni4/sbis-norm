@@ -95,8 +95,8 @@ class Command(BaseCommand):
         parser.add_argument(
             "--workers",
             type=int,
-            default=2,
-            help="Параллельных компаний (по умолчанию 2; 10 убивает NodeMaven/SR2D)",
+            default=10,
+            help="Параллельных компаний (по умолчанию 10)",
         )
         parser.add_argument(
             "--sleep",
@@ -109,12 +109,24 @@ class Command(BaseCommand):
         parser.add_argument(
             "--force",
             action="store_true",
-            help="Перезаписывать уже существующие PDF выписок",
+            help="Перекачать книгу из СБИС даже если уже есть _full.pdf",
         )
         parser.add_argument(
             "--skip-full-book",
             action="store_true",
             help="Не сохранять полную книгу _full.pdf",
+        )
+        parser.add_argument(
+            "--reuse-full",
+            action="store_true",
+            default=True,
+            help="Если есть _full.pdf — не дергать СБИС, только нарезать (по умолчанию вкл)",
+        )
+        parser.add_argument(
+            "--no-reuse-full",
+            action="store_false",
+            dest="reuse_full",
+            help="Всегда качать архив из СБИС заново",
         )
         parser.add_argument(
             "--dry-run",
@@ -124,14 +136,14 @@ class Command(BaseCommand):
         parser.add_argument(
             "--pdf-ready-attempts",
             type=int,
-            default=8,
-            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 8)",
+            default=5,
+            help="Сколько раз ждать готовности PDF в архиве СБИС (по умолчанию 5)",
         )
         parser.add_argument(
             "--pdf-ready-sleep",
             type=float,
-            default=10.0,
-            help="Пауза между ожиданиями PDF, сек (по умолчанию 10)",
+            default=8.0,
+            help="Пауза между ожиданиями PDF, сек (по умолчанию 8)",
         )
         parser.add_argument(
             "--retry-rounds",
@@ -150,14 +162,15 @@ class Command(BaseCommand):
         date_from = (options["date_from"] or "").strip()
         date_to = (options["date_to"] or "").strip()
         out_dir = Path(options["out_dir"])
-        workers = max(1, int(options["workers"] or 2))
+        workers = max(1, int(options["workers"] or 10))
         sleep_sec = max(0.0, float(options["sleep"] or 0))
         limit = int(options["limit"] or 0)
         force = bool(options["force"])
         skip_full = bool(options["skip_full_book"])
+        reuse_full = bool(options.get("reuse_full", True)) and not force
         dry_run = bool(options["dry_run"])
-        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 8))
-        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 10))
+        pdf_ready_attempts = max(1, int(options["pdf_ready_attempts"] or 5))
+        pdf_ready_sleep = max(1.0, float(options["pdf_ready_sleep"] or 8))
         retry_rounds = max(0, int(options["retry_rounds"] or 0))
         retry_sleep = max(0.0, float(options["retry_sleep"] or 0))
         only_inns = [str(x).strip() for x in (options["inn"] or []) if str(x).strip()]
@@ -222,6 +235,7 @@ class Command(BaseCommand):
                     shop_dir=shop_dir,
                     force=force,
                     skip_full=skip_full,
+                    reuse_full=reuse_full,
                     pdf_ready_attempts=pdf_ready_attempts,
                     pdf_ready_sleep=pdf_ready_sleep,
                 )
@@ -363,38 +377,53 @@ class Command(BaseCommand):
         shop_dir: Path,
         force: bool,
         skip_full: bool,
+        reuse_full: bool = True,
         pdf_ready_attempts: int = 5,
         pdf_ready_sleep: float = 8.0,
     ) -> tuple[int, str]:
-        resp = fetch_sales_book_pdf(
-            inn,
-            date_from=date_from,
-            date_to=date_to,
-            only_accepted=False,
-            max_docs=30,
-            pdf_ready_attempts=pdf_ready_attempts,
-            pdf_ready_sleep_sec=pdf_ready_sleep,
-        )
-        if not resp.get("success"):
-            err = resp.get("error") or {}
-            raise RuntimeError(err.get("message") or str(err) or "fetch_sales_book_pdf failed")
+        full_path = shop_dir / "_full.pdf"
+        pdf_bytes: bytes | None = None
+        sbis_doc_id = ""
+        pdf_filename = ""
+        period_from = date_from
+        period_to = date_to
+        from_cache = False
 
-        result = resp.get("result") or {}
-        source = _pick_source_doc(result)
-        if not source or not source.get("pdf_b64"):
-            raise RuntimeError("PDF книги продаж не найден в ответе")
+        if reuse_full and full_path.is_file() and full_path.stat().st_size > 1000:
+            pdf_bytes = full_path.read_bytes()
+            from_cache = True
+            sbis_doc_id = "local_cache"
+            pdf_filename = full_path.name
+        else:
+            resp = fetch_sales_book_pdf(
+                inn,
+                date_from=date_from,
+                date_to=date_to,
+                only_accepted=False,
+                max_docs=30,
+                pdf_ready_attempts=pdf_ready_attempts,
+                pdf_ready_sleep_sec=pdf_ready_sleep,
+            )
+            if not resp.get("success"):
+                err = resp.get("error") or {}
+                raise RuntimeError(err.get("message") or str(err) or "fetch_sales_book_pdf failed")
 
-        pdf_bytes = base64.b64decode(source["pdf_b64"])
-        sbis_doc_id = (source.get("sbis_doc_id") or result.get("sbis_doc_id") or "").strip()
-        pdf_filename = source.get("pdf_filename") or result.get("pdf_filename") or ""
-        period = result.get("period") or {}
-        period_from = period.get("from") or date_from
-        period_to = period.get("to") or date_to
+            result = resp.get("result") or {}
+            source = _pick_source_doc(result)
+            if not source or not source.get("pdf_b64"):
+                raise RuntimeError("PDF книги продаж не найден в ответе")
 
-        if not skip_full:
-            full_path = shop_dir / "_full.pdf"
-            if force or not full_path.is_file():
+            pdf_bytes = base64.b64decode(source["pdf_b64"])
+            sbis_doc_id = (source.get("sbis_doc_id") or result.get("sbis_doc_id") or "").strip()
+            pdf_filename = source.get("pdf_filename") or result.get("pdf_filename") or ""
+            period = result.get("period") or {}
+            period_from = period.get("from") or date_from
+            period_to = period.get("to") or date_to
+
+            if not skip_full:
                 full_path.write_bytes(pdf_bytes)
+
+        assert pdf_bytes is not None
 
         rows = parse_sales_rows_from_saby_pdf(pdf_bytes, counterparty_id=None)
         by_buyer: dict[str, list] = defaultdict(list)
@@ -474,4 +503,5 @@ class Command(BaseCommand):
             w.writeheader()
             w.writerows(index_rows)
 
-        return made, f"doc={sbis_doc_id[:12]} pdf_rows={len(rows)} buyers={len(by_buyer)}"
+        src = "cache" if from_cache else "sbis"
+        return made, f"src={src} doc={sbis_doc_id[:12]} pdf_rows={len(rows)} buyers={len(by_buyer)}"
