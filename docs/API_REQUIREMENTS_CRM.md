@@ -269,6 +269,11 @@ curl -sS -X POST "http://146.19.125.77:8000/api/sbis/requirements/12/reply/" \
 
 Фильтр «только PDF» по желанию: `storage_file_name` / Content-Type файла.
 
+**Уведомления о блокировке счёта:** сканер сохраняет их как запись-маркер **без файла**
+(`file` пустой / `storage_file_name` оканчивается на `.stub`, `reply_status=answered`).
+CRM должна принять мета по `id`/`doc_title` и сделать `mark-synced` даже без PDF
+(как уже для skip не-PDF). Отвечать на блокировку через `/reply/` не нужно.
+
 ### Ответ пользователем
 
 ```

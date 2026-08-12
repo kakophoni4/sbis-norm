@@ -206,6 +206,44 @@ def is_requirement_like(doc: dict) -> bool:
     return any(kw in name for kw in REQUIREMENT_KEYWORDS)
 
 
+def is_account_block_notice(doc: dict) -> bool:
+    """Уведомление о блокировке / приостановлении счёта — в БД кладём мета без файла."""
+    name = (doc.get("Название") or "").lower().replace("ё", "е")
+    if "блокировк" in name and "счет" in name:
+        return True
+    if "приостановлен" in name and "счет" in name:
+        return True
+    return False
+
+
+def save_account_block_stub(
+    *,
+    inn: str,
+    doc_id: str,
+    document_date: date,
+    doc_title: str,
+    stage_id: str | None,
+) -> RequirementDocument:
+    """Запись-маркер блокировки счёта без скачивания вложения."""
+    stub_key = f"meta-only:block:{inn}:{doc_id}".encode("utf-8")
+    content_sha256 = hashlib.sha256(stub_key).hexdigest()
+    return RequirementDocument.objects.create(
+        inn=inn,
+        document_date=document_date,
+        sbis_doc_id=doc_id,
+        sbis_stage_id=stage_id or None,
+        doc_title=(doc_title or "Уведомление о блокировке счета")[:512],
+        content_sha256=content_sha256,
+        file_b64="",
+        storage_file_name=f"Уведомление о блокировке ({inn}) ({document_date}).stub",
+        # отвечать не нужно — CRM скрывает кнопку при answered/sent
+        reply_status=RequirementDocument.REPLY_STATUS_ANSWERED,
+        receipt_due_date=None,
+        response_due_date=None,
+        knd=None,
+    )
+
+
 def is_requirement_in_client_date_window(doc: dict, win_start: date, win_end: date) -> bool:
     """
     Дата документа из карточки СБИС (parse_document_date) в пределах [win_start, win_end].
@@ -284,10 +322,12 @@ def refresh_existing_requirement_from_scan(
     *,
     inn: str,
     session_id: str | None = None,
+    skip_sbis_meta: bool = False,
 ) -> dict:
     """
     Для уже сохранённого требования: обновить doc_title и мета из СБИС
     (срок, knd, answered). При CRM-значимых изменениях сбросить external_synced_at.
+    skip_sbis_meta — только title из списка (для блокировок счёта / нет прав на карточку).
     """
     out = {
         "title_updated": False,
@@ -307,39 +347,50 @@ def refresh_existing_requirement_from_scan(
         local_fields.append("doc_title")
         out["title_updated"] = True
 
+    # блокировки: отвечать не нужно
+    if is_account_block_notice(list_doc) and before_status in (
+        RequirementDocument.REPLY_STATUS_NONE,
+        RequirementDocument.REPLY_STATUS_ERROR,
+        "",
+    ):
+        obj.reply_status = RequirementDocument.REPLY_STATUS_ANSWERED
+        local_fields.append("reply_status")
+        out["marked_answered"] = True
+
     if local_fields:
         obj.save(update_fields=list(dict.fromkeys(local_fields)))
         out["fields"].extend(local_fields)
 
-    try:
-        meta_res = fetch_requirement_sbis_meta(
-            inn,
-            sbis_doc_id=obj.sbis_doc_id,
-            document_date=obj.document_date,
-            session_id=session_id or None,
-        )
-    except Exception as e:
-        logger.warning("refresh meta fail inn=%s doc=%s: %s", inn, obj.sbis_doc_id, e)
-        meta_res = {"success": False, "error": {"message": str(e)}}
+    if not skip_sbis_meta:
+        try:
+            meta_res = fetch_requirement_sbis_meta(
+                inn,
+                sbis_doc_id=obj.sbis_doc_id,
+                document_date=obj.document_date,
+                session_id=session_id or None,
+            )
+        except Exception as e:
+            logger.warning("refresh meta fail inn=%s doc=%s: %s", inn, obj.sbis_doc_id, e)
+            meta_res = {"success": False, "error": {"message": str(e)}}
 
-    if meta_res.get("success"):
-        changed = apply_sbis_meta_to_requirement(obj, meta_res.get("meta") or {})
-        if changed:
-            out["meta_updated"] = True
-            out["fields"].extend(changed)
-        obj.refresh_from_db()
-        if (
-            obj.reply_status == RequirementDocument.REPLY_STATUS_ANSWERED
-            and before_status != RequirementDocument.REPLY_STATUS_ANSWERED
-        ):
-            out["marked_answered"] = True
-    else:
-        logger.info(
-            "refresh meta skip inn=%s doc=%s err=%s",
-            inn,
-            (obj.sbis_doc_id or "")[:36],
-            meta_res.get("error"),
-        )
+        if meta_res.get("success"):
+            changed = apply_sbis_meta_to_requirement(obj, meta_res.get("meta") or {})
+            if changed:
+                out["meta_updated"] = True
+                out["fields"].extend(changed)
+            obj.refresh_from_db()
+            if (
+                obj.reply_status == RequirementDocument.REPLY_STATUS_ANSWERED
+                and before_status != RequirementDocument.REPLY_STATUS_ANSWERED
+            ):
+                out["marked_answered"] = True
+        else:
+            logger.info(
+                "refresh meta skip inn=%s doc=%s err=%s",
+                inn,
+                (obj.sbis_doc_id or "")[:36],
+                meta_res.get("error"),
+            )
 
     crm_resync = bool(
         out["title_updated"]
@@ -417,6 +468,7 @@ def _process_one_cert(
         "marked_answered": 0,
         "title_updated": 0,
         "crm_resync": 0,
+        "saved_block_stub": 0,
         "resource_pressure": 0,
     }
     # True только если дошли до конца обработки incoming без исключения и выполнены критерии ниже
@@ -566,7 +618,10 @@ def _process_one_cert(
                 if len(title) > 70:
                     title = title[:70] + "..."
                 if did in incoming_ids:
-                    mark = "скачаем"
+                    if is_account_block_notice(d):
+                        mark = "stub блокировка (без файла)"
+                    else:
+                        mark = "скачаем"
                 elif is_requirement_like(d):
                     mark = "пропуск (дата вне окна)"
                 else:
@@ -613,8 +668,10 @@ def _process_one_cert(
             doc_id = (doc.get("Идентификатор") or "").strip()
             if not doc_id:
                 continue
+            is_block = is_account_block_notice(doc)
             stage_id = pick_service_stage_id(doc)
-            if not stage_id and enrich_session_id:
+            # блокировки — только мета из списка, ПрочитатьДокумент не трогаем (часто нет прав)
+            if not is_block and not stage_id and enrich_session_id:
                 try:
                     read = sbis_read_document(inn, session_id=enrich_session_id, doc_id=doc_id)
                     if read.get("success"):
@@ -649,6 +706,7 @@ def _process_one_cert(
                         doc,
                         inn=inn,
                         session_id=enrich_session_id or None,
+                        skip_sbis_meta=is_block,
                     )
                     if ref.get("meta_updated") or ref.get("title_updated") or ref.get("marked_answered"):
                         stats["meta_refreshed"] += 1
@@ -690,6 +748,44 @@ def _process_one_cert(
                 continue
             document_date = doc_date.date() if doc_date else date_from.date()
             doc_title = (doc.get("Название") or "")[:512]
+
+            # Уведомления о блокировке счёта — только запись в БД, без файла/СБИС-download
+            if is_block:
+                if dry_run:
+                    if not quiet:
+                        write_fn(
+                            f"      — {doc_title_short}: stub блокировка (dry-run, без файла)",
+                            None,
+                        )
+                    stats["saved_block_stub"] += 1
+                    continue
+                try:
+                    with transaction.atomic():
+                        obj = save_account_block_stub(
+                            inn=inn,
+                            doc_id=doc_id,
+                            document_date=document_date,
+                            doc_title=doc_title,
+                            stage_id=stage_id,
+                        )
+                    stats["saved_block_stub"] += 1
+                    stats["saved"] += 1
+                    if not quiet:
+                        write_fn(
+                            f"      — {doc_title_short}: сохранён stub блокировки "
+                            f"(id={obj.id}, без файла, reply=answered)",
+                            "success",
+                        )
+                    try:
+                        notify_requirement_saved(obj)
+                    except Exception:
+                        logger.exception("notify stub block failed inn=%s", inn)
+                except Exception as e:
+                    stats["fetch_error"] += 1
+                    logger.exception("save block stub fail inn=%s doc=%s", inn, doc_id)
+                    if not quiet:
+                        write_fn(f"      — {doc_title_short}: stub error: {e}", "error")
+                continue
 
             if not quiet:
                 if stage_id:
@@ -1163,6 +1259,7 @@ class Command(BaseCommand):
             "marked_answered": 0,
             "title_updated": 0,
             "crm_resync": 0,
+            "saved_block_stub": 0,
             "skipped_cached": skipped_cached,
             "resource_pressure_hits": 0,
         }
@@ -1368,6 +1465,7 @@ class Command(BaseCommand):
             f"refresh meta/title: {stats['meta_refreshed']} "
             f"(answered={stats['marked_answered']}, title={stats['title_updated']}, "
             f"crm_resync={stats['crm_resync']}), "
+            f"stub блокировок: {stats['saved_block_stub']}, "
             f"сохранено: {stats['saved']}."
         )
         if stats.get("list_error") or stats.get("fetch_error"):
