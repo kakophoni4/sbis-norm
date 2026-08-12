@@ -3,7 +3,9 @@
 и сохранить в таблицу RequirementDocument с дедупликацией.
 
 Дедупликация:
-  1) По (inn, sbis_doc_id) — если документ уже есть, пропускаем.
+  1) По (inn, sbis_doc_id) — файл повторно не качаем; обновляем название и мета
+     (срок / reply_status=answered). Если статус стал answered или title/срок изменились —
+     сбрасываем external_synced_at, чтобы CRM снова забрала запись.
   2) По (inn, document_date, content_sha256) — при повторном сканировании не плодим
      одинаковые по содержимому документы за одну дату.
 
@@ -249,6 +251,110 @@ def unpack_zip_and_pick_file(zip_bytes: bytes) -> tuple[bytes, str]:
         return zip_bytes, ".bin"
 
 
+_GENERIC_DOC_TITLES = frozenset(
+    {
+        "требование фнс",
+        "требования фнс",
+        "требования сфр",
+        "требование сфр",
+        "требования фсс",
+        "требование фсс",
+    }
+)
+
+
+def _should_replace_doc_title(old: str, new: str) -> bool:
+    new = (new or "").strip()
+    if not new:
+        return False
+    old = (old or "").strip()
+    if not old:
+        return True
+    old_l, new_l = old.lower(), new.lower()
+    if old_l in _GENERIC_DOC_TITLES and new_l not in _GENERIC_DOC_TITLES:
+        return True
+    if new != old and len(new) > len(old):
+        return True
+    return False
+
+
+def refresh_existing_requirement_from_scan(
+    obj: RequirementDocument,
+    list_doc: dict,
+    *,
+    inn: str,
+    session_id: str | None = None,
+) -> dict:
+    """
+    Для уже сохранённого требования: обновить doc_title и мета из СБИС
+    (срок, knd, answered). При CRM-значимых изменениях сбросить external_synced_at.
+    """
+    out = {
+        "title_updated": False,
+        "marked_answered": False,
+        "meta_updated": False,
+        "crm_resync": False,
+        "fields": [],
+    }
+    before_status = (obj.reply_status or RequirementDocument.REPLY_STATUS_NONE).strip()
+    before_due = obj.response_due_date
+    before_synced = obj.external_synced_at
+
+    new_title = (list_doc.get("Название") or "").strip()[:512]
+    local_fields: list[str] = []
+    if _should_replace_doc_title(obj.doc_title or "", new_title):
+        obj.doc_title = new_title
+        local_fields.append("doc_title")
+        out["title_updated"] = True
+
+    if local_fields:
+        obj.save(update_fields=list(dict.fromkeys(local_fields)))
+        out["fields"].extend(local_fields)
+
+    try:
+        meta_res = fetch_requirement_sbis_meta(
+            inn,
+            sbis_doc_id=obj.sbis_doc_id,
+            document_date=obj.document_date,
+            session_id=session_id or None,
+        )
+    except Exception as e:
+        logger.warning("refresh meta fail inn=%s doc=%s: %s", inn, obj.sbis_doc_id, e)
+        meta_res = {"success": False, "error": {"message": str(e)}}
+
+    if meta_res.get("success"):
+        changed = apply_sbis_meta_to_requirement(obj, meta_res.get("meta") or {})
+        if changed:
+            out["meta_updated"] = True
+            out["fields"].extend(changed)
+        obj.refresh_from_db()
+        if (
+            obj.reply_status == RequirementDocument.REPLY_STATUS_ANSWERED
+            and before_status != RequirementDocument.REPLY_STATUS_ANSWERED
+        ):
+            out["marked_answered"] = True
+    else:
+        logger.info(
+            "refresh meta skip inn=%s doc=%s err=%s",
+            inn,
+            (obj.sbis_doc_id or "")[:36],
+            meta_res.get("error"),
+        )
+
+    crm_resync = bool(
+        out["title_updated"]
+        or out["marked_answered"]
+        or (obj.response_due_date and obj.response_due_date != before_due)
+    )
+    if crm_resync and before_synced is not None:
+        RequirementDocument.objects.filter(pk=obj.pk).update(external_synced_at=None)
+        obj.external_synced_at = None
+        out["crm_resync"] = True
+        out["fields"].append("external_synced_at")
+
+    return out
+
+
 def resolve_kpp_for_inn(inn: str, cert: Certificate | None = None) -> str:
     """КПП: Certificate → Organization → из .cer файла."""
     kpp = ((getattr(cert, "kpp", None) if cert else None) or "").strip()
@@ -307,6 +413,10 @@ def _process_one_cert(
         "saved": 0,
         "fetch_error": 0,
         "dates_updated": 0,
+        "meta_refreshed": 0,
+        "marked_answered": 0,
+        "title_updated": 0,
+        "crm_resync": 0,
         "resource_pressure": 0,
     }
     # True только если дошли до конца обработки incoming без исключения и выполнены критерии ниже
@@ -522,12 +632,54 @@ def _process_one_cert(
             doc_title_short = ((doc.get("Название") or "")[:50] or doc_id[:20]) + (
                 "..." if len(doc.get("Название") or "") > 50 else ""
             )
-            if RequirementDocument.objects.filter(inn=inn, sbis_doc_id=doc_id).exists():
+            existing = RequirementDocument.objects.filter(inn=inn, sbis_doc_id=doc_id).first()
+            if existing:
                 stats["skipped_dup_doc_id"] += 1
-                if not quiet:
-                    # Не дёргаем ПодготовитьДействие повторно: этап часто уже закрыт в СБИС
-                    # («Действие отсутствует или обработано») — файл у нас уже есть.
-                    write_fn(f"      — {doc_title_short}: уже в БД (doc_id), пропуск", None)
+                # Файл не качаем повторно (этап часто закрыт), но освежаем title/answered для CRM.
+                if dry_run:
+                    if not quiet:
+                        write_fn(
+                            f"      — {doc_title_short}: уже в БД (doc_id), dry-run meta skip",
+                            None,
+                        )
+                    continue
+                try:
+                    ref = refresh_existing_requirement_from_scan(
+                        existing,
+                        doc,
+                        inn=inn,
+                        session_id=enrich_session_id or None,
+                    )
+                    if ref.get("meta_updated") or ref.get("title_updated") or ref.get("marked_answered"):
+                        stats["meta_refreshed"] += 1
+                    if ref.get("marked_answered"):
+                        stats["marked_answered"] += 1
+                    if ref.get("title_updated"):
+                        stats["title_updated"] += 1
+                    if ref.get("crm_resync"):
+                        stats["crm_resync"] += 1
+                    if not quiet:
+                        bits = []
+                        if ref.get("title_updated"):
+                            bits.append("title")
+                        if ref.get("marked_answered"):
+                            bits.append("answered")
+                        if ref.get("meta_updated") and not ref.get("marked_answered"):
+                            bits.append("meta")
+                        if ref.get("crm_resync"):
+                            bits.append("crm_resync")
+                        detail = (", ".join(bits) if bits else "без изменений")
+                        write_fn(
+                            f"      — {doc_title_short}: уже в БД → refresh ({detail})",
+                            "success" if ref.get("marked_answered") or ref.get("crm_resync") else None,
+                        )
+                except Exception as e:
+                    logger.warning("refresh existing fail inn=%s doc=%s: %s", inn, doc_id, e)
+                    if not quiet:
+                        write_fn(
+                            f"      — {doc_title_short}: уже в БД, refresh error: {e}",
+                            "warning",
+                        )
                 continue
 
             doc_date = parse_document_date(doc)
@@ -1007,6 +1159,10 @@ class Command(BaseCommand):
             "saved": 0,
             "fetch_error": 0,
             "dates_updated": 0,
+            "meta_refreshed": 0,
+            "marked_answered": 0,
+            "title_updated": 0,
+            "crm_resync": 0,
             "skipped_cached": skipped_cached,
             "resource_pressure_hits": 0,
         }
@@ -1209,6 +1365,9 @@ class Command(BaseCommand):
             f"ошибки скачивания: {stats['fetch_error']}, "
             f"resource pressure hits: {stats.get('resource_pressure_hits', 0)}, "
             f"обновлено дат у существующих: {stats['dates_updated']}, "
+            f"refresh meta/title: {stats['meta_refreshed']} "
+            f"(answered={stats['marked_answered']}, title={stats['title_updated']}, "
+            f"crm_resync={stats['crm_resync']}), "
             f"сохранено: {stats['saved']}."
         )
         if stats.get("list_error") or stats.get("fetch_error"):
