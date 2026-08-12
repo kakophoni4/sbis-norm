@@ -1684,19 +1684,6 @@ def sbis_execute_action(
     return {"success": True, "result": data.get("result")}
 
 
-def sbis_read_document(inn: str, *, session_id: str, doc_id: str) -> dict:
-    data = sbis_rpc(
-        inn=inn,
-        session_id=session_id,
-        method="СБИС.ПрочитатьДокумент",
-        params={"Документ": {"Идентификатор": doc_id}},
-        timeout=45,
-    )
-    if data.get("error"):
-        return {"success": False, "error": data["error"]}
-    return {"success": True, "result": data.get("result") or {}}
-
-
 def _iter_prepare_attachments(prepare_raw: dict) -> list[dict]:
     stages = prepare_raw.get("Этап") or []
     if isinstance(stages, dict):
