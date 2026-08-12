@@ -2254,7 +2254,11 @@ def fetch_requirement_full(
         save_to=save_to,
     )
     if not base.get("success"):
-        err_msg = str((base.get("error") or {}).get("message") or base.get("error") or "").lower()
+        err_obj = base.get("error")
+        if isinstance(err_obj, dict):
+            err_msg = str(err_obj.get("message") or err_obj.get("body_head") or err_obj).lower()
+        else:
+            err_msg = str(err_obj or "").lower()
         if any(
             x in err_msg
             for x in (
@@ -2262,13 +2266,31 @@ def fetch_requirement_full(
                 "уже обработано",
                 "нет доступных действий",
                 "действие недоступно",
+                "обработано",
             )
         ):
+            logger.info(
+                "requirement stage closed → read fallback inn=%s doc=%s",
+                inn,
+                (requirement_doc_id or "")[:36],
+            )
             fb = fetch_requirement_file_via_read(
                 inn, requirement_doc_id=requirement_doc_id, save_to=save_to
             )
             if fb.get("success"):
                 return fb
+            # вернём более понятную ошибку, если fallback тоже упал
+            return {
+                "success": False,
+                "error": {
+                    "message": (
+                        f"этап закрыт и ПрочитатьДокумент тоже не дал файл: "
+                        f"{(fb.get('error') if isinstance(fb.get('error'), dict) else {'message': fb.get('error')})}"
+                    ),
+                    "prepare_error": err_obj,
+                    "read_error": fb.get("error"),
+                },
+            }
         return base
 
     cert = _resolve_requirement_cert(inn)

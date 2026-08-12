@@ -594,13 +594,32 @@ def _process_one_cert(
                     requirement_doc_id=doc_id,
                     session_id=enrich_session_id or None,
                 )
+            # страховка: если full не упал в fallback — пробуем read ещё раз
+            if not fetch.get("success") and stage_id:
+                err_obj = fetch.get("error")
+                err_text = (
+                    str(err_obj.get("message") or err_obj.get("body_head") or err_obj)
+                    if isinstance(err_obj, dict)
+                    else str(err_obj or "")
+                ).lower()
+                if "обработано" in err_text or "нет доступных" in err_text:
+                    if not quiet:
+                        write_fn(
+                            "        этап закрыт — повторно качаем через ПрочитатьДокумент...",
+                            None,
+                        )
+                    fetch = fetch_requirement_file_via_read(
+                        inn,
+                        requirement_doc_id=doc_id,
+                        session_id=enrich_session_id or None,
+                    )
             if not fetch.get("success"):
                 stats["fetch_error"] += 1
                 err_obj = fetch.get("error")
                 if isinstance(err_obj, dict):
-                    err = str(err_obj.get("message") or err_obj)[:80]
+                    err = str(err_obj.get("message") or err_obj)[:160]
                 else:
-                    err = str(err_obj or "unknown")[:80]
+                    err = str(err_obj or "unknown")[:160]
                 if is_resource_pressure_error(str(err_obj or "") + " " + err):
                     stats["resource_pressure"] = 1
                 if not quiet:
