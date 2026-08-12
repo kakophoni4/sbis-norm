@@ -1039,10 +1039,16 @@ class Command(BaseCommand):
             help="Число потоков на первом раунде (по умолчанию 1). Максимум в коде: 8. При EMFILE / «Too many open files» используйте 1–2 или ulimit -n 8192.",
         )
         parser.add_argument(
+            "--round2-workers",
+            type=int,
+            default=0,
+            help="Потоков на раунде 2 (0 = как --retry-workers). Пример: --workers 7 --round2-workers 3 --retry-workers 1",
+        )
+        parser.add_argument(
             "--retry-workers",
             type=int,
             default=1,
-            help="Потоков на раундах 2+ (повтор по ошибкам). По умолчанию 1 — последовательно, меньше риск исчерпать открытые файлы.",
+            help="Потоков на раундах 3+ (повтор по ошибкам). По умолчанию 1.",
         )
         parser.add_argument(
             "--round-sleep",
@@ -1092,6 +1098,10 @@ class Command(BaseCommand):
         quiet = options.get("quiet", False)
         workers = max(1, min(8, int(options.get("workers", 1))))
         retry_workers = max(1, min(8, int(options.get("retry_workers", 1))))
+        round2_raw = int(options.get("round2_workers") or 0)
+        round2_workers = (
+            max(1, min(8, round2_raw)) if round2_raw > 0 else retry_workers
+        )
         round_sleep_sec = max(15, int(options.get("round_sleep", 90)))
         max_rounds = max(1, int(options.get("max_rounds", 10)))
         client_date_filter = not bool(options.get("download_any_doc_date"))
@@ -1217,8 +1227,10 @@ class Command(BaseCommand):
             f"Период: {date_from_str} — {date_to_str}. Организаций к обходу: {len(certs)}. Раундов повтора при ошибках: до {max_rounds}.{cache_note}{date_filter_note}"
         )
         self.stdout.write(
-            f"Параллелизм: раунд 1 — {workers} поток(ов), раунды 2+ — {retry_workers} "
-            f"(--workers / --retry-workers); пауза между раундами при ошибках: {round_sleep_sec} с."
+            f"Параллелизм: раунд 1 — {workers}, раунд 2 — {round2_workers}, "
+            f"раунды 3+ — {retry_workers} "
+            f"(--workers / --round2-workers / --retry-workers); "
+            f"пауза между раундами при ошибках: {round_sleep_sec} с."
         )
         if workers > 4:
             self.stdout.write(
@@ -1290,7 +1302,12 @@ class Command(BaseCommand):
             if not certs_to_try:
                 break
             total_orgs = len(certs_to_try)
-            round_workers = workers if round_num == 1 else retry_workers
+            if round_num == 1:
+                round_workers = workers
+            elif round_num == 2:
+                round_workers = round2_workers
+            else:
+                round_workers = retry_workers
             if throttle_after_emfile:
                 round_workers = 1
 

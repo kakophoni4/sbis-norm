@@ -181,8 +181,8 @@ def fetch_requirements_daily_task(self, days: int = 10):
     Ежедневный сканер требований ФНС (полный цикл Saby: prepare→decrypt→execute→ack).
     Whitelist: docs/requirements_scan_inns.txt. Окно по умолчанию --days 10.
 
-    Важно: workers>1, мало раундов ретрая — иначе 172 ИНН не укладываются в лимит Celery
-    (раньше soft 6h + max_rounds=10 → TimeLimitExceeded / SIGKILL).
+    Важно: раунд1=7 / раунд2=3 / далее=1, мало раундов ретрая — иначе не укладываемся
+    в soft_time_limit Celery (раньше soft 6h + max_rounds=10 → TimeLimitExceeded).
     """
     from django.core.management import call_command
 
@@ -192,7 +192,8 @@ def fetch_requirements_daily_task(self, days: int = 10):
         call_command(
             "fetch_requirements_all_companies",
             days=days,
-            workers=2,
+            workers=7,
+            round2_workers=3,
             retry_workers=1,
             max_rounds=3,
             round_sleep=45,
