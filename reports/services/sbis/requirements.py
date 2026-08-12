@@ -643,6 +643,238 @@ def sbis_read_document(inn: str, *, session_id: str, doc_id: str, timeout: int =
     return {"success": True, "result": data.get("result") or {}}
 
 
+def _iter_doc_attachments(raw: dict | list | None) -> list[dict]:
+    """Собрать объекты Вложение из карточки ПрочитатьДокумент (рекурсивно)."""
+    out: list[dict] = []
+
+    def walk(obj) -> None:
+        if len(out) >= 40:
+            return
+        if isinstance(obj, dict):
+            atts = obj.get("Вложение")
+            if isinstance(atts, list):
+                for a in atts:
+                    if isinstance(a, dict):
+                        out.append(a)
+            elif isinstance(atts, dict):
+                out.append(atts)
+            for v in obj.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(obj, list):
+            for x in obj:
+                walk(x)
+
+    walk(raw or {})
+    # дедуп по идентификатору/ссылке
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for a in out:
+        f = a.get("Файл") if isinstance(a.get("Файл"), dict) else {}
+        key = (
+            (a.get("Идентификатор") or "").strip()
+            or (f.get("Ссылка") or "").strip()
+            or (f.get("Имя") or f.get("Название") or "").strip()
+            or str(id(a))
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        uniq.append(a)
+    return uniq
+
+
+def fetch_requirement_file_via_read(
+    inn: str,
+    *,
+    requirement_doc_id: str,
+    session_id: str | None = None,
+    save_to: str | None = None,
+) -> dict:
+    """
+    Скачать файл требования без ПодготовитьДействие.
+
+    Нужен, когда этап уже закрыт («Действие отсутствует или обработано»)
+    или СписокДокументов не отдаёт Этап — но карточку и вложения всё ещё можно прочитать.
+    """
+    inn = (inn or "").strip()
+    doc_id = (requirement_doc_id or "").strip()
+    if not inn or not doc_id:
+        return {"success": False, "error": {"message": "inn и requirement_doc_id обязательны"}}
+
+    cert = (
+        Certificate.objects.filter(inn=inn, has_private_key=True)
+        .exclude(csptest_name="")
+        .order_by("-id")
+        .first()
+    ) or Certificate.objects.filter(inn=inn).exclude(csptest_name="").order_by("-id").first()
+    if not cert or not cert.csptest_name:
+        return {"success": False, "error": {"message": "Нет сертификата для ИНН", "inn": inn}}
+
+    cert_path = f"/tmp/sbis_report_{inn}.cer"
+    export_cert_der(cert.csptest_name, cert_path)
+    thumbprint = get_thumbprint_from_cert(cert_path)
+    if not session_id:
+        try:
+            session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn)
+        except Exception as e:
+            return {"success": False, "error": {"message": f"auth: {e}", "inn": inn}}
+
+    read = sbis_read_document(inn, session_id=session_id, doc_id=doc_id, timeout=60)
+    if not read.get("success"):
+        return {"success": False, "error": read.get("error") or {"message": "ПрочитатьДокумент failed"}}
+
+    raw = read.get("result") or {}
+    attachments_out: list[dict] = []
+
+    def _maybe_decrypt(content: bytes, encrypted_flag: str) -> bytes:
+        if (encrypted_flag or "").strip() != "Да":
+            return content
+        try:
+            with tempfile.TemporaryDirectory(prefix=f"sbis_req_read_dec_{inn}_") as td:
+                enc_path = os.path.join(td, "req.enc")
+                dec_path = os.path.join(td, "req.dec")
+                Path(enc_path).write_bytes(content)
+                run_cmd([CRYPTCP_BIN, "-decr", *CRYPTCP_DECR_FLAGS, "-thumbprint", thumbprint, enc_path, dec_path])
+                return Path(dec_path).read_bytes()
+        except Exception:
+            try:
+                return _try_decrypt_bytes_with_cert(content, cert.csptest_name) or content
+            except Exception:
+                return content
+
+    for i, att in enumerate(_iter_doc_attachments(raw)):
+        file_obj = att.get("Файл") if isinstance(att.get("Файл"), dict) else {}
+        filename = (file_obj.get("Имя") or file_obj.get("Название") or att.get("Название") or "requirement.bin").strip()
+        # служебные мелкие квитанции пропускаем позже по выбору PDF
+        href = (file_obj.get("Ссылка") or "").strip()
+        b64 = (file_obj.get("ДвоичныеДанные") or "").strip()
+        encrypted_flag = (att.get("Зашифрован") or "").strip()
+        content = b""
+        try:
+            if b64:
+                content = base64.b64decode(b64)
+            elif href:
+                if i:
+                    time.sleep(0.5)
+                r = _sbis_get(
+                    href,
+                    headers={"X-SBISSessionID": session_id},
+                    timeout=120,
+                    inn=inn,
+                    total_budget_sec=180,
+                )
+                if r.status_code != 200:
+                    continue
+                content = r.content or b""
+            else:
+                continue
+        except Exception as e:
+            logger.info("read-att download skip inn=%s err=%s", inn, e)
+            continue
+        if not content:
+            continue
+        decrypted = _maybe_decrypt(content, encrypted_flag)
+        attachments_out.append(
+            {
+                "filename": filename,
+                "b64": base64.b64encode(decrypted).decode("ascii"),
+                "size": len(decrypted),
+                "is_pdf": decrypted.startswith(b"%PDF") or filename.lower().endswith(".pdf"),
+                "is_doc": filename.lower().endswith((".doc", ".docx")),
+                "is_xml": decrypted.lstrip().startswith(b"<?xml") or filename.lower().endswith(".xml"),
+            }
+        )
+
+    # fallback: архив / PDF ссылки с карточки
+    if not attachments_out:
+        for key in ("СсылкаНаАрхив", "СсылкаНаPDF", "Ссылка"):
+            url = (raw.get(key) or "").strip()
+            if not url:
+                continue
+            try:
+                r = _sbis_get(
+                    url,
+                    headers={"X-SBISSessionID": session_id},
+                    timeout=120,
+                    inn=inn,
+                    total_budget_sec=180,
+                )
+                if r.status_code != 200 or not r.content:
+                    continue
+                content = r.content
+                name = "requirement.zip" if content.startswith(b"PK") else (
+                    "requirement.pdf" if content.startswith(b"%PDF") else "requirement.bin"
+                )
+                attachments_out.append(
+                    {
+                        "filename": name,
+                        "b64": base64.b64encode(content).decode("ascii"),
+                        "size": len(content),
+                        "is_pdf": content.startswith(b"%PDF"),
+                        "is_doc": False,
+                        "is_xml": False,
+                        "source": key,
+                    }
+                )
+                break
+            except Exception as e:
+                logger.info("read-link %s fail inn=%s err=%s", key, inn, e)
+
+    if not attachments_out:
+        return {
+            "success": False,
+            "error": {
+                "message": "ПрочитатьДокумент: нет скачиваемых вложений/ссылок",
+                "inn": inn,
+                "doc_id": doc_id,
+                "keys": list(raw.keys())[:30],
+            },
+        }
+
+    chosen = None
+    for a in attachments_out:
+        if a.get("is_pdf") or a.get("is_doc"):
+            chosen = a
+            break
+    if not chosen:
+        for a in attachments_out:
+            if a.get("is_xml"):
+                chosen = a
+                break
+    if not chosen:
+        chosen = attachments_out[0]
+
+    saved_to = None
+    if save_to:
+        try:
+            Path(save_to).parent.mkdir(parents=True, exist_ok=True)
+            Path(save_to).write_bytes(base64.b64decode(chosen["b64"]))
+            saved_to = save_to
+        except Exception:
+            pass
+
+    return {
+        "success": True,
+        "result": {
+            "inn": inn,
+            "requirement_doc_id": doc_id,
+            "requirement_stage_id": None,
+            "filename": chosen["filename"],
+            "size": chosen["size"],
+            "saved_to": saved_to,
+            "b64": chosen["b64"],
+            "attachments_count": len(attachments_out),
+            "attachments_all": attachments_out,
+            "executed": False,
+            "receipt_sent": False,
+            "receipt_skipped": True,
+            "download_mode": "read_document",
+            "service_stages_done": 0,
+        },
+    }
+
+
 def sbis_prepare_action(
     inn: str,
     *,
@@ -1997,16 +2229,40 @@ def fetch_requirement_full(
     Полный цикл по доке Saby:
     prepare → download/decrypt → execute → ack Утверждение.
     do_drain=True — дополнительно пройти служебные этапы по этому doc_id (дорого по прокси).
+
+    Если этап уже закрыт («Действие отсутствует или обработано») — fallback:
+    скачать файл через ПрочитатьДокумент без prepare/execute.
     """
+    stage_id = (requirement_stage_id or "").strip()
+    if not stage_id:
+        return fetch_requirement_file_via_read(
+            inn, requirement_doc_id=requirement_doc_id, save_to=save_to
+        )
+
     base = fetch_requirement_file_b64(
         inn,
         kpp=kpp,
         requirement_doc_id=requirement_doc_id,
-        requirement_stage_id=requirement_stage_id,
+        requirement_stage_id=stage_id,
         action_name=action_name,
         save_to=save_to,
     )
     if not base.get("success"):
+        err_msg = str((base.get("error") or {}).get("message") or base.get("error") or "").lower()
+        if any(
+            x in err_msg
+            for x in (
+                "отсутствует или обработано",
+                "уже обработано",
+                "нет доступных действий",
+                "действие недоступно",
+            )
+        ):
+            fb = fetch_requirement_file_via_read(
+                inn, requirement_doc_id=requirement_doc_id, save_to=save_to
+            )
+            if fb.get("success"):
+                return fb
         return base
 
     cert = _resolve_requirement_cert(inn)

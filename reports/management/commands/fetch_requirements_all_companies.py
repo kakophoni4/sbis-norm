@@ -55,6 +55,7 @@ from reports.services.sbis.crypto import export_cert_der, parse_kpp_from_cert_fi
 from reports.services.sbis.requirements import (
     sbis_list_requirement_documents,
     sbis_read_document,
+    fetch_requirement_file_via_read,
 )
 from reports.services.sbis.auth import sbis_auth_session_for_inn
 
@@ -518,49 +519,45 @@ def _process_one_cert(
                 except Exception as e:
                     if not quiet:
                         write_fn(f"      — {doc_id[:24]}...: ПрочитатьДокумент fail: {e}", "warning")
-            if not stage_id:
-                stats["skipped_no_stage"] += 1
-                if not quiet:
-                    write_fn(
-                        f"      — документ {doc_id[:24]}...: нет этапа (даже после ПрочитатьДокумент), пропуск",
-                        "warning",
-                    )
-                continue
-
-            doc_title_short = ((doc.get("Название") or "")[:50] or doc_id[:20]) + ("..." if len(doc.get("Название") or "") > 50 else "")
-
+            doc_title_short = ((doc.get("Название") or "")[:50] or doc_id[:20]) + (
+                "..." if len(doc.get("Название") or "") > 50 else ""
+            )
             if RequirementDocument.objects.filter(inn=inn, sbis_doc_id=doc_id).exists():
                 stats["skipped_dup_doc_id"] += 1
                 if not quiet:
                     write_fn(
-                        f"      — {doc_title_short}: уже в БД (doc_id), закрываем этап (execute/ack)...",
+                        f"      — {doc_title_short}: уже в БД (doc_id)"
+                        + (", закрываем этап (execute/ack)..." if stage_id else " — этап не нужен"),
                         None,
                     )
-                try:
-                    ack_fetch = fetch_requirement_full(
-                        inn,
-                        kpp=kpp,
-                        requirement_doc_id=doc_id,
-                        requirement_stage_id=stage_id,
-                        date_from_str=date_from_str,
-                        date_to_str=date_to_str,
-                        do_drain=False,
-                    )
-                    if not quiet:
-                        r = ack_fetch.get("result") or {}
-                        write_fn(
-                            f"        executed={r.get('executed')} receipt={r.get('receipt_sent')} "
-                            f"skipped={r.get('receipt_skipped')}"
-                            + (
-                                f" err={ack_fetch.get('error') or r.get('execute_error') or r.get('receipt_error')}"
-                                if not ack_fetch.get("success") or r.get("execute_error") or r.get("receipt_error")
-                                else ""
-                            ),
-                            None,
+                if stage_id:
+                    try:
+                        ack_fetch = fetch_requirement_full(
+                            inn,
+                            kpp=kpp,
+                            requirement_doc_id=doc_id,
+                            requirement_stage_id=stage_id,
+                            date_from_str=date_from_str,
+                            date_to_str=date_to_str,
+                            do_drain=False,
                         )
-                except Exception as e:
-                    if not quiet:
-                        write_fn(f"        execute/ack error: {e}", "warning")
+                        if not quiet:
+                            r = ack_fetch.get("result") or {}
+                            write_fn(
+                                f"        executed={r.get('executed')} receipt={r.get('receipt_sent')} "
+                                f"skipped={r.get('receipt_skipped')}"
+                                + (
+                                    f" err={ack_fetch.get('error') or r.get('execute_error') or r.get('receipt_error')}"
+                                    if not ack_fetch.get("success")
+                                    or r.get("execute_error")
+                                    or r.get("receipt_error")
+                                    else ""
+                                ),
+                                None,
+                            )
+                    except Exception as e:
+                        if not quiet:
+                            write_fn(f"        execute/ack error: {e}", "warning")
                 continue
 
             doc_date = parse_document_date(doc)
@@ -573,17 +570,30 @@ def _process_one_cert(
             doc_title = (doc.get("Название") or "")[:512]
 
             if not quiet:
-                write_fn(f"      — {doc_title_short}: скачивание + execute/ack...", None)
+                if stage_id:
+                    write_fn(f"      — {doc_title_short}: скачивание + execute/ack...", None)
+                else:
+                    write_fn(
+                        f"      — {doc_title_short}: этапа нет — качаем через ПрочитатьДокумент...",
+                        None,
+                    )
 
-            fetch = fetch_requirement_full(
-                inn,
-                kpp=kpp,
-                requirement_doc_id=doc_id,
-                requirement_stage_id=stage_id,
-                date_from_str=date_from_str,
-                date_to_str=date_to_str,
-                do_drain=False,
-            )
+            if stage_id:
+                fetch = fetch_requirement_full(
+                    inn,
+                    kpp=kpp,
+                    requirement_doc_id=doc_id,
+                    requirement_stage_id=stage_id,
+                    date_from_str=date_from_str,
+                    date_to_str=date_to_str,
+                    do_drain=False,
+                )
+            else:
+                fetch = fetch_requirement_file_via_read(
+                    inn,
+                    requirement_doc_id=doc_id,
+                    session_id=enrich_session_id or None,
+                )
             if not fetch.get("success"):
                 stats["fetch_error"] += 1
                 err = (fetch.get("error") or {}).get("message", "")[:80]
