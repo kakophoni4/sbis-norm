@@ -739,7 +739,10 @@ def fetch_requirement_file_via_read(
                 return Path(dec_path).read_bytes()
         except Exception:
             try:
-                return _try_decrypt_bytes_with_cert(content, cert.csptest_name) or content
+                dec, _meta = _try_decrypt_bytes_with_cert(
+                    inn=inn, thumbprint=thumbprint, content=content
+                )
+                return dec or content
             except Exception:
                 return content
 
