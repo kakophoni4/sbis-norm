@@ -714,18 +714,34 @@ def fetch_requirement_file_via_read(
     cert_path = f"/tmp/sbis_report_{inn}.cer"
     export_cert_der(cert.csptest_name, cert_path)
     thumbprint = get_thumbprint_from_cert(cert_path)
+
+    def _fresh_session() -> str:
+        return auth_sbis_by_cert(cert_path, thumbprint, inn=inn)
+
     if not session_id:
         try:
-            session_id = auth_sbis_by_cert(cert_path, thumbprint, inn=inn)
+            session_id = _fresh_session()
         except Exception as e:
             return {"success": False, "error": {"message": f"auth: {e}", "inn": inn}}
 
     read = sbis_read_document(inn, session_id=session_id, doc_id=doc_id, timeout=60)
     if not read.get("success"):
         err = read.get("error")
-        if not isinstance(err, dict):
-            err = {"message": str(err or "ПрочитатьДокумент failed")}
-        return {"success": False, "error": err}
+        err_text = (
+            str(err.get("message") or err) if isinstance(err, dict) else str(err or "")
+        ).lower()
+        # протухшая/битая сессия после длинного прогона
+        if "not authorized" in err_text or "не авториз" in err_text or "unauthorized" in err_text:
+            try:
+                session_id = _fresh_session()
+                read = sbis_read_document(inn, session_id=session_id, doc_id=doc_id, timeout=60)
+            except Exception as e:
+                return {"success": False, "error": {"message": f"re-auth: {e}", "inn": inn}}
+        if not read.get("success"):
+            err = read.get("error")
+            if not isinstance(err, dict):
+                err = {"message": str(err or "ПрочитатьДокумент failed")}
+            return {"success": False, "error": err}
 
     raw = read.get("result")
     if not isinstance(raw, dict):

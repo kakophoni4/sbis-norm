@@ -559,10 +559,11 @@ def _process_one_cert(
                     do_drain=False,
                 )
             else:
+                # не тащим старую session — via_read сам авторизуется / обновит при Not authorized
                 fetch = fetch_requirement_file_via_read(
                     inn,
                     requirement_doc_id=doc_id,
-                    session_id=enrich_session_id or None,
+                    session_id=None,
                 )
             # страховка: если full не упал в fallback — пробуем read ещё раз
             if not fetch.get("success") and stage_id:
@@ -581,7 +582,7 @@ def _process_one_cert(
                     fetch = fetch_requirement_file_via_read(
                         inn,
                         requirement_doc_id=doc_id,
-                        session_id=enrich_session_id or None,
+                        session_id=None,
                     )
             if not fetch.get("success"):
                 stats["fetch_error"] += 1
