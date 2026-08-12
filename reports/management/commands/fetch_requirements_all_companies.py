@@ -596,8 +596,12 @@ def _process_one_cert(
                 )
             if not fetch.get("success"):
                 stats["fetch_error"] += 1
-                err = (fetch.get("error") or {}).get("message", "")[:80]
-                if is_resource_pressure_error(str(fetch.get("error") or "") + " " + err):
+                err_obj = fetch.get("error")
+                if isinstance(err_obj, dict):
+                    err = str(err_obj.get("message") or err_obj)[:80]
+                else:
+                    err = str(err_obj or "unknown")[:80]
+                if is_resource_pressure_error(str(err_obj or "") + " " + err):
                     stats["resource_pressure"] = 1
                 if not quiet:
                     write_fn(f"        Ошибка: {err}", "error")
@@ -619,7 +623,9 @@ def _process_one_cert(
 
             extra_xml: list[bytes] = []
             for att in ((fetch.get("result") or {}).get("attachments_all") or []):
-                ab64 = (att.get("b64") or "").strip()
+                if not isinstance(att, dict):
+                    continue
+                ab64 = str(att.get("b64") or "").strip()
                 if not ab64:
                     continue
                 try:

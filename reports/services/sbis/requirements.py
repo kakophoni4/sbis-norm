@@ -722,9 +722,21 @@ def fetch_requirement_file_via_read(
 
     read = sbis_read_document(inn, session_id=session_id, doc_id=doc_id, timeout=60)
     if not read.get("success"):
-        return {"success": False, "error": read.get("error") or {"message": "ПрочитатьДокумент failed"}}
+        err = read.get("error")
+        if not isinstance(err, dict):
+            err = {"message": str(err or "ПрочитатьДокумент failed")}
+        return {"success": False, "error": err}
 
-    raw = read.get("result") or {}
+    raw = read.get("result")
+    if not isinstance(raw, dict):
+        return {
+            "success": False,
+            "error": {
+                "message": f"ПрочитатьДокумент: неожиданный result type={type(raw).__name__}",
+                "inn": inn,
+                "doc_id": doc_id,
+            },
+        }
     attachments_out: list[dict] = []
 
     def _maybe_decrypt(content: bytes, encrypted_flag: str) -> bytes:
@@ -747,12 +759,15 @@ def fetch_requirement_file_via_read(
                 return content
 
     for i, att in enumerate(_iter_doc_attachments(raw)):
+        if not isinstance(att, dict):
+            continue
         file_obj = att.get("Файл") if isinstance(att.get("Файл"), dict) else {}
-        filename = (file_obj.get("Имя") or file_obj.get("Название") or att.get("Название") or "requirement.bin").strip()
-        # служебные мелкие квитанции пропускаем позже по выбору PDF
-        href = (file_obj.get("Ссылка") or "").strip()
-        b64 = (file_obj.get("ДвоичныеДанные") or "").strip()
-        encrypted_flag = (att.get("Зашифрован") or "").strip()
+        filename = str(
+            file_obj.get("Имя") or file_obj.get("Название") or att.get("Название") or "requirement.bin"
+        ).strip()
+        href = str(file_obj.get("Ссылка") or "").strip()
+        b64 = str(file_obj.get("ДвоичныеДанные") or "").strip()
+        encrypted_flag = str(att.get("Зашифрован") or "").strip()
         content = b""
         try:
             if b64:
@@ -792,7 +807,8 @@ def fetch_requirement_file_via_read(
     # fallback: архив / PDF ссылки с карточки
     if not attachments_out:
         for key in ("СсылкаНаАрхив", "СсылкаНаPDF", "Ссылка"):
-            url = (raw.get(key) or "").strip()
+            url_raw = raw.get(key)
+            url = str(url_raw or "").strip() if not isinstance(url_raw, (dict, list)) else ""
             if not url:
                 continue
             try:
