@@ -236,8 +236,8 @@ def save_account_block_stub(
         content_sha256=content_sha256,
         file_b64="",
         storage_file_name=f"Уведомление о блокировке ({inn}) ({document_date}).stub",
-        # отвечать не нужно — CRM скрывает кнопку при answered/sent
-        reply_status=RequirementDocument.REPLY_STATUS_ANSWERED,
+        # reply_status=none: это не «отвечено», а уведомление — ответить нельзя, но запись нужна
+        reply_status=RequirementDocument.REPLY_STATUS_NONE,
         receipt_due_date=None,
         response_due_date=None,
         knd=None,
@@ -346,16 +346,6 @@ def refresh_existing_requirement_from_scan(
         obj.doc_title = new_title
         local_fields.append("doc_title")
         out["title_updated"] = True
-
-    # блокировки: отвечать не нужно
-    if is_account_block_notice(list_doc) and before_status in (
-        RequirementDocument.REPLY_STATUS_NONE,
-        RequirementDocument.REPLY_STATUS_ERROR,
-        "",
-    ):
-        obj.reply_status = RequirementDocument.REPLY_STATUS_ANSWERED
-        local_fields.append("reply_status")
-        out["marked_answered"] = True
 
     if local_fields:
         obj.save(update_fields=list(dict.fromkeys(local_fields)))
@@ -773,7 +763,7 @@ def _process_one_cert(
                     if not quiet:
                         write_fn(
                             f"      — {doc_title_short}: сохранён stub блокировки "
-                            f"(id={obj.id}, без файла, reply=answered)",
+                            f"(id={obj.id}, без файла, reply не нужен)",
                             "success",
                         )
                     try:
