@@ -86,7 +86,7 @@ def is_resource_pressure_error(text: str) -> bool:
 
 
 def is_permanent_sbis_auth_error(text: str) -> bool:
-    """Ошибки, которые бессмысленно ретраить в том же прогоне (серт/регистрация)."""
+    """Ошибки, которые бессмысленно ретраить в том же прогоне (серт/регистрация/права)."""
     t = (text or "").lower()
     return any(
         x in t
@@ -97,8 +97,16 @@ def is_permanent_sbis_auth_error(text: str) -> bool:
             "регистрация клиента ещё не завершилась",
             "нет валидной подписи",
             "нет сертификата",
+            "недостаточно прав",
+            "keyset does not exist",
+            "failed to open container",
         )
     )
+
+
+def is_no_rights_error(text: str) -> bool:
+    t = (text or "").lower()
+    return "недостаточно прав" in t
 
 # Ключевые слова в названии (стем «требован» ловит «требование» / «требования»)
 REQUIREMENT_KEYWORDS = (
@@ -459,6 +467,7 @@ def _process_one_cert(
         "title_updated": 0,
         "crm_resync": 0,
         "saved_block_stub": 0,
+        "skipped_no_rights": 0,
         "resource_pressure": 0,
     }
     # True только если дошли до конца обработки incoming без исключения и выполнены критерии ниже
@@ -823,14 +832,26 @@ def _process_one_cert(
                         session_id=None,
                     )
             if not fetch.get("success"):
-                stats["fetch_error"] += 1
                 err_obj = fetch.get("error")
                 if isinstance(err_obj, dict):
                     err = str(err_obj.get("message") or err_obj)[:160]
                 else:
                     err = str(err_obj or "unknown")[:160]
-                if is_resource_pressure_error(str(err_obj or "") + " " + err):
+                err_blob = str(err_obj or "") + " " + err
+                if is_no_rights_error(err_blob):
+                    # права не появятся в том же прогоне — не крутим раунды из‑за этого
+                    stats["skipped_no_rights"] += 1
+                    if not quiet:
+                        write_fn(
+                            f"        Нет прав на документ — пропуск без ретрая: {err}",
+                            "warning",
+                        )
+                    continue
+                stats["fetch_error"] += 1
+                if is_resource_pressure_error(err_blob):
                     stats["resource_pressure"] = 1
+                if is_permanent_sbis_auth_error(err_blob):
+                    stats["permanent_fail"] = 1
                 if not quiet:
                     write_fn(f"        Ошибка: {err}", "error")
                 continue
@@ -1262,6 +1283,7 @@ class Command(BaseCommand):
             "title_updated": 0,
             "crm_resync": 0,
             "saved_block_stub": 0,
+            "skipped_no_rights": 0,
             "skipped_cached": skipped_cached,
             "resource_pressure_hits": 0,
         }
@@ -1473,6 +1495,7 @@ class Command(BaseCommand):
             f"(answered={stats['marked_answered']}, title={stats['title_updated']}, "
             f"crm_resync={stats['crm_resync']}), "
             f"stub блокировок: {stats['saved_block_stub']}, "
+            f"нет прав (без ретрая): {stats['skipped_no_rights']}, "
             f"сохранено: {stats['saved']}."
         )
         if stats.get("list_error") or stats.get("fetch_error"):
