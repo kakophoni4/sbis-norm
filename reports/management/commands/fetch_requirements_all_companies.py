@@ -525,39 +525,9 @@ def _process_one_cert(
             if RequirementDocument.objects.filter(inn=inn, sbis_doc_id=doc_id).exists():
                 stats["skipped_dup_doc_id"] += 1
                 if not quiet:
-                    write_fn(
-                        f"      — {doc_title_short}: уже в БД (doc_id)"
-                        + (", закрываем этап (execute/ack)..." if stage_id else " — этап не нужен"),
-                        None,
-                    )
-                if stage_id:
-                    try:
-                        ack_fetch = fetch_requirement_full(
-                            inn,
-                            kpp=kpp,
-                            requirement_doc_id=doc_id,
-                            requirement_stage_id=stage_id,
-                            date_from_str=date_from_str,
-                            date_to_str=date_to_str,
-                            do_drain=False,
-                        )
-                        if not quiet:
-                            r = ack_fetch.get("result") or {}
-                            write_fn(
-                                f"        executed={r.get('executed')} receipt={r.get('receipt_sent')} "
-                                f"skipped={r.get('receipt_skipped')}"
-                                + (
-                                    f" err={ack_fetch.get('error') or r.get('execute_error') or r.get('receipt_error')}"
-                                    if not ack_fetch.get("success")
-                                    or r.get("execute_error")
-                                    or r.get("receipt_error")
-                                    else ""
-                                ),
-                                None,
-                            )
-                    except Exception as e:
-                        if not quiet:
-                            write_fn(f"        execute/ack error: {e}", "warning")
+                    # Не дёргаем ПодготовитьДействие повторно: этап часто уже закрыт в СБИС
+                    # («Действие отсутствует или обработано») — файл у нас уже есть.
+                    write_fn(f"      — {doc_title_short}: уже в БД (doc_id), пропуск", None)
                 continue
 
             doc_date = parse_document_date(doc)
