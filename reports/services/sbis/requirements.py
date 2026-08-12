@@ -532,6 +532,117 @@ def sbis_list_service_stages(
     except Exception as e:
         return {"success": False, "error": {"message": f"Ошибка СписокСлужебныхЭтапов: {e}", "inn": inn}}
 
+REQUIREMENT_LIST_DOC_TYPES = ("RequirementFNS", "RequirementFSS")
+
+
+def sbis_list_requirement_documents(
+    inn: str,
+    *,
+    date_from: str | None = None,
+    date_to: str | None = None,
+    page_size: int = 50,
+    types: tuple[str, ...] | list[str] = REQUIREMENT_LIST_DOC_TYPES,
+    session_id: str | None = None,
+) -> dict:
+    """
+    Входящие требования через СБИС.СписокДокументов (Тип=RequirementFNS/RequirementFSS).
+
+    Важно: СБИС.СписокСлужебныхЭтапов часто НЕ возвращает уже лежащие требования ФНС
+    (видит только текущие служебные этапы вроде исходящего НДС). Для сканера нужен этот метод.
+    """
+    inn = (inn or "").strip()
+    if not inn:
+        return {"success": False, "error": {"message": "inn обязателен"}, "docs": []}
+
+    today = datetime.now()
+    if not date_to:
+        date_to = today.strftime("%d.%m.%Y")
+    if not date_from:
+        date_from = (today - timedelta(days=30)).strftime("%d.%m.%Y")
+
+    if not session_id:
+        auth = sbis_auth_session_for_inn(inn)
+        if not auth.get("success"):
+            return {"success": False, "error": auth.get("error") or {"message": "auth failed"}, "docs": []}
+        session_id = (((auth.get("result") or {}).get("session_id")) or "").strip()
+    if not session_id:
+        return {"success": False, "error": {"message": "нет session_id"}, "docs": []}
+
+    merged: dict[str, dict] = {}
+    errors: list[dict] = []
+    for tip in types:
+        tip = (tip or "").strip()
+        if not tip:
+            continue
+        try:
+            data = sbis_rpc(
+                inn=inn,
+                session_id=session_id,
+                method="СБИС.СписокДокументов",
+                params={
+                    "Фильтр": {
+                        "Тип": tip,
+                        "Направление": "Входящий",
+                        "ДатаС": date_from,
+                        "ДатаПо": date_to,
+                        "Навигация": {"РазмерСтраницы": str(int(page_size))},
+                    }
+                },
+                timeout=60,
+                total_budget_sec=70,
+            )
+        except Exception as e:
+            errors.append({"type": tip, "message": str(e)})
+            continue
+        if data.get("error"):
+            errors.append({"type": tip, "error": data.get("error")})
+            continue
+        docs = (((data.get("result") or {}).get("Документ")) or [])
+        if isinstance(docs, dict):
+            docs = [docs]
+        for d in docs:
+            if not isinstance(d, dict):
+                continue
+            did = (d.get("Идентификатор") or "").strip()
+            if not did:
+                continue
+            # не затираем уже найденный документ с этапами
+            prev = merged.get(did)
+            if prev and (prev.get("Этап") or []) and not (d.get("Этап") or []):
+                continue
+            merged[did] = d
+
+    docs_out = list(merged.values())
+    return {
+        "success": True,
+        "docs": docs_out,
+        "errors": errors or None,
+        "period": {"from": date_from, "to": date_to},
+        "count": len(docs_out),
+    }
+
+
+def sbis_read_document(inn: str, *, session_id: str, doc_id: str, timeout: int = 45) -> dict:
+    """СБИС.ПрочитатьДокумент — карточка + Этап[] (нужно, если СписокДокументов без этапов)."""
+    doc_id = (doc_id or "").strip()
+    if not doc_id:
+        return {"success": False, "error": {"message": "doc_id обязателен"}}
+    try:
+        data = sbis_rpc(
+            inn=inn,
+            session_id=session_id,
+            method="СБИС.ПрочитатьДокумент",
+            params={"Документ": {"Идентификатор": doc_id}},
+            timeout=timeout,
+            total_budget_sec=max(timeout + 5, 50),
+        )
+    except Exception as e:
+        return {"success": False, "error": {"message": str(e)}}
+    if data.get("error"):
+        return {"success": False, "error": data.get("error")}
+    return {"success": True, "result": data.get("result") or {}}
+
+
 def sbis_prepare_action(
     inn: str,
     *,

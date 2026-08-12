@@ -52,6 +52,11 @@ from reports.services.requirements_scan_scope import get_requirements_scan_inns
 from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
 from reports.services.sbis.client import close_thread_local_sbis_session
 from reports.services.sbis.crypto import export_cert_der, parse_kpp_from_cert_file
+from reports.services.sbis.requirements import (
+    sbis_list_requirement_documents,
+    sbis_read_document,
+)
+from reports.services.sbis.auth import sbis_auth_session_for_inn
 
 
 logger = logging.getLogger(__name__)
@@ -314,7 +319,11 @@ def _process_one_cert(
             return stats
 
         if not quiet:
-            write_fn(f"  [{idx}/{total_orgs}] ИНН {inn} (КПП {kpp}): запрос СписокСлужебныхЭтапов...", None)
+            write_fn(
+                f"  [{idx}/{total_orgs}] ИНН {inn} (КПП {kpp}): "
+                f"СписокСлужебныхЭтапов + СписокДокументов(RequirementFNS/FSS)...",
+                None,
+            )
 
         result = sbis_list_service_stages(
             inn,
@@ -325,22 +334,80 @@ def _process_one_cert(
             page_size=page_size,
             only_reporting=False,
         )
-        if not result.get("success"):
-            stats["list_error"] = 1
+        stage_docs: list[dict] = []
+        if result.get("success"):
+            stage_docs = (result.get("result") or {}).get("docs") or []
+        else:
             err = result.get("error") or {}
             msg = (err.get("message", str(result)) or "")[:120]
             full_err = str(err) + " " + msg
             if is_resource_pressure_error(full_err):
                 stats["resource_pressure"] = 1
             elif is_permanent_sbis_auth_error(full_err):
-                # Не гоняем 10 раундов по мёртвому серту — помечаем день как «просмотрен»
                 stats["permanent_fail"] = 1
                 scan_eligible_for_cache = True
             if not quiet:
-                write_fn(f"      Ошибка СписокСлужебныхЭтапов: {msg}", "error")
-            return stats
+                write_fn(f"      Ошибка СписокСлужебныхЭтапов: {msg}", "warning")
+            # не выходим: требования часто есть только в СписокДокументов
 
-        docs = (result.get("result") or {}).get("docs") or []
+        list_docs: list[dict] = []
+        list_res = sbis_list_requirement_documents(
+            inn,
+            date_from=date_from_str,
+            date_to=date_to_str,
+            page_size=max(50, int(page_size or 50)),
+        )
+        if list_res.get("success"):
+            list_docs = list_res.get("docs") or []
+            if not quiet:
+                write_fn(
+                    f"      СписокДокументов Requirement*: {len(list_docs)}"
+                    + (f" (warn={list_res.get('errors')})" if list_res.get("errors") else ""),
+                    None,
+                )
+        else:
+            err = list_res.get("error") or {}
+            msg = (err.get("message", str(list_res)) or "")[:120]
+            full_err = str(err) + " " + msg
+            if is_resource_pressure_error(full_err):
+                stats["resource_pressure"] = 1
+            elif is_permanent_sbis_auth_error(full_err) and not stage_docs:
+                stats["permanent_fail"] = 1
+                scan_eligible_for_cache = True
+            if not quiet:
+                write_fn(f"      Ошибка СписокДокументов(Requirement*): {msg}", "error")
+            if not stage_docs:
+                stats["list_error"] = 1
+                return stats
+
+        # merge: id → doc (этапы из служебных приоритетнее)
+        by_id: dict[str, dict] = {}
+        for d in stage_docs:
+            did = (d.get("Идентификатор") or "").strip()
+            if did:
+                by_id[did] = d
+        for d in list_docs:
+            did = (d.get("Идентификатор") or "").strip()
+            if not did:
+                continue
+            prev = by_id.get(did)
+            if not prev:
+                by_id[did] = d
+                continue
+            if not (prev.get("Этап") or []) and (d.get("Этап") or []):
+                prev["Этап"] = d.get("Этап")
+            if not (prev.get("Название") or "").strip() and (d.get("Название") or "").strip():
+                prev["Название"] = d.get("Название")
+            if not (prev.get("Дата") or prev.get("ДатаВремяСоздания")) and (
+                d.get("Дата") or d.get("ДатаВремяСоздания")
+            ):
+                prev["Дата"] = d.get("Дата") or d.get("ДатаВремяСоздания")
+            if not (prev.get("Тип") or "").strip() and (d.get("Тип") or "").strip():
+                prev["Тип"] = d.get("Тип")
+            if not (prev.get("Направление") or "").strip() and (d.get("Направление") or "").strip():
+                prev["Направление"] = d.get("Направление")
+
+        docs = list(by_id.values())
         win_start = date_from.date()
         win_end = date_to.date()
         raw_incoming = [d for d in docs if is_requirement_like(d)]
@@ -422,15 +489,42 @@ def _process_one_cert(
                     if not quiet:
                         write_fn(f"      — обновлена дата у doc_id={r.sbis_doc_id[:20]}...: {old_date} -> {new_date}", None)
 
+        # session для дочитывания этапов у docs из СписокДокументов
+        enrich_session_id = ""
+        try:
+            auth = sbis_auth_session_for_inn(inn)
+            if auth.get("success"):
+                enrich_session_id = (((auth.get("result") or {}).get("session_id")) or "").strip()
+        except Exception:
+            enrich_session_id = ""
+
         for doc in incoming:
             doc_id = (doc.get("Идентификатор") or "").strip()
             if not doc_id:
                 continue
             stage_id = pick_service_stage_id(doc)
+            if not stage_id and enrich_session_id:
+                try:
+                    read = sbis_read_document(inn, session_id=enrich_session_id, doc_id=doc_id)
+                    if read.get("success"):
+                        raw = read.get("result") or {}
+                        if raw.get("Этап"):
+                            doc["Этап"] = raw.get("Этап")
+                        if raw.get("Название") and not (doc.get("Название") or "").strip():
+                            doc["Название"] = raw.get("Название")
+                        if raw.get("Дата") and not (doc.get("Дата") or "").strip():
+                            doc["Дата"] = raw.get("Дата")
+                        stage_id = pick_service_stage_id(doc)
+                except Exception as e:
+                    if not quiet:
+                        write_fn(f"      — {doc_id[:24]}...: ПрочитатьДокумент fail: {e}", "warning")
             if not stage_id:
                 stats["skipped_no_stage"] += 1
                 if not quiet:
-                    write_fn(f"      — документ {doc_id[:24]}...: нет этапа, пропуск", "warning")
+                    write_fn(
+                        f"      — документ {doc_id[:24]}...: нет этапа (даже после ПрочитатьДокумент), пропуск",
+                        "warning",
+                    )
                 continue
 
             doc_title_short = ((doc.get("Название") or "")[:50] or doc_id[:20]) + ("..." if len(doc.get("Название") or "") > 50 else "")
