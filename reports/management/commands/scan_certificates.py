@@ -886,8 +886,7 @@ class Command(BaseCommand):
                 if n and not quiet:
                     self.stdout.write(f"  деактивировано дублей ИНН {inn}: {n}")
 
-        Certificate.objects.update(has_private_key=False)
-        update_private_key_flags()
+        pk_stats = update_private_key_flags()
 
         total = Certificate.objects.count()
         active = Certificate.objects.filter(is_active=True).count()
