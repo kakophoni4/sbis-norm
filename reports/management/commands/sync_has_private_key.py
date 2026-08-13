@@ -2,7 +2,8 @@
 Синхронизировать has_private_key по хранилищу uMy (PrivateKey Link).
 
 Для SBIS auth нужен сертификат в uMy с привязкой к контейнеру — это делает
-sbis_keys_install_linux.sh --install-only, затем эта команда.
+sbis_keys_install_linux.sh --install-only / scan_certificates --install-uMy,
+затем эта команда.
 
   docker compose exec web python manage.py sync_has_private_key
   docker compose exec web python manage.py sync_has_private_key --all  # только для отладки
@@ -34,10 +35,12 @@ class Command(BaseCommand):
             self.stdout.write(self.style.SUCCESS(f"has_private_key=True для всех: {n}"))
             return
 
-        reset = Certificate.objects.update(has_private_key=False)
-        self.stdout.write(f"Сброшено has_private_key=False: {reset}")
-
-        update_private_key_flags()
+        # Без массового UPDATE False: флаги выставляются по фактическому uMy.
+        stats = update_private_key_flags()
+        self.stdout.write(
+            f"uMy sync: linked={stats.get('linked')} unlinked={stats.get('unlinked')} "
+            f"updated={stats.get('updated')} unchanged={stats.get('unchanged')}"
+        )
 
         with_pk = Certificate.objects.filter(has_private_key=True).count()
         total = Certificate.objects.count()

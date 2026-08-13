@@ -551,64 +551,77 @@ def parse_cert_info(cert_path: str, csptest_name: str = "", csp_index: CspIndex 
     return parse_certmgr_listing(out, csptest_name, csp_index)
 
 
-def update_private_key_flags():
+def update_private_key_flags() -> dict:
+    """
+    Синхронизировать Certificate.has_private_key по uMy (PrivateKey Link).
+    Не делает массовый UPDATE False заранее — выставляет флаги по фактическому списку uMy.
+    Возвращает статистику: linked / unlinked / unchanged / missing_in_umy.
+    """
     out = run_cmd(_csp_cmd(CERTMGR_BIN, ["-list", "-store", "uMy"]))
-
-    current_thumb = None
-    has_pk = False
-    container_line = None
 
     def _norm_tp(tp: str) -> str:
         return re.sub(r"\s+", "", (tp or "").strip()).lower()
+
+    # thumb -> {has_pk, container}
+    umy: dict[str, dict] = {}
+    current_thumb = None
+    has_pk = False
+    container_line = None
 
     def flush():
         nonlocal current_thumb, has_pk, container_line
         if not current_thumb:
             return
         tp = _norm_tp(current_thumb)
-        cert = (
-            Certificate.objects.filter(thumbprint=tp).first()
-            or Certificate.objects.filter(thumbprint=current_thumb.lower()).first()
-            or Certificate.objects.filter(thumbprint__iexact=tp).first()
-        )
-        if not cert:
-            # иногда в БД отпечаток с пробелами
-            for c in Certificate.objects.exclude(thumbprint="").exclude(thumbprint__isnull=True).iterator():
-                if _norm_tp(c.thumbprint or "") == tp:
-                    cert = c
-                    break
-        if not cert:
-            current_thumb = None
-            has_pk = False
-            container_line = None
-            return
-        cert.has_private_key = has_pk
-        cert.thumbprint = tp
-        if container_line:
-            parts = container_line.split(":", 1)
-            if len(parts) == 2:
-                cert.hdimage_path = parts[1].strip()
-        cert.save(update_fields=["has_private_key", "hdimage_path", "thumbprint"])
+        cont = ""
+        if container_line and ":" in container_line:
+            cont = container_line.split(":", 1)[1].strip()
+        prev = umy.get(tp)
+        # если thumb несколько раз — True побеждает
+        if prev is None or (has_pk and not prev.get("has_pk")):
+            umy[tp] = {"has_pk": has_pk, "container": cont}
         current_thumb = None
         has_pk = False
         container_line = None
 
     for line in out.splitlines():
         line = line.rstrip()
-
         if line.startswith("SHA1 Thumbprint"):
             flush()
             parts = line.split(":", 1)
             if len(parts) == 2:
                 current_thumb = parts[1].strip().lower()
-
         if "PrivateKey Link" in line:
             has_pk = "Yes" in line
-
         if line.startswith("Container"):
             container_line = line
-
     flush()
+
+    stats = {"linked": 0, "unlinked": 0, "unchanged": 0, "updated": 0}
+    for cert in Certificate.objects.iterator(chunk_size=200):
+        tp = _norm_tp(cert.thumbprint or "")
+        info = umy.get(tp) if tp else None
+        want = bool(info and info.get("has_pk"))
+        fields: list[str] = []
+        if cert.has_private_key != want:
+            cert.has_private_key = want
+            fields.append("has_private_key")
+        if info and tp and (cert.thumbprint or "").replace(" ", "").lower() != tp:
+            cert.thumbprint = tp
+            fields.append("thumbprint")
+        if info and info.get("container") and cert.hdimage_path != info["container"]:
+            cert.hdimage_path = info["container"]
+            fields.append("hdimage_path")
+        if fields:
+            cert.save(update_fields=fields)
+            stats["updated"] += 1
+        else:
+            stats["unchanged"] += 1
+        if want:
+            stats["linked"] += 1
+        else:
+            stats["unlinked"] += 1
+    return stats
 
 
 class Command(BaseCommand):
