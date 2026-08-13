@@ -104,24 +104,27 @@ def auth_sbis_by_cert(
     if data.get("error"):
         err = data["error"]
         err_msg = (err.get("message") or err.get("details") or str(err)).lower()
-        if (
-            "отозван" in err_msg
-            or "не является доверенным" in err_msg
-            or "выберите другой сертификат" in err_msg
-            or "просроченному сертификату" in err_msg
-            or "аутентификация по просроченному" in err_msg
-        ):
-            try:
-                tp = (thumbprint or "").strip().lower()
-                if inn and inn != "no_inn" and tp:
-                    deleted = Certificate.objects.filter(inn=inn, thumbprint=tp).delete()
-                    if deleted[0]:
-                        logger.warning(
-                            "[SBIS auth] Сертификат отозван/просрочен/не доверенный — удалён из БД (inn=%s)",
-                            inn,
-                        )
-            except Exception as e:
-                logger.warning("[SBIS auth] Не удалось удалить сертификат из БД: %s", e)
+        # Не удаляем Certificate здесь: массовый auth/сканер пишет аудит по pk,
+        # а чистку мёртвых делаем отдельно по CSV (иначе FK и гонки на workers).
+        if getattr(settings, "SBIS_AUTH_DELETE_REVOKED_CERTS", False):
+            if (
+                "отозван" in err_msg
+                or "не является доверенным" in err_msg
+                or "выберите другой сертификат" in err_msg
+                or "просроченному сертификату" in err_msg
+                or "аутентификация по просроченному" in err_msg
+            ):
+                try:
+                    tp = (thumbprint or "").strip().lower()
+                    if inn and inn != "no_inn" and tp:
+                        deleted = Certificate.objects.filter(inn=inn, thumbprint=tp).delete()
+                        if deleted[0]:
+                            logger.warning(
+                                "[SBIS auth] Сертификат отозван/просрочен/не доверенный — удалён из БД (inn=%s)",
+                                inn,
+                            )
+                except Exception as e:
+                    logger.warning("[SBIS auth] Не удалось удалить сертификат из БД: %s", e)
         raise RuntimeError(f"JSON-RPC error при аутентификации: {data['error']}")
 
     enc_b64 = data.get("result")

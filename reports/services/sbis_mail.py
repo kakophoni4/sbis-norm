@@ -788,11 +788,16 @@ class SbisSessionService:
             message = f"{message[:997]}..."
 
         inn_value = _sanitize_inn(getattr(self.certificate, "inn", None))
+        cert = self.certificate
+        cert_fk = None
+        pk = getattr(cert, "pk", None)
+        if pk and Certificate.objects.filter(pk=pk).exists():
+            cert_fk = cert
 
         try:
             CertificateAuditLog.objects.create(
                 inn=inn_value,
-                cert=self.certificate,
+                cert=cert_fk,
                 action=SBIS_AUTH_AUDIT_ACTION,
                 status=status,
                 message=message,
@@ -800,7 +805,7 @@ class SbisSessionService:
         except Exception:
             logger.exception(
                 "Не удалось записать аудит авторизации (certificate_id=%s)",
-                self.certificate.pk,
+                pk,
             )
 
     def _get_certmgr_path(self) -> str:
@@ -954,11 +959,16 @@ class SbisMailService:
             message = f"{message[:997]}..."
 
         inn_value = _sanitize_inn(getattr(self.certificate, "inn", None))
+        cert = self.certificate
+        cert_fk = None
+        pk = getattr(cert, "pk", None)
+        if pk and Certificate.objects.filter(pk=pk).exists():
+            cert_fk = cert
 
         try:
             CertificateAuditLog.objects.create(
                 inn=inn_value,
-                cert=self.certificate,
+                cert=cert_fk,
                 action=SBIS_FETCH_MAIL_AUDIT_ACTION,
                 status=status,
                 message=message,
@@ -966,7 +976,7 @@ class SbisMailService:
         except Exception:
             logger.exception(
                 "Не удалось записать аудит получения писем (certificate_id=%s)",
-                self.certificate.pk,
+                pk,
             )
 
     def _get_service_url(self) -> str:
