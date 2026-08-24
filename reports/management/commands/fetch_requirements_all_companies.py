@@ -51,7 +51,7 @@ from reports.services.requirement_sbis_meta import (
 )
 from reports.services.requirements_notify import notify_requirement_saved
 from reports.services.requirements_scan_scope import get_requirements_scan_inns
-from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full, finalize_requirement_ack
+from reports.services.sbis import sbis_list_service_stages, fetch_requirement_full
 from reports.services.sbis.client import close_thread_local_sbis_session
 from reports.services.sbis.crypto import export_cert_der, parse_kpp_from_cert_file
 from reports.services.sbis.requirements import (
@@ -788,7 +788,7 @@ def _process_one_cert(
 
             if not quiet:
                 if stage_id:
-                    write_fn(f"      — {doc_title_short}: скачивание + execute/ack...", None)
+                    write_fn(f"      — {doc_title_short}: скачивание + execute (ack отложен)...", None)
                 else:
                     write_fn(
                         f"      — {doc_title_short}: этапа нет — качаем через ПрочитатьДокумент...",
@@ -804,6 +804,7 @@ def _process_one_cert(
                     date_from_str=date_from_str,
                     date_to_str=date_to_str,
                     do_drain=False,
+                    skip_ack=True,
                 )
             else:
                 # не тащим старую session — via_read сам авторизуется / обновит при Not authorized
@@ -948,43 +949,13 @@ def _process_one_cert(
                 rmeta = fetch.get("result") or {}
                 write_fn(
                     f"        Сохранён. Дата док.: {document_date}, размер {size_str}"
-                    f" executed={rmeta.get('executed')} receipt={rmeta.get('receipt_sent')}"
+                    f" executed={rmeta.get('executed')} receipt=deferred"
                     + (" (dry-run)" if dry_run else ""),
                     "success",
                 )
 
-        # Документы уже в БД, но не в СписокСлужебныхЭтапов («Обработать» закрыт) —
-        # всё равно пробуем квитанцию Утверждение (статус «Ожидается доставка»).
-        if not dry_run:
-            db_qs = RequirementDocument.objects.filter(inn=inn)
-            if client_date_filter:
-                db_qs = db_qs.filter(document_date__gte=date_from.date(), document_date__lte=date_to.date())
-            for rdoc in db_qs.order_by("-document_date")[:30]:
-                if not quiet:
-                    write_fn(
-                        f"      — DB {rdoc.sbis_doc_id[:24]}...: ack Утверждение (вне списка служебных)...",
-                        None,
-                    )
-                try:
-                    ack_only = finalize_requirement_ack(
-                        inn,
-                        kpp=kpp,
-                        doc_id=rdoc.sbis_doc_id,
-                        date_from_str=date_from_str,
-                        date_to_str=date_to_str,
-                        do_drain=False,
-                    )
-                    if not quiet:
-                        rr = ack_only.get("result") or {}
-                        write_fn(
-                            f"        receipt={rr.get('receipt_sent')} skipped={rr.get('receipt_skipped')} "
-                            f"comment={rr.get('receipt_comment') or ''}"
-                            + (f" err={ack_only.get('error')}" if not ack_only.get("success") else ""),
-                            None,
-                        )
-                except Exception as e:
-                    if not quiet:
-                        write_fn(f"        ack-only error: {e}", "warning")
+        # Подтверждение получения — отложено (ack_requirements_delayed / Celery).
+        # Раньше здесь был немедленный finalize_requirement_ack по документам в БД.
 
         # Сюда попадаем только без исключения в теле try (в т.ч. после полного цикла по incoming)
         scan_eligible_for_cache = (

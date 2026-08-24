@@ -178,7 +178,7 @@ def periodic_mail_check_task(self, inn: str, days_back: int = 7):
 @shared_task(bind=True, max_retries=0, soft_time_limit=12 * 3600, time_limit=12 * 3600 + 600)
 def fetch_requirements_daily_task(self, days: int = 10):
     """
-    Ежедневный сканер требований ФНС (полный цикл Saby: prepare→decrypt→execute→ack).
+    Ежедневный сканер требований ФНС (скачивание без немедленного ack).
     Whitelist: docs/requirements_scan_inns.txt. Окно по умолчанию --days 10.
 
     Важно: раунд1=7 / раунд2=3 / далее=1, мало раундов ретрая — иначе не укладываемся
@@ -204,4 +204,36 @@ def fetch_requirements_daily_task(self, days: int = 10):
         return {"ok": True, "days": days}
     except Exception:
         logger.exception("[fetch_requirements_daily_task] failed")
+        raise
+
+
+@shared_task(bind=True, max_retries=0, soft_time_limit=2 * 3600, time_limit=2 * 3600 + 300)
+def ack_requirements_delayed_task(self, delay_days: int = 4, workers: int = 4, limit: int = 0):
+    """
+    Подтверждение получения требований спустя delay_days после скачивания (created_at).
+    """
+    from django.core.management import call_command
+
+    delay_days = max(0, int(delay_days if delay_days is not None else 4))
+    workers = max(1, min(8, int(workers or 4)))
+    limit = max(0, int(limit or 0))
+    logger.info(
+        "[ack_requirements_delayed_task] start delay_days=%s workers=%s limit=%s",
+        delay_days,
+        workers,
+        limit,
+    )
+    try:
+        kwargs = {
+            "delay_days": delay_days,
+            "workers": workers,
+            "verbosity": 1,
+        }
+        if limit:
+            kwargs["limit"] = limit
+        call_command("ack_requirements_delayed", **kwargs)
+        logger.info("[ack_requirements_delayed_task] done")
+        return {"ok": True, "delay_days": delay_days}
+    except Exception:
+        logger.exception("[ack_requirements_delayed_task] failed")
         raise

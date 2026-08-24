@@ -130,6 +130,14 @@ class RequirementDocument(models.Model):
     )
     replied_at = models.DateTimeField(null=True, blank=True, verbose_name="Ответ отправлен")
     reply_error = models.TextField(blank=True, null=True, verbose_name="Ошибка ответа")
+    receipt_acked_at = models.DateTimeField(
+        null=True,
+        blank=True,
+        db_index=True,
+        verbose_name="Подтверждение получения в СБИС",
+        help_text="Когда отправили квитанцию «Подтвердить получение/Утверждение». "
+        "Сканер не подтверждает сразу — отложенный ack через N дней после created_at.",
+    )
 
     class Meta:
         verbose_name = "Требование (документ ФНС)"

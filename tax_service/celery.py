@@ -26,3 +26,10 @@ app.conf.beat_schedule["fetch-requirements-daily"] = {
     "schedule": crontab(hour=14, minute=0),
     "kwargs": {"days": 10},
 }
+
+# 17:30 Europe/Moscow = 14:30 UTC — ack через 4 дня после скачивания (created_at)
+app.conf.beat_schedule["ack-requirements-delayed"] = {
+    "task": "reports.tasks.ack_requirements_delayed_task",
+    "schedule": crontab(hour=14, minute=30),
+    "kwargs": {"delay_days": 4, "workers": 4},
+}

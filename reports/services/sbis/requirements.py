@@ -2246,11 +2246,13 @@ def fetch_requirement_full(
     date_to_str: str | None = None,
     save_to: str | None = None,
     do_drain: bool = False,
+    skip_ack: bool = False,
 ) -> dict:
     """
     Полный цикл по доке Saby:
-    prepare → download/decrypt → execute → ack Утверждение.
+    prepare → download/decrypt → execute → (опционально) ack Утверждение.
     do_drain=True — дополнительно пройти служебные этапы по этому doc_id (дорого по прокси).
+    skip_ack=True — не подтверждать получение (отложенный ack по created_at + N дней).
 
     Если этап уже закрыт («Действие отсутствует или обработано») — fallback:
     скачать файл через ПрочитатьДокумент без prepare/execute.
@@ -2410,22 +2412,27 @@ def fetch_requirement_full(
     else:
         result["service_stages_done"] = 0
 
-    ack = acknowledge_requirement_receipt(
-        inn,
-        session_id=session_id,
-        doc_id=requirement_doc_id,
-        kpp=kpp,
-        thumbprint=thumbprint,
-        fio=fio,
-        csptest_name=cert.csptest_name,
-        org_name=org_name,
-    )
-    result["receipt_sent"] = bool(ack.get("receipt_sent"))
-    result["receipt_skipped"] = bool(ack.get("skipped"))
-    if not ack.get("success"):
-        result["receipt_error"] = ack.get("error")
-    elif ack.get("comment"):
-        result["receipt_comment"] = ack.get("comment")
+    if skip_ack:
+        result["receipt_sent"] = False
+        result["receipt_skipped"] = True
+        result["receipt_comment"] = "ack отложен (skip_ack=True)"
+    else:
+        ack = acknowledge_requirement_receipt(
+            inn,
+            session_id=session_id,
+            doc_id=requirement_doc_id,
+            kpp=kpp,
+            thumbprint=thumbprint,
+            fio=fio,
+            csptest_name=cert.csptest_name,
+            org_name=org_name,
+        )
+        result["receipt_sent"] = bool(ack.get("receipt_sent"))
+        result["receipt_skipped"] = bool(ack.get("skipped"))
+        if not ack.get("success"):
+            result["receipt_error"] = ack.get("error")
+        elif ack.get("comment"):
+            result["receipt_comment"] = ack.get("comment")
 
     logger.info(
         "fetch_requirement_full inn=%s doc=%s executed=%s receipt_sent=%s receipt_skipped=%s stages=%s",

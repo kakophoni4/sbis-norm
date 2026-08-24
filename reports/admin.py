@@ -36,6 +36,7 @@ class RequirementDocumentAdmin(admin.ModelAdmin):
         "document_date",
         "response_due_date",
         "reply_status",
+        "receipt_acked_at",
         "sbis_doc_id",
         "doc_title",
         "created_at",
