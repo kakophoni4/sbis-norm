@@ -84,9 +84,14 @@ def find_kv_iv(atts: list[dict]):
 
 
 def pdf_url(att: dict) -> str:
-    """В разных ответах СБИС ссылка встречается и у вложения, и внутри Файл."""
+    """Найти PDF- или прямую файловую ссылку в разных формах ответа СБИС.
+
+    У части KV/IV поле ``СсылкаНаPDF`` отсутствует, хотя прямой ``Ссылка``
+    есть внутри ``Файл``. Сохранение всё равно происходит только после
+    проверки сигнатуры PDF в ``download_pdf``.
+    """
     for source in (att, att.get("Файл") or {}):
-        for key in ("СсылкаНаPDF", "СсылкаPDF"):
+        for key in ("СсылкаНаPDF", "СсылкаPDF", "Ссылка"):
             value = source.get(key)
             if isinstance(value, str) and value.strip():
                 return value.strip()
