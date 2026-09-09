@@ -151,8 +151,8 @@ def sbis_auth_session_for_inn(
     inn: str,
     *,
     prewarm_proxies: bool = True,
-    proxy_want: int = 6,
-    proxy_warmup_budget_sec: int = 14,
+    proxy_want: int = 2,
+    proxy_warmup_budget_sec: int = 8,
     auth_timeout_sec: int = 14,
     auth_budget_sec: int = 20,
 ) -> dict:

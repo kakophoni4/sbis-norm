@@ -44,6 +44,12 @@ _PROXY_CACHE: dict[tuple[str, str], tuple[float, dict]] = {}
 _NODEMAVEN_CLIENT: NodeMavenClient | None = None
 _NODEMAVEN_CLIENT_KEY: str | None = None
 _GOOD_PROXY_POOL: dict[str, tuple[float, list[str]]] = {}
+_GOOD_PROXY_POOL_LOCK = threading.RLock()
+_WARMUP_LOCKS: dict[str, threading.Lock] = {}
+_WARMUP_LOCKS_LOCK = threading.Lock()
+# Пробы прокси ходят в тот же шлюз, что и рабочие запросы. Общий лимит не даёт
+# нескольким воркерам одновременно устроить ему всплеск CONNECT-запросов.
+_PROXY_PROBE_SEMAPHORE = threading.BoundedSemaphore(3)
 
 _thread_http = threading.local()
 
@@ -262,6 +268,50 @@ def _probe_proxy_connectivity(
     except Exception as e:
         return False, f"error={e}"
 
+
+def _good_proxies_for_inn(inn: str) -> list[str]:
+    """Вернуть непротухший пул прокси, не отдавая наружу изменяемый список."""
+    with _GOOD_PROXY_POOL_LOCK:
+        cached = _GOOD_PROXY_POOL.get(inn)
+        if not cached:
+            return []
+        ts, arr = cached
+        if (time.time() - ts) > _GOOD_PROXY_TTL_SECONDS or not arr:
+            _GOOD_PROXY_POOL.pop(inn, None)
+            return []
+        return list(arr)
+
+
+def _save_good_proxies_for_inn(inn: str, proxies: list[str]) -> None:
+    """Сохранить уникальный пул прокси для ИНН и обновить его TTL."""
+    unique = list(dict.fromkeys(p for p in proxies if p))
+    if not unique:
+        return
+    with _GOOD_PROXY_POOL_LOCK:
+        _GOOD_PROXY_POOL[inn] = (time.time(), unique)
+
+
+def _discard_good_proxy_for_inn(inn: str, proxy_url: str | None) -> None:
+    """Не предлагать повторно прокси, который только что не прошёл рабочий запрос."""
+    if not proxy_url:
+        return
+    with _GOOD_PROXY_POOL_LOCK:
+        cached = _GOOD_PROXY_POOL.get(inn)
+        if not cached:
+            return
+        _ts, arr = cached
+        remaining = [item for item in arr if item != proxy_url]
+        if remaining:
+            _GOOD_PROXY_POOL[inn] = (time.time(), remaining)
+        else:
+            _GOOD_PROXY_POOL.pop(inn, None)
+
+
+def _warmup_lock_for_inn(inn: str) -> threading.Lock:
+    """Один прогрев на ИНН за раз: параллельные запросы используют его результат."""
+    with _WARMUP_LOCKS_LOCK:
+        return _WARMUP_LOCKS.setdefault(inn, threading.Lock())
+
 def warmup_good_proxies_for_inn(
     inn: str,
     *,
@@ -270,85 +320,97 @@ def warmup_good_proxies_for_inn(
     per_probe_timeout: float = 6.0,
 ) -> list[str]:
     """
-    Мягкий прогрев:
-    - ищем 1–2 рабочих прокси
-    - не делаем много проб подряд, иначе сами ловим 429
+    Прогрев пула для ИНН.
+
+    Сначала используется пятиминутный пул. Новые прокси ищутся только если
+    в нём не хватает экземпляров; повторные HTTP-запросы не прогревают пул заново.
     """
-    logger.info(
-        "[SBIS_PROXY_POOL] warmup start inn=%s want=%s budget_sec=%s",
-        inn, want, total_budget_sec,
-    )
-    deadline = time.time() + max(8, int(total_budget_sec))
-    good: list[str] = []
+    want = max(1, int(want))
+    cached = _good_proxies_for_inn(inn)
+    if len(cached) >= want:
+        logger.debug("[SBIS_PROXY_POOL] reuse inn=%s count=%s", inn, len(cached))
+        return cached
 
-    ports = [8080, 8081, 8082, 8083, 8085, 8090, 8100]
-    random.shuffle(ports)
+    # В рамках одного ИНН несколько потоков не должны одновременно прогревать
+    # один и тот же пул. Ожидающий поток после lock увидит готовый кэш.
+    with _warmup_lock_for_inn(inn):
+        good = _good_proxies_for_inn(inn)
+        if len(good) >= want:
+            return good
 
-    city_modes = [None, NODEMAVEN_CITY]  # чаще без city стабильнее
+        logger.info(
+            "[SBIS_PROXY_POOL] warmup start inn=%s have=%s want=%s budget_sec=%s",
+            inn, len(good), want, total_budget_sec,
+        )
+        deadline = time.time() + max(4, int(total_budget_sec))
+        ports = [8080, 8081, 8082, 8083, 8085, 8090, 8100]
+        random.shuffle(ports)
+        city_modes = [None, NODEMAVEN_CITY]  # чаще без city стабильнее
+        tries = 0
+        max_tries = 20
 
-    tries = 0
-    max_tries = 80
-    while time.time() < deadline and len(good) < want and tries < max_tries:
-        tries += 1
-        sticky = uuid.uuid4().hex[:8]
-        got_proxy_this_round = False
+        while time.time() < deadline and len(good) < want and tries < max_tries:
+            tries += 1
+            sticky = uuid.uuid4().hex[:8]
+            got_proxy_this_round = False
 
-        for city in city_modes:
-            if time.time() >= deadline or len(good) >= want:
-                break
-
-            try:
-                p = _nodemaven_proxies(inn=inn, sticky_key=sticky, city=city)
-                base = (p.get("http") or "").strip()
-                if not base:
-                    continue
-                got_proxy_this_round = True
-            except Exception:
-                continue
-
-            for port in ports:
+            for city in city_modes:
                 if time.time() >= deadline or len(good) >= want:
                     break
-
-                proxy_url = _replace_port_in_proxy_url(base, port)
-                if proxy_url in good:
+                try:
+                    p = _nodemaven_proxies(inn=inn, sticky_key=sticky, city=city)
+                    base = (p.get("http") or "").strip()
+                    if not base:
+                        continue
+                    got_proxy_this_round = True
+                except Exception:
                     continue
 
-                ok, reason = _probe_proxy_connectivity(proxy_url, timeout=per_probe_timeout)
-                if ok:
-                    good.append(proxy_url)
-                else:
-                    # если видим 429 — тормозим, иначе быстро упрёмся в лимит
-                    if "bad_status=429" in reason:
-                        time.sleep(4.0)
+                for port in ports:
+                    if time.time() >= deadline or len(good) >= want:
+                        break
+                    proxy_url = _replace_port_in_proxy_url(base, port)
+                    if proxy_url in good:
+                        continue
 
-                # лёгкая пауза между пробами
-                time.sleep(0.7)
+                    # Ограничиваем пробы глобально, но не блокируем прогрев дольше
+                    # оставшегося времени его бюджета.
+                    remaining = max(0.1, deadline - time.time())
+                    acquired = _PROXY_PROBE_SEMAPHORE.acquire(timeout=min(1.0, remaining))
+                    if not acquired:
+                        continue
+                    try:
+                        ok, reason = _probe_proxy_connectivity(
+                            proxy_url,
+                            timeout=min(per_probe_timeout, max(0.5, deadline - time.time())),
+                        )
+                    finally:
+                        _PROXY_PROBE_SEMAPHORE.release()
 
-        if not got_proxy_this_round:
-            time.sleep(0.3)
+                    if ok:
+                        good.append(proxy_url)
+                    elif "bad_status=429" in reason:
+                        time.sleep(min(2.0, max(0.0, deadline - time.time())))
 
-    if good:
-        _GOOD_PROXY_POOL[inn] = (time.time(), good)
+                    # Лёгкая пауза между пробами, чтобы не устроить burst на шлюзе.
+                    time.sleep(min(0.5, max(0.0, deadline - time.time())))
 
-    logger.info(
-        f"[SBIS_PROXY_POOL] warmup inn={inn} collected={len(good)} tries={tries} "
-        f"sample={[ _mask_proxy_url(x) for x in good[:2] ]}"
-    )
-    return good
+            if not got_proxy_this_round:
+                time.sleep(min(0.3, max(0.0, deadline - time.time())))
+
+        _save_good_proxies_for_inn(inn, good)
+        logger.info(
+            f"[SBIS_PROXY_POOL] warmup inn={inn} collected={len(good)} tries={tries} "
+            f"sample={[ _mask_proxy_url(x) for x in good[:2] ]}"
+        )
+        return good
 
 def get_good_proxy_for_inn(inn: str) -> str | None:
     """
     Берем рабочий proxy_url из пула (если не протух).
     """
-    cached = _GOOD_PROXY_POOL.get(inn)
-    if not cached:
-        return None
-    ts, arr = cached
-    if (time.time() - ts) > _GOOD_PROXY_TTL_SECONDS or not arr:
-        _GOOD_PROXY_POOL.pop(inn, None)
-        return None
-    return random.choice(arr)
+    cached = _good_proxies_for_inn(inn)
+    return random.choice(cached) if cached else None
 
 def _sbis_request(
     method: str,
@@ -361,8 +423,8 @@ def _sbis_request(
     allow_redirects: bool = True,
     proxy_url_override: str | None = None,
     total_budget_sec: int = 45,
-    proxy_want: int = 5,
-    proxy_warmup_budget_sec: int = 12,
+    proxy_want: int = 2,
+    proxy_warmup_budget_sec: int = 8,
 ):
     """
     Главная точка HTTP.
@@ -501,6 +563,8 @@ def _sbis_request(
                     return resp
                 _close_http_response(last_bad_resp)
                 last_bad_resp = resp
+                if inn:
+                    _discard_good_proxy_for_inn(inn, proxy_url)
                 logger.warning(
                     f"[SBIS_PROXY] retryable HTTP {resp.status_code} attempt={attempt} "
                     f"proxy={_mask_proxy_url(proxy_url) if proxy_url else None} "
@@ -522,6 +586,8 @@ def _sbis_request(
 
         except (ProxyError, Timeout, ConnectionError, SSLError) as e:
             last_err = e
+            if inn:
+                _discard_good_proxy_for_inn(inn, proxy_url)
             logger.warning(
                 f"[SBIS_PROXY] transport error attempt={attempt} proxy={_mask_proxy_url(proxy_url) if proxy_url else None}: {e}"
             )
