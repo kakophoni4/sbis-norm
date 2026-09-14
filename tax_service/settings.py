@@ -1,6 +1,7 @@
 import os
 
 import environ
+from django.core.exceptions import ImproperlyConfigured
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
@@ -24,7 +25,23 @@ SECRET_KEY = env('SECRET_KEY')
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = env('DEBUG')
 
-ALLOWED_HOSTS = ['*']
+# В production хост задаётся явно: wildcard позволял любому Host-заголовку
+# попасть в приложение. Отсутствующая конфигурация закрывает запуск, а не
+# открывает приложение случайно на все домены.
+ALLOWED_HOSTS = env.list('DJANGO_ALLOWED_HOSTS', default=[])
+if not DEBUG and not ALLOWED_HOSTS:
+    raise ImproperlyConfigured('DJANGO_ALLOWED_HOSTS обязателен при DEBUG=false')
+
+CSRF_TRUSTED_ORIGINS = env.list('DJANGO_CSRF_TRUSTED_ORIGINS', default=[])
+SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+SECURE_SSL_REDIRECT = env.bool('DJANGO_SECURE_SSL_REDIRECT', default=not DEBUG)
+SESSION_COOKIE_SECURE = not DEBUG
+CSRF_COOKIE_SECURE = not DEBUG
+SESSION_COOKIE_HTTPONLY = True
+SECURE_CONTENT_TYPE_NOSNIFF = True
+SECURE_REFERRER_POLICY = 'same-origin'
+X_FRAME_OPTIONS = 'DENY'
+SECURE_HSTS_SECONDS = env.int('DJANGO_HSTS_SECONDS', default=31536000 if not DEBUG else 0)
 
 
 # Application definition
