@@ -8,7 +8,7 @@ from pathlib import Path
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from reports.services.sbis import send_report_1c
+from reports.services.sbis import check_report_statuses, send_report_1c
 
 logger = logging.getLogger(__name__)
 
@@ -89,3 +89,33 @@ class SendReport1CView(APIView):
             logger.info("[1C_IN_REPORT] saved payload to: %s", base)
         except Exception:
             logger.exception("[1C_IN_REPORT] failed to log payload")
+
+
+class ReportStatuses1CView(APIView):
+    """Проверка статуса исходящих отчётов и КВ/ИВ по известным 1С документам."""
+
+    permission_classes = []
+
+    def post(self, request, *args, **kwargs):
+        items = request.data.get("items")
+        # Удобный однодокументный формат, но основной контракт — пачка items.
+        if items is None:
+            items = [{
+                "external_id": request.data.get("external_id"),
+                "inn": request.data.get("inn"),
+                "sbis_doc_id": request.data.get("sbis_doc_id"),
+            }]
+        include_files = self._as_bool(request.data.get("include_files", False))
+        include_content = self._as_bool(request.data.get("include_content", include_files))
+        result = check_report_statuses(
+            items,
+            include_files=include_files,
+            include_content=include_content,
+        )
+        return Response(result, status=400 if result.get("error") else 200)
+
+    @staticmethod
+    def _as_bool(value) -> bool:
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "y", "on")
+        return bool(value)

@@ -123,6 +123,10 @@ STATIC_URL = 'static/'
 MEDIA_ROOT = BASE_DIR / 'media'
 MEDIA_URL = '/media/'
 
+# Временно можно остановить оба фоновых задания по требованиям, не выключая
+# Celery Beat целиком и не затрагивая проверку почты/прочие задачи.
+REQUIREMENTS_SCHEDULER_ENABLED = env.bool('REQUIREMENTS_SCHEDULER_ENABLED', default=True)
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 

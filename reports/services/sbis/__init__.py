@@ -11,3 +11,4 @@ from .reports import (  # noqa: F401 — новый API, не трогает sen
     send_report,
     send_report_1c,
 )
+from .report_status import check_report_statuses  # noqa: F401
