@@ -9,6 +9,7 @@ from rest_framework import status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from reports.api.permissions import OneCApiTokenPermission
 from reports.services.sbis import (
     fetch_receipt_pdf_b64_from_archive,
     fetch_sales_book_extract_by_counterparty,
@@ -67,7 +68,7 @@ class SendNdsExtraView(APIView):
 
 
 class SendNdsExtra1CView(APIView):
-    permission_classes = []
+    permission_classes = [OneCApiTokenPermission]
 
     def post(self, request, *args, **kwargs):
         inn = str(request.data.get("inn", "")).strip()

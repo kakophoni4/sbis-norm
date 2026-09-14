@@ -127,6 +127,13 @@ MEDIA_URL = '/media/'
 # Celery Beat целиком и не затрагивая проверку почты/прочие задачи.
 REQUIREMENTS_SCHEDULER_ENABLED = env.bool('REQUIREMENTS_SCHEDULER_ENABLED', default=True)
 
+# Общий ключ серверной интеграции с 1С. Пустое значение намеренно закрывает
+# защищённые 1С-ручки (fail closed), пока ключ не задан в app.env.
+ONEC_API_TOKEN = env('ONEC_API_TOKEN', default='')
+# Временный предыдущий ключ для безостановочной ротации; после перехода 1С
+# на новый ключ его нужно удалить из app.env.
+ONEC_API_TOKEN_PREVIOUS = env('ONEC_API_TOKEN_PREVIOUS', default='')
+
 # Default primary key field type
 # https://docs.djangoproject.com/en/4.2/ref/settings/#default-auto-field
 

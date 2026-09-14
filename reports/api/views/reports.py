@@ -8,6 +8,7 @@ from pathlib import Path
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from reports.api.permissions import OneCApiTokenPermission
 from reports.services.sbis import check_report_statuses, send_report_1c
 
 logger = logging.getLogger(__name__)
@@ -34,7 +35,7 @@ class SendReport1CView(APIView):
     Не заменяет send-nds-extra-1c (НДС с книгами для 1С).
     """
 
-    permission_classes = []
+    permission_classes = [OneCApiTokenPermission]
 
     def post(self, request, *args, **kwargs):
         inn = str(request.data.get("inn", "")).strip()
@@ -94,7 +95,7 @@ class SendReport1CView(APIView):
 class ReportStatuses1CView(APIView):
     """Проверка статуса исходящих отчётов и КВ/ИВ по известным 1С документам."""
 
-    permission_classes = []
+    permission_classes = [OneCApiTokenPermission]
 
     def post(self, request, *args, **kwargs):
         items = request.data.get("items")
