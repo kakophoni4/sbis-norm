@@ -4,7 +4,8 @@
 #
 # This importer deliberately does NOT delete files, overwrite existing key
 # directories, change the Certificate table, or call SBIS.  Each discovered
-# keyset gets its own new HDIMAGE directory, so archives containing several
+# keyset gets its own new HDIMAGE directory under a numeric holding directory,
+# which CryptoPro requires for enumeration, so archives containing several
 # signatures and files named "2560" cannot collide with one another.
 #
 # Run on the host:
@@ -18,19 +19,21 @@ PROJECT_DIR="${PROJECT_DIR:-/opt/sbis-norm}"
 CSP_ROOT="${CSP_ROOT:-/var/opt/cprocsp/keys/root}"
 SOURCE_DIR=""
 BATCH=""
+CSP_PARENT_INN="0000000000"
 APPLY=false
 
 usage() {
   cat <<'EOF'
 Usage:
-  import_ecp_archives_additive.sh --source DIR --batch YYYYMMDD [--apply]
+  import_ecp_archives_additive.sh --source DIR --batch YYYYMMDD [--csp-parent-inn INN] [--apply]
 
 --source  Directory containing ZIP/RAR archives with CryptoPro keysets.
 --batch   Safe ASCII batch label, e.g. 20260916.
+--csp-parent-inn  Numeric holding directory for new containers (default: 0000000000).
 --apply   Copy discovered keysets to CryptoPro. Without it only print a plan.
 
 The importer never overwrites or removes existing files. It only creates:
-  /var/opt/cprocsp/keys/root/new_<batch>_<archive>_<container>/
+  /var/opt/cprocsp/keys/root/<holding-inn>/new_<batch>_<archive>_<container>/
 EOF
 }
 
@@ -38,6 +41,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --source) SOURCE_DIR="$2"; shift 2 ;;
     --batch) BATCH="$2"; shift 2 ;;
+    --csp-parent-inn) CSP_PARENT_INN="$2"; shift 2 ;;
     --apply) APPLY=true; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -47,7 +51,8 @@ done
 [[ "$(id -u)" -eq 0 ]] || { echo "Run as root." >&2; exit 1; }
 [[ -n "$SOURCE_DIR" && -d "$SOURCE_DIR" ]] || { echo "--source must be an existing directory." >&2; exit 2; }
 [[ "$BATCH" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "--batch may contain only A-Z, a-z, 0-9, _ and -." >&2; exit 2; }
-mkdir -p "$CSP_ROOT"
+[[ "$CSP_PARENT_INN" =~ ^[0-9]{10,12}$ ]] || { echo "--csp-parent-inn must contain 10-12 digits." >&2; exit 2; }
+mkdir -p "$CSP_ROOT/$CSP_PARENT_INN"
 
 command -v unzip >/dev/null || { echo "unzip is required." >&2; exit 1; }
 if ! command -v unrar >/dev/null && ! command -v unar >/dev/null; then
@@ -85,7 +90,7 @@ mapfile -d '' archives < <(
 
 echo "Source archives: ${#archives[@]}"
 echo "Mode: $([[ "$APPLY" == true ]] && echo APPLY || echo PLAN)"
-echo "CryptoPro root: $CSP_ROOT"
+echo "CryptoPro root: $CSP_ROOT/$CSP_PARENT_INN"
 
 archive_index=0
 keyset_total=0
@@ -108,7 +113,7 @@ for archive in "${archives[@]}"; do
 
     container_index=$((container_index + 1))
     keyset_total=$((keyset_total + 1))
-    destination="$CSP_ROOT/new_${BATCH}_$(printf '%03d' "$archive_index")_$(printf '%02d' "$container_index")"
+    destination="$CSP_ROOT/$CSP_PARENT_INN/new_${BATCH}_$(printf '%03d' "$archive_index")_$(printf '%02d' "$container_index")"
 
     printf '%s\t%s\t%s\t%s\n' "$archive" "$keyset_dir" "$destination" "$key_count" >> "$MANIFEST"
     echo "[$keyset_total] $(basename "$archive") -> $(basename "$destination") ($key_count .key)"
