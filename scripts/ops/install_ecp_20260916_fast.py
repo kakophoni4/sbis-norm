@@ -29,7 +29,11 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from import_ecp_archives_additive import REQUIRED_KEY_FILES, read_container_name
+from import_ecp_archives_additive import (
+    REQUIRED_KEY_FILES,
+    keyset_fingerprint,
+    read_container_name,
+)
 
 
 # The two duplicate archives (2560.zip and Zero.zip) are intentionally absent.
@@ -85,14 +89,22 @@ def host(*command: str, timeout: int = 90) -> subprocess.CompletedProcess[str]:
     return subprocess.run(command, text=True, capture_output=True, timeout=timeout, check=False)
 
 
-def csp_name(container: str) -> str:
-    # This is the exact spelling used by the successful ZERO verification.
-    return r"\\\\.\HDIMAGE" + "\\\\" + container
+def enumerated_container(container_name: str) -> str | None:
+    """Return CryptoPro's exact FQCN rather than reconstructing backslashes."""
+    listed = docker(CSPTEST, "-keyset", "-enum_cont", "-fqcn")
+    if listed.returncode:
+        return None
+    suffix = "\\" + container_name
+    for line in listed.stdout.splitlines():
+        line = line.strip()
+        if "HDIMAGE" in line and line.endswith(suffix):
+            return line
+    return None
 
 
-def cert_details(container: str, label: str) -> dict[str, str] | None:
+def cert_details(fqcn: str, label: str) -> dict[str, str] | None:
     cert = f"/tmp/ecp_20260916_{label}.cer"
-    exported = docker(CERTMGR, "-export", "-cont", csp_name(container), "-dest", cert)
+    exported = docker(CERTMGR, "-export", "-cont", fqcn, "-dest", cert)
     if exported.returncode:
         return None
     listed = docker(CERTMGR, "-list", "-file", cert)
@@ -121,8 +133,8 @@ def cert_details(container: str, label: str) -> dict[str, str] | None:
     }
 
 
-def verify(container: str) -> bool:
-    result = docker(CSPTEST, "-keyset", "-container", csp_name(container), "-verifycontext")
+def verify(fqcn: str) -> bool:
+    result = docker(CSPTEST, "-keyset", "-container", fqcn, "-verifycontext")
     return result.returncode == 0
 
 
@@ -146,9 +158,24 @@ def read_candidates(source_root: Path, csp_root: Path, first_probe: int) -> list
             raise RuntimeError(f"source keyset is incomplete: {source}")
         container = read_container_name(source / "name.key")
         probe = csp_root / str(first_probe + index)
+        reuse_probe = False
         if probe.exists():
-            raise RuntimeError(f"reserved probe directory already exists: {probe}")
-        candidates.append({"source": source, "archive": archive, "container": container, "probe": probe})
+            # The first failed run already created these temporary copies.  It
+            # is safe to reuse only an exact copy of the same key material;
+            # never overwrite an arbitrary existing directory.
+            try:
+                reuse_probe = probe.is_dir() and keyset_fingerprint(probe) == keyset_fingerprint(source)
+            except OSError:
+                reuse_probe = False
+            if not reuse_probe:
+                raise RuntimeError(f"reserved probe directory conflicts with this keyset: {probe}")
+        candidates.append({
+            "source": source,
+            "archive": archive,
+            "container": container,
+            "probe": probe,
+            "reuse_probe": reuse_probe,
+        })
     return candidates
 
 
@@ -213,7 +240,8 @@ def main() -> int:
 
     print(f"Preflight OK: {len(candidates)} unique keysets; no old key was changed yet.")
     for candidate in candidates:
-        copy_flat(candidate["source"], candidate["probe"])  # type: ignore[arg-type]
+        if not candidate["reuse_probe"]:
+            copy_flat(candidate["source"], candidate["probe"])  # type: ignore[arg-type]
     restarted = host("docker", "compose", "restart", "web")
     if restarted.returncode:
         print(restarted.stdout + restarted.stderr, file=sys.stderr)
@@ -222,13 +250,15 @@ def main() -> int:
     usable: list[dict[str, object]] = []
     for index, candidate in enumerate(candidates, start=1):
         container = str(candidate["container"])
-        if not verify(container):
+        fqcn = enumerated_container(container)
+        if not fqcn or not verify(fqcn):
             print(f"SKIP not visible: {candidate['archive']} -> {container}")
             continue
-        details = cert_details(container, str(index))
+        details = cert_details(fqcn, str(index))
         if not details:
             print(f"SKIP cannot export/parse: {candidate['archive']} -> {container}")
             continue
+        candidate["fqcn"] = fqcn
         candidate.update(details)
         usable.append(candidate)
         print(f"CERT {details['inn']} until {details['not_after']} <- {candidate['archive']}")
@@ -266,17 +296,18 @@ def main() -> int:
 
         for inn, candidate in selected.items():
             container = str(candidate["container"])
-            if not verify(container):
+            fqcn = enumerated_container(container)
+            if not fqcn or not verify(fqcn):
                 raise RuntimeError(f"new container not visible for INN {inn}: {container}")
-            checked = cert_details(container, "final_" + inn)
+            checked = cert_details(fqcn, "final_" + inn)
             if not checked or checked["inn"] != inn:
                 raise RuntimeError(f"certificate mismatch after final copy for INN {inn}")
-            installed_result = docker(CERTMGR, "-inst", "-store", "uMy", "-file", checked["cert_path"], "-cont", csp_name(container), timeout=45)
+            installed_result = docker(CERTMGR, "-inst", "-store", "uMy", "-file", checked["cert_path"], "-cont", fqcn, timeout=45)
             if installed_result.returncode:
                 raise RuntimeError(f"uMy install failed for INN {inn}: {(installed_result.stdout + installed_result.stderr)[-500:]}")
             installed.append({
                 "inn": inn,
-                "container": container,
+                "container": fqcn,
                 "thumbprint": checked["thumbprint"],
                 "not_before": checked["not_before"],
                 "not_after": checked["not_after"],
