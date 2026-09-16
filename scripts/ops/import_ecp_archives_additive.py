@@ -28,6 +28,7 @@ from pathlib import Path
 REQUIRED_KEY_FILES = {
     "header.key", "masks.key", "masks2.key", "name.key", "primary.key", "primary2.key"
 }
+KEY_MATERIAL_FILES = REQUIRED_KEY_FILES - {"name.key"}
 NAME_KEY_SIZE = 300
 GUID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
 
@@ -119,9 +120,11 @@ def list_keysets(extracted: Path) -> list[Path]:
 
 
 def keyset_fingerprint(keyset: Path) -> str:
-    """Fingerprint without exposing any private-key content in logs."""
+    """Fingerprint key material without exposing private-key content in logs."""
     digest = hashlib.sha256()
-    for filename in sorted(REQUIRED_KEY_FILES):
+    # name.key is intentionally regenerated for Linux HDIMAGE and is metadata,
+    # not key material. The destination directory name already verifies it.
+    for filename in sorted(KEY_MATERIAL_FILES):
         data = (keyset / filename).read_bytes()
         digest.update(filename.encode("ascii"))
         digest.update(b"\0")
