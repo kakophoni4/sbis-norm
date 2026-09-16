@@ -226,18 +226,35 @@ def main() -> int:
         print("No CryptoPro files were changed. Re-run with --apply to create the listed containers.")
         return 0
 
-    # All-or-nothing preflight: no new container is copied when any target
-    # collides with an existing one.
-    existing = [str(destination) for _, _, _, destination in pending if destination.exists()]
-    if existing:
-        print("ERROR: existing container directories found; nothing was copied:", file=sys.stderr)
-        for destination in existing:
+    # Existing exact copies are already installed and must not be overwritten.
+    # A same-name directory with different key material is a real conflict,
+    # therefore no new container is copied in that case.
+    copy_pending: list[tuple[Path, Path, str, Path]] = []
+    conflicts: list[str] = []
+    for item in pending:
+        _, keyset, container_name, destination = item
+        if not destination.exists():
+            copy_pending.append(item)
+            continue
+        try:
+            identical = destination.is_dir() and (
+                keyset_fingerprint(destination) == keyset_fingerprint(keyset)
+            )
+        except OSError:
+            identical = False
+        if identical:
+            print(f"SKIP already installed exact container: {container_name}")
+        else:
+            conflicts.append(str(destination))
+    if conflicts:
+        print("ERROR: conflicting existing container directories; nothing was copied:", file=sys.stderr)
+        for destination in conflicts:
             print(f"  {destination}", file=sys.stderr)
         return 1
 
     created: list[Path] = []
     try:
-        for _, keyset, container_name, destination in pending:
+        for _, keyset, container_name, destination in copy_pending:
             copy_keyset(keyset, destination, container_name)
             created.append(destination)
     except Exception as exc:
