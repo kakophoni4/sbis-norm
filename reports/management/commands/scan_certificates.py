@@ -551,7 +551,7 @@ def parse_cert_info(cert_path: str, csptest_name: str = "", csp_index: CspIndex 
     return parse_certmgr_listing(out, csptest_name, csp_index)
 
 
-def update_private_key_flags() -> dict:
+def update_private_key_flags(cert_ids: set[int] | None = None) -> dict:
     """
     Синхронизировать Certificate.has_private_key по uMy (PrivateKey Link).
     Не делает массовый UPDATE False заранее — выставляет флаги по фактическому списку uMy.
@@ -598,7 +598,11 @@ def update_private_key_flags() -> dict:
     flush()
 
     stats = {"linked": 0, "unlinked": 0, "unchanged": 0, "updated": 0}
-    for cert in Certificate.objects.iterator(chunk_size=200):
+    queryset = Certificate.objects.all()
+    if cert_ids is not None:
+        queryset = queryset.filter(pk__in=cert_ids)
+
+    for cert in queryset.iterator(chunk_size=200):
         tp = _norm_tp(cert.thumbprint or "")
         info = umy.get(tp) if tp else None
         want = bool(info and info.get("has_pk"))
@@ -663,6 +667,15 @@ class Command(BaseCommand):
             help="Обработать только N контейнеров (0 = все)",
         )
         parser.add_argument(
+            "--container-prefix",
+            default="",
+            help=(
+                "Обработать только HDIMAGE-контейнеры, чьё имя начинается с префикса. "
+                "Например: new_20260916. В этом режиме синхронизация has_private_key "
+                "тоже затрагивает только обновлённые записи."
+            ),
+        )
+        parser.add_argument(
             "--export-timeout",
             type=int,
             default=DEFAULT_EXPORT_TIMEOUT,
@@ -677,6 +690,7 @@ class Command(BaseCommand):
         install_umy = options["install_uMy"]
         export_timeout = options["export_timeout"]
         verify_key_timeout = DEFAULT_VERIFY_KEY_TIMEOUT
+        container_prefix = str(options.get("container_prefix") or "").strip()
 
         if options["clear"]:
             n = Certificate.objects.count()
@@ -694,6 +708,13 @@ class Command(BaseCommand):
         )
 
         containers = list_hdimage_containers()
+        if container_prefix:
+            containers = [
+                container
+                for container in containers
+                if normalize_container_id(container).startswith(container_prefix)
+            ]
+            self.stdout.write(f"  (--container-prefix={container_prefix}: только выбранные контейнеры)")
         if options["limit"]:
             containers = containers[: options["limit"]]
         total_containers = len(containers)
@@ -795,6 +816,7 @@ class Command(BaseCommand):
 
         install_pk_ok = 0
         winners_by_inn: dict[str, ScanCandidate] = {}
+        touched_cert_ids: set[int] = set()
         for cand in to_persist:
             winner = cand
             if install_umy:
@@ -855,12 +877,13 @@ class Command(BaseCommand):
                         "is_active",
                     ]
                 )
+                touched_cert_ids.add(cert.pk)
                 updated += 1
                 if not quiet:
                     self.stdout.write(f"  обновлён ИНН {winner.inn} ({winner.source})")
                 continue
 
-            Certificate.objects.create(
+            cert = Certificate.objects.create(
                 inn=winner.inn,
                 csptest_name=winner.csptest_name,
                 hdimage_path="",
@@ -872,6 +895,7 @@ class Command(BaseCommand):
                 last_seen_at=now,
                 meta={"scan_source": winner.source},
             )
+            touched_cert_ids.add(cert.pk)
             created += 1
             if not quiet:
                 self.stdout.write(f"  создан Certificate для ИНН {winner.inn} ({winner.source})")
@@ -886,7 +910,7 @@ class Command(BaseCommand):
                 if n and not quiet:
                     self.stdout.write(f"  деактивировано дублей ИНН {inn}: {n}")
 
-        pk_stats = update_private_key_flags()
+        pk_stats = update_private_key_flags(touched_cert_ids if container_prefix else None)
 
         total = Certificate.objects.count()
         active = Certificate.objects.filter(is_active=True).count()
