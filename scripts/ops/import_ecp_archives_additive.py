@@ -85,6 +85,12 @@ def read_container_name(name_key: Path) -> str:
     else:
         normalized = f"{pieces[0]} {suffix}".strip()
 
+    # In some FNS container names spaces occur before the actual suffix, so
+    # it is not the second token. The exported Windows name is truncated to
+    # "копи"; Linux CSP expects the complete "копия" name.
+    if normalized.endswith(" копи"):
+        normalized = f"{normalized[:-4]}копия"
+
     if any(char in normalized for char in ("/", "\\", "\x00")) or normalized in {".", ".."}:
         raise ValueError("unsafe container name in name.key")
     if len(normalized.encode("cp1251", "strict")) > NAME_KEY_SIZE - 4:
