@@ -177,6 +177,7 @@ def main() -> int:
         args.csp_root.mkdir(parents=True, exist_ok=True)
 
     rows: list[tuple[str, str, str, str]] = []
+    pending: list[tuple[Path, Path, str, Path]] = []
     planned: dict[str, str] = {}
     print(f"Source archives: {len(archives)}")
     print(f"Mode: {'APPLY' if args.apply else 'PLAN'}")
@@ -211,13 +212,8 @@ def main() -> int:
                 return 1
             planned[container_name] = fingerprint
             rows.append((archive.name, str(keyset), container_name, str(destination)))
+            pending.append((archive, keyset, container_name, destination))
             print(f"[{len(rows)}] {archive.name} -> {container_name}")
-            if args.apply:
-                try:
-                    copy_keyset(keyset, destination, container_name)
-                except Exception as exc:
-                    print(f"ERROR {container_name}: {exc}", file=sys.stderr)
-                    return 1
 
     with manifest.open("w", newline="", encoding="utf-8") as file:
         writer = csv.writer(file, delimiter="\t")
@@ -229,6 +225,26 @@ def main() -> int:
     if not args.apply:
         print("No CryptoPro files were changed. Re-run with --apply to create the listed containers.")
         return 0
+
+    # All-or-nothing preflight: no new container is copied when any target
+    # collides with an existing one.
+    existing = [str(destination) for _, _, _, destination in pending if destination.exists()]
+    if existing:
+        print("ERROR: existing container directories found; nothing was copied:", file=sys.stderr)
+        for destination in existing:
+            print(f"  {destination}", file=sys.stderr)
+        return 1
+
+    created: list[Path] = []
+    try:
+        for _, keyset, container_name, destination in pending:
+            copy_keyset(keyset, destination, container_name)
+            created.append(destination)
+    except Exception as exc:
+        for destination in reversed(created):
+            shutil.rmtree(destination, ignore_errors=True)
+        print(f"ERROR {container_name}: {exc}; created containers were rolled back", file=sys.stderr)
+        return 1
     print("\nContainers were copied only. uMy, Certificate table and SBIS were not changed.")
     print("Next: restart web and enumerate/export only these names before any certificate installation.")
     return 0
