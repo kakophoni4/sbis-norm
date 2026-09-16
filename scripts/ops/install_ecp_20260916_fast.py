@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install the 20 unique keysets from the 2026-09-16 delivery safely.
+"""Install the 19 remaining keysets from the 2026-09-16 delivery safely.
 
 This is the batch form of the verified ZERO procedure.  It first puts every
 raw keyset in a *new* numeric probe directory and reads its own certificate.
@@ -50,7 +50,8 @@ KEYSETS: tuple[tuple[str, str], ...] = (
     ("unpacked_011/gjlgbcb/3072", "gjlgbcb.rar / 3072"),
     ("unpacked_012/Азарт/2560", "Азарт.zip"),
     ("unpacked_013/Диспут (4)/2560", "Диспут (4).zip"),
-    ("unpacked_014/Зеро/2560", "Зеро (3).zip"),
+    # ZERO (9729355495) was already installed and authenticated successfully
+    # by the verified one-by-one procedure, so it is deliberately skipped.
     ("unpacked_016/Зинтер (4)/2816", "Зинтер (4).zip"),
     ("unpacked_017/Легем (4)/3072", "Легем (4).zip"),
     ("unpacked_018/ПБС/2816", "ПБС.zip"),
