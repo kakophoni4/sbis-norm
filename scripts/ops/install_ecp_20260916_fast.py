@@ -52,8 +52,8 @@ KEYSETS: tuple[tuple[str, str], ...] = (
     ("unpacked_013/Диспут/2560", "Диспут (4).zip"),
     # ZERO (9729355495) was already installed and authenticated successfully
     # by the verified one-by-one procedure, so it is deliberately skipped.
-    ("unpacked_016/Зинтер (4)/2816", "Зинтер (4).zip"),
-    ("unpacked_017/Легем (4)/3072", "Легем (4).zip"),
+    ("unpacked_016/Зинтер/2816", "Зинтер (4).zip"),
+    ("unpacked_017/Легем/3072", "Легем (4).zip"),
     ("unpacked_018/ПБС/2816", "ПБС.zip"),
     ("unpacked_019/3072", "РОСА (2).rar"),
 )
