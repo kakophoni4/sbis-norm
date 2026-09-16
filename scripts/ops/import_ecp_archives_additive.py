@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import os
 import re
 import shutil
@@ -82,7 +83,7 @@ def read_container_name(name_key: Path) -> str:
         if suffix:
             normalized += f" {suffix}"
     else:
-        normalized = original
+        normalized = f"{pieces[0]} {suffix}".strip()
 
     if any(char in normalized for char in ("/", "\\", "\x00")) or normalized in {".", ".."}:
         raise ValueError("unsafe container name in name.key")
@@ -109,6 +110,18 @@ def list_keysets(extracted: Path) -> list[Path]:
         else:
             print(f"WARN incomplete keyset skipped: {keyset}", file=sys.stderr)
     return result
+
+
+def keyset_fingerprint(keyset: Path) -> str:
+    """Fingerprint without exposing any private-key content in logs."""
+    digest = hashlib.sha256()
+    for filename in sorted(REQUIRED_KEY_FILES):
+        data = (keyset / filename).read_bytes()
+        digest.update(filename.encode("ascii"))
+        digest.update(b"\0")
+        digest.update(data)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def copy_keyset(source: Path, destination: Path, container_name: str) -> None:
@@ -158,7 +171,7 @@ def main() -> int:
         args.csp_root.mkdir(parents=True, exist_ok=True)
 
     rows: list[tuple[str, str, str, str]] = []
-    planned: set[str] = set()
+    planned: dict[str, str] = {}
     print(f"Source archives: {len(archives)}")
     print(f"Mode: {'APPLY' if args.apply else 'PLAN'}")
     print(f"CryptoPro HDIMAGE root: {args.csp_root}")
@@ -179,10 +192,18 @@ def main() -> int:
                 print(f"WARN {archive.name} / {keyset.name}: {exc}", file=sys.stderr)
                 continue
             destination = args.csp_root / container_name
-            if container_name in planned:
-                print(f"ERROR duplicate container name inside batch: {container_name}", file=sys.stderr)
+            fingerprint = keyset_fingerprint(keyset)
+            previous_fingerprint = planned.get(container_name)
+            if previous_fingerprint:
+                if previous_fingerprint == fingerprint:
+                    print(f"SKIP exact duplicate: {archive.name} -> {container_name}")
+                    continue
+                print(
+                    f"ERROR same container name but different key material: {container_name}",
+                    file=sys.stderr,
+                )
                 return 1
-            planned.add(container_name)
+            planned[container_name] = fingerprint
             rows.append((archive.name, str(keyset), container_name, str(destination)))
             print(f"[{len(rows)}] {archive.name} -> {container_name}")
             if args.apply:
