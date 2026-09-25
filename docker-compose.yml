@@ -31,6 +31,8 @@ services:
       - /var/opt/cprocsp/keys:/var/opt/cprocsp/keys
       # uMy (my.sto) — иначе после recreate контейнера PrivateKey Link пропадает
       - cprocsp_users:/var/opt/cprocsp/users
+      # Конфигурация CSP и лицензия. Должны переживать recreate контейнера.
+      - cprocsp_config:/etc/opt/cprocsp
     ports:
       # Внешние клиенты должны обращаться через HTTPS Nginx. Прямой Gunicorn
       # нельзя публиковать в интернет: иначе обходятся TLS, rate-limit и auth.
@@ -51,6 +53,7 @@ services:
       - .:/app
       - /var/opt/cprocsp/keys:/var/opt/cprocsp/keys
       - cprocsp_users:/var/opt/cprocsp/users
+      - cprocsp_config:/etc/opt/cprocsp
     env_file:
       - ./app.env
     depends_on:
@@ -67,6 +70,7 @@ services:
       - .:/app
       - /var/opt/cprocsp/keys:/var/opt/cprocsp/keys
       - cprocsp_users:/var/opt/cprocsp/users
+      - cprocsp_config:/etc/opt/cprocsp
     env_file:
       - ./app.env
     depends_on:
@@ -78,3 +82,4 @@ services:
 volumes:
   postgres_data:
   cprocsp_users:
+  cprocsp_config:
