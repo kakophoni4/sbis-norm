@@ -159,7 +159,8 @@ def list_sent_reports(inn, days):
                 raise ReportError("scan_limit", "Лимит времени; повторите запрос, даты уже проверенных документов сохранены")
             raw = _rpc(inn, session, "СБИС.СписокДокументов", {"Фильтр": {
                 "Тип": "ОтчетФНС", "Направление": "Исходящий",
-                "НашаОрганизация": {"СвЮЛ" if len(inn) == 10 else "СвФЛ": {"ИНН": inn}},
+                # Session is authenticated for inn; verify ownership below.
+                # A partial СвЮЛ filter (INN without KPP) is rejected by reporting API.
                 "Навигация": {"РазмерСтраницы": "100", "Страница": str(page)},
             }})
             pages += 1

@@ -61,6 +61,7 @@ class SentReportsTests(SimpleTestCase):
         self.assertEqual(result["items"][0]["document_date"], "2020-01-01")
         self.assertEqual(result["items"][0]["period_code"], "21")
         self.assertNotIn("ДатаС", rpc.call_args_list[0].args[3]["Фильтр"])
+        self.assertNotIn("НашаОрганизация", rpc.call_args_list[0].args[3]["Фильтр"])
         self.assertEqual(rpc.call_args_list[1].args[3]["Фильтр"]["Навигация"]["Страница"], "1")
         with patch.object(s, "_rpc", return_value=self.page([self.doc])) as rpc:
             self.assertTrue(s.list_sent_reports(INN, 30)["success"])
@@ -197,6 +198,17 @@ class SentReportsTests(SimpleTestCase):
                 s._download(INN, "session", "https://disk.sbis.ru/a")
             self.assertFalse(request.call_args.kwargs["allow_redirects"])
             response.close.assert_called_once()
+
+    def test_missing_kpp_is_not_retried_as_proxy_failure(self):
+        from reports.services.sbis import client
+        response = Mock(status_code=500, text='{"error":{"message":"Ошибка в реквизитах: КПП должен быть заполнен."}}')
+        session = Mock()
+        session.request.return_value = response
+        with patch.object(client, "_thread_local_sbis_session", return_value=session):
+            result = client._sbis_request("POST", "https://online.sbis.ru/service/",
+                headers={}, proxy_url_override="http://proxy.example:8080")
+        self.assertIs(result, response)
+        self.assertEqual(session.request.call_count, 1)
 
     @override_settings(ONEC_API_TOKEN="test-token")
     def test_api_token_and_input(self):
