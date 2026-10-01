@@ -421,6 +421,7 @@ def _sbis_request(
     timeout: int = 30,
     inn: str | None = None,
     allow_redirects: bool = True,
+    stream: bool = False,
     proxy_url_override: str | None = None,
     total_budget_sec: int = 45,
     proxy_want: int = 2,
@@ -450,6 +451,7 @@ def _sbis_request(
             timeout=timeout,
             proxies=proxies,
             allow_redirects=allow_redirects,
+            stream=stream,
         )
 
     # 1) Собираем кандидатов прокси на попытки

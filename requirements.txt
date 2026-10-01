@@ -14,3 +14,4 @@ drf-spectacular
 reportlab
 pypdf
 pymupdf
+defusedxml>=0.7.1

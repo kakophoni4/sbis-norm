@@ -9,6 +9,7 @@ from reports.api.views.nds import (
     SendNdsExtraView,
 )
 from reports.api.views.reports import ReportStatuses1CView, SendReport1CView
+from reports.api.views.sent_reports import SentReports1CView, SentReportXml1CView
 from reports.api.views.requirements import (
     RequirementDetailView,
     RequirementFileView,
@@ -18,6 +19,8 @@ from reports.api.views.requirements import (
 )
 
 urlpatterns = [
+    path("sbis/sent-reports-1c/", SentReports1CView.as_view(), name="sent_reports_1c"),
+    path("sbis/sent-report-xml-1c/", SentReportXml1CView.as_view(), name="sent_report_xml_1c"),
     path("mail/lookup/", MailLookupView.as_view(), name="mail_lookup"),
     path("sbis/mail", sbis_mail_view, name="sbis_mail"),
     path("sbis/send-nds-extra/", SendNdsExtraView.as_view(), name="send_nds_extra"),
